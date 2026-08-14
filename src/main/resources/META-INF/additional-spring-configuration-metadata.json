@@ -1,0 +1,385 @@
+{
+  "groups": [
+    {
+      "name": "nasa.redis-proxy.idempotent-counter",
+      "type": "io.github.nasaruntime.redis.cache.redis.RedisIdempotentCounterProperties",
+      "description": "RedisProxy 资金类计数命令的 nonce 幂等账本与自动回收布局。"
+    },
+    {
+      "name": "nasa.redis.job",
+      "type": "io.github.nasaruntime.redis.cache.redis.job.RedisJobProperties",
+      "description": "Redis 原生分布式任务调度、执行权租约与集群 Fanout。"
+    }
+  ],
+  "properties": [
+    {
+      "name": "nasa.redis-proxy.idempotent-counter.ledger-key-prefix",
+      "type": "java.lang.String",
+      "description": "幂等 sidecar 账本键前缀；同一 RedisProxy 集群运行期间不能改变。",
+      "defaultValue": "rpidem"
+    },
+    {
+      "name": "nasa.redis-proxy.idempotent-counter.nonce-ttl-ms",
+      "type": "java.lang.Long",
+      "description": "同一逻辑计数器与 nonce 最多生效一次的保证窗口；默认 7 天。",
+      "defaultValue": 604800000
+    },
+    {
+      "name": "nasa.redis-proxy.idempotent-counter.ttl-mode",
+      "type": "io.github.nasaruntime.redis.cache.redis.RedisIdempotentCounterTtlMode",
+      "description": "AUTO 检查全部 Redis master 的 HPEXPIRE 能力并固定为字段 TTL 或环形桶 TTL。",
+      "defaultValue": "AUTO"
+    },
+    {
+      "name": "nasa.redis-proxy.idempotent-counter.bucket-span-ms",
+      "type": "java.lang.Long",
+      "description": "HASH_BUCKET 单桶时间跨度；默认 1 天。",
+      "defaultValue": 86400000
+    },
+    {
+      "name": "nasa.redis-proxy.idempotent-counter.ledger-shards",
+      "type": "java.lang.Integer",
+      "description": "每个目标键的逻辑计数器账本分片数，必须是 1 到 4096 之间的 2 的幂。",
+      "defaultValue": 256
+    },
+    {
+      "name": "nasa.redis.job.enabled",
+      "type": "java.lang.Boolean",
+      "description": "是否装配并启动 RedisJobScheduler。",
+      "defaultValue": false
+    },
+    {
+      "name": "nasa.redis.job.namespace",
+      "type": "java.lang.String",
+      "description": "任务隔离与 Redis Cluster hash tag 路由命名空间；已有数据时不能原地改变分片或桶数量。",
+      "defaultValue": "default"
+    },
+    {
+      "name": "nasa.redis.job.qualifier",
+      "type": "java.lang.String",
+      "description": "RedisJob 使用的 RedisProxy 实例名。",
+      "defaultValue": "primary"
+    },
+    {
+      "name": "nasa.redis.job.protocol-version",
+      "type": "java.lang.Integer",
+      "description": "普通 Run 的线协议门禁；同一命名空间中的执行器必须一致。",
+      "defaultValue": 1
+    },
+    {
+      "name": "nasa.redis.job.application-name",
+      "type": "java.lang.String",
+      "description": "组成执行器稳定节点身份的应用名。",
+      "defaultValue": "application"
+    },
+    {
+      "name": "nasa.redis.job.instance-identity",
+      "type": "java.lang.String",
+      "description": "同一逻辑节点跨进程重启保持稳定的身份；留空时回退到主机名。",
+      "defaultValue": ""
+    },
+    {
+      "name": "nasa.redis.job.shard-count",
+      "type": "java.lang.Integer",
+      "description": "普通调度固定分片数；命名空间已经写入数据后不能原地改变。",
+      "defaultValue": 64
+    },
+    {
+      "name": "nasa.redis.job.fanout-bucket-count",
+      "type": "java.lang.Integer",
+      "description": "Fanout 固定桶数；命名空间已经写入数据后不能原地改变。",
+      "defaultValue": 32
+    },
+    {
+      "name": "nasa.redis.job.pubsub-mode",
+      "type": "io.github.nasaruntime.redis.cache.redis.job.RedisJobPubSubMode",
+      "description": "Fanout 低延迟通知模式；SHARDED 需要 Redis 7，BROADCAST 是 Redis 6.2 降级模式。",
+      "defaultValue": "SHARDED"
+    },
+    {
+      "name": "nasa.redis.job.executor-capacity",
+      "type": "java.lang.Integer",
+      "description": "当前执行器对外登记的总并发容量。",
+      "defaultValue": 128
+    },
+    {
+      "name": "nasa.redis.job.handler-capacity",
+      "type": "java.lang.Integer",
+      "description": "当前进程同时运行的 Handler 上限，不得大于 executor-capacity。",
+      "defaultValue": 8
+    },
+    {
+      "name": "nasa.redis.job.lease-ms",
+      "type": "java.lang.Long",
+      "description": "单个 attempt 的执行权租约；必须覆盖两次续期与允许的停顿。",
+      "defaultValue": 30000
+    },
+    {
+      "name": "nasa.redis.job.lease-renew-ms",
+      "type": "java.lang.Long",
+      "description": "当前 owner 的租约续期间隔。",
+      "defaultValue": 10000
+    },
+    {
+      "name": "nasa.redis.job.visibility-timeout-ms",
+      "type": "java.lang.Long",
+      "description": "普通 Run 派发消息的可见性兜底期限，不得小于两倍 lease-ms。",
+      "defaultValue": 60000
+    },
+    {
+      "name": "nasa.redis.job.heartbeat-ms",
+      "type": "java.lang.Long",
+      "description": "执行器能力与存活状态的心跳周期。",
+      "defaultValue": 10000
+    },
+    {
+      "name": "nasa.redis.job.executor-expire-ms",
+      "type": "java.lang.Long",
+      "description": "执行器心跳失效期限，至少覆盖两个 heartbeat-ms。",
+      "defaultValue": 30000
+    },
+    {
+      "name": "nasa.redis.job.fanout-max-members",
+      "type": "java.lang.Integer",
+      "description": "一次 Fanout 能力快照的最大执行器成员数。",
+      "defaultValue": 512
+    },
+    {
+      "name": "nasa.redis.job.fanout-delivery-batch-size",
+      "type": "java.lang.Integer",
+      "description": "单段 Fanout Lua 提交或通知的分片数上限，不得大于 fanout-max-members。",
+      "defaultValue": 64
+    },
+    {
+      "name": "nasa.redis.job.fanout-max-total-parameter-bytes",
+      "type": "java.lang.Integer",
+      "description": "一次 Fanout 所有分片参数的总字节上限。",
+      "defaultValue": 16777216
+    },
+    {
+      "name": "nasa.redis.job.fanout-create-timeout-ms",
+      "type": "java.lang.Long",
+      "description": "Fanout intent 从普通根记录建立到桶内提交完成的截止时间。",
+      "defaultValue": 60000
+    },
+    {
+      "name": "nasa.redis.job.fanout-max-wait-ms",
+      "type": "java.lang.Long",
+      "description": "Fanout 普通根等待全部 shard 收敛的最长时间。",
+      "defaultValue": 1800000
+    },
+    {
+      "name": "nasa.redis.job.fanout-max-assignments",
+      "type": "java.lang.Integer",
+      "description": "单个 Fanout shard 允许的目标 assignment 代次上限。",
+      "defaultValue": 5
+    },
+    {
+      "name": "nasa.redis.job.ready-max-wakeups",
+      "type": "java.lang.Integer",
+      "description": "Fanout shard 已确认接收但未 start 时的低延迟唤醒上限。",
+      "defaultValue": 3
+    },
+    {
+      "name": "nasa.redis.job.node-unready-evidence-count",
+      "type": "java.lang.Integer",
+      "description": "不同 Fanout 根对同一心跳代次累积到此证据数后才降级节点，必须大于 1。",
+      "defaultValue": 3
+    },
+    {
+      "name": "nasa.redis.job.fanout-cleanup-batch-size",
+      "type": "java.lang.Integer",
+      "description": "单轮 Fanout 回收的 shard 数，用于限制 Lua 工作量。",
+      "defaultValue": 100
+    },
+    {
+      "name": "nasa.redis.job.fanout-retention-ms",
+      "type": "java.lang.Long",
+      "description": "Fanout 终态、分片幂等证据与结果摘要的 Redis 保留期。",
+      "defaultValue": 604800000
+    },
+    {
+      "name": "nasa.redis.job.serial-overflow-policy",
+      "type": "io.github.nasaruntime.redis.cache.redis.job.RedisJobSerialOverflowPolicy",
+      "description": "串行等待队列达到 max-serial-backlog 时跳过最旧还是最新 Run。",
+      "defaultValue": "SKIP_OLDEST"
+    },
+    {
+      "name": "nasa.redis.job.min-scan-interval-ms",
+      "type": "java.lang.Long",
+      "description": "有到期工作时后台索引扫描的最短间隔。",
+      "defaultValue": 50
+    },
+    {
+      "name": "nasa.redis.job.max-scan-interval-ms",
+      "type": "java.lang.Long",
+      "description": "无到期工作时后台索引扫描的最长退避。",
+      "defaultValue": 30000
+    },
+    {
+      "name": "nasa.redis.job.schedule-rtt-allowance-ms",
+      "type": "java.lang.Long",
+      "description": "判断逻辑调度时刻已错过前允许的 Redis 往返延迟。",
+      "defaultValue": 100
+    },
+    {
+      "name": "nasa.redis.job.need-recompute-max-retries",
+      "type": "java.lang.Integer",
+      "description": "调度逻辑时刻被并发推进后，单轮扫描允许重新计算的次数。",
+      "defaultValue": 3
+    },
+    {
+      "name": "nasa.redis.job.scan-batch-size",
+      "type": "java.lang.Integer",
+      "description": "单轮索引扫描和注册表回收处理的候选数上限。",
+      "defaultValue": 100
+    },
+    {
+      "name": "nasa.redis.job.dispatch-group",
+      "type": "java.lang.String",
+      "description": "普通 Run Dispatch Stream 的消费组名；同一命名空间内必须一致。",
+      "defaultValue": "redis-job-executor"
+    },
+    {
+      "name": "nasa.redis.job.max-dispatch-attempts",
+      "type": "java.lang.Integer",
+      "description": "可见性消息的最大重建次数，防止无法派发的 Run 无限循环。",
+      "defaultValue": 20
+    },
+    {
+      "name": "nasa.redis.job.renew-rtt-allowance-ms",
+      "type": "java.lang.Long",
+      "description": "计算本地保守持权截止点时扣除的租约续期往返预算。",
+      "defaultValue": 1000
+    },
+    {
+      "name": "nasa.redis.job.clock-drift-allowance-ms",
+      "type": "java.lang.Long",
+      "description": "计算本地保守持权截止点时扣除的时钟偏差预算。",
+      "defaultValue": 1000
+    },
+    {
+      "name": "nasa.redis.job.max-tolerated-gc-pause-ms",
+      "type": "java.lang.Long",
+      "description": "租约安全关系允许的最大 JVM 停顿预算。",
+      "defaultValue": 1000
+    },
+    {
+      "name": "nasa.redis.job.max-run-duration-ms",
+      "type": "java.lang.Long",
+      "description": "全局 Handler attempt 超时上限，同时用作停机等待本地 Handler 的边界。",
+      "defaultValue": 3600000
+    },
+    {
+      "name": "nasa.redis.job.max-serial-backlog",
+      "type": "java.lang.Integer",
+      "description": "单任务 SERIAL_QUEUE 等待 Run 上限。",
+      "defaultValue": 1000
+    },
+    {
+      "name": "nasa.redis.job.xautoclaim-min-idle-ms",
+      "type": "java.lang.Long",
+      "description": "XAUTOCLAIM 接管 PEL 消息前要求的最小 idle 时间。",
+      "defaultValue": 30000
+    },
+    {
+      "name": "nasa.redis.job.run-retention-ms",
+      "type": "java.lang.Long",
+      "description": "普通 Run 进入终态后的 Redis 保留期，同时限定框架幂等窗口。",
+      "defaultValue": 604800000
+    },
+    {
+      "name": "nasa.redis.job.completion-retention-ms",
+      "type": "java.lang.Long",
+      "description": "预留的完成事件保留期；当前完成 Stream 由近似长度限制裁剪，不读取此值。",
+      "defaultValue": 604800000
+    },
+    {
+      "name": "nasa.redis.job.tombstone-retention-ms",
+      "type": "java.lang.Long",
+      "description": "删除定义的 tombstone 保留期，用于拒绝旧修订号重新登记。",
+      "defaultValue": 604800000
+    },
+    {
+      "name": "nasa.redis.job.registry-gc-grace-ms",
+      "type": "java.lang.Long",
+      "description": "执行器过期后回收注册记录的宽限，必须大于 fanout-max-wait-ms。",
+      "defaultValue": 3600000
+    },
+    {
+      "name": "nasa.redis.job.max-parameter-bytes",
+      "type": "java.lang.Integer",
+      "description": "单个普通 Run 或 Fanout shard 参数的字节上限。",
+      "defaultValue": 65536
+    },
+    {
+      "name": "nasa.redis.job.max-result-summary-bytes",
+      "type": "java.lang.Integer",
+      "description": "持久化 Handler 结果摘要的 UTF-8 字节上限。",
+      "defaultValue": 4096
+    },
+    {
+      "name": "nasa.redis.job.max-catch-up-runs",
+      "type": "java.lang.Integer",
+      "description": "CATCH_UP 单轮保留的最近补偿 Run 上限。",
+      "defaultValue": 50
+    },
+    {
+      "name": "nasa.redis.job.max-catch-up-window-ms",
+      "type": "java.lang.Long",
+      "description": "CATCH_UP 允许保留逻辑调度时刻的时间窗口。",
+      "defaultValue": 3600000
+    },
+    {
+      "name": "nasa.redis.job.wire.json.default-typing",
+      "type": "java.lang.Boolean",
+      "description": "Job JSON 的 Jackson Default Typing 安全门禁，只能保持 false。",
+      "defaultValue": false
+    }
+  ],
+  "hints": [
+    {
+      "name": "nasa.redis-proxy.idempotent-counter.ttl-mode",
+      "values": [
+        {
+          "value": "AUTO",
+          "description": "全部 Redis master 支持 HPEXPIRE 时使用字段 TTL，否则固定使用环形桶 TTL。"
+        },
+        {
+          "value": "HASH_FIELD",
+          "description": "要求全部 Redis master 支持 HPEXPIRE，每个 nonce field 独立过期。"
+        },
+        {
+          "value": "HASH_BUCKET",
+          "description": "使用固定数量的环形 HASH 桶与整桶 PEXPIRE，不依赖字段 TTL。"
+        }
+      ]
+    },
+    {
+      "name": "nasa.redis.job.pubsub-mode",
+      "values": [
+        {
+          "value": "SHARDED",
+          "description": "使用 Redis 7 Sharded Pub/Sub，通知只在目标 hash slot 所属 shard 传播。"
+        },
+        {
+          "value": "BROADCAST",
+          "description": "使用普通 Pub/Sub，经 Redis Cluster 总线广播，需要评估集群放大量。"
+        }
+      ]
+    },
+    {
+      "name": "nasa.redis.job.serial-overflow-policy",
+      "values": [
+        {
+          "value": "SKIP_OLDEST",
+          "description": "跳过当前最旧等待 Run，为新 Run 腾出容量。"
+        },
+        {
+          "value": "SKIP_NEWEST",
+          "description": "保留既有等待队列，直接跳过新 Run。"
+        }
+      ]
+    }
+  ]
+}
