@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 
 /**
  * 业务作用：冻结 Worker 能力快照并按 prepare、begin、add、commit、deliver 协议提交 Fanout。
@@ -20,6 +21,7 @@ final class RedisJobFanoutCoordinator implements RedisJobFanoutService {
     private final RedisJobExecutorRegistry registry;
     private final RedisJobJsonCodec jsonCodec;
     private final String publishCommand;
+    private final BiConsumer<String, String> cancellationRequester;
     private final Map<String, RedisJobDefinition> workers = new ConcurrentHashMap<>();
     private final Map<String, RedisJobDefinition> definitions = new ConcurrentHashMap<>();
     private volatile RedisJobVisibleWakeup visibleWakeup;
@@ -33,15 +35,19 @@ final class RedisJobFanoutCoordinator implements RedisJobFanoutService {
      * @param scripts    脚本执行器
      * @param registry   执行器注册表
      * @param jsonCodec  Job JSON Codec
+     * @param cancellationRequester Fanout 桶取消入口
+     * <p>返回：构造绑定同一数据源的 Fanout 协调器。
      */
     RedisJobFanoutCoordinator(RedisJobProperties properties, RedisJobKeyspace keys,
                               RedisJobScriptExecutor scripts, RedisJobExecutorRegistry registry,
-                              RedisJobJsonCodec jsonCodec) {
+                              RedisJobJsonCodec jsonCodec, BiConsumer<String, String> cancellationRequester) {
         this.properties = properties;
         this.keys = keys;
         this.scripts = scripts;
         this.registry = registry;
         this.jsonCodec = jsonCodec;
+        this.cancellationRequester = Objects.requireNonNull(
+                cancellationRequester, "cancellationRequester must not be null");
         this.publishCommand = properties.getPubsubMode() == RedisJobPubSubMode.SHARDED ? "SPUBLISH" : "PUBLISH";
     }
 
@@ -56,6 +62,20 @@ final class RedisJobFanoutCoordinator implements RedisJobFanoutService {
             workers.put(definition.workerName(), definition);
         }
         definitions.put(definition.name(), definition);
+    }
+
+    /**
+     * 业务作用：撤销已删除任务的契约登记，使新的根任务不再把该 Worker 视为可选目标。
+     *
+     * @param definition       任务定义
+     * @param workerStillUsed  同名能力是否仍被其它本地定义使用
+     *                         返回：无返回值。
+     */
+    void unregister(RedisJobDefinition definition, boolean workerStillUsed) {
+        definitions.remove(definition.name(), definition);
+        if (!workerStillUsed && definition.trigger() == RedisJobTrigger.FANOUT_ONLY) {
+            workers.remove(definition.workerName(), definition);
+        }
     }
 
     /**
@@ -87,7 +107,8 @@ final class RedisJobFanoutCoordinator implements RedisJobFanoutService {
      * @param rootJobName 根任务名
      * @param rootShard   根调度分片
      * @param fanoutState 桶内终态
-     *                    返回：无返回值。
+     * @param errorType   桶内终态归因
+     * <p>返回：无返回值。
      */
     void reconcileTerminal(String fanoutId, String rootRunId, int rootAttempt, String rootJobName,
                            int rootShard, String fanoutState, String errorType) {
@@ -113,16 +134,21 @@ final class RedisJobFanoutCoordinator implements RedisJobFanoutService {
      * @param rootAttempt 根 attempt
      * @param rootJobName 根任务名
      * @param rootShard   根调度分片
-     *                    返回：无返回值。
+     * <p>返回：无返回值；删除 fence 命中时先关闭已提交桶，不推进普通根等待窗口。
      */
     void reconcileCommitted(String fanoutId, String rootRunId, int rootAttempt,
                             String rootJobName, int rootShard) {
-        scripts.list(RedisJobScript.FINISH_FANOUT_ROOT,
+        List<Object> response = scripts.list(RedisJobScript.FINISH_FANOUT_ROOT,
                 new String[]{keys.run(rootShard, rootRunId), keys.waiting(rootShard), keys.running(rootShard),
                         keys.visible(rootShard), keys.waitq(rootShard, rootJobName), keys.completion(rootShard)},
                 rootRunId, fanoutId, rootAttempt, "COMMITTED", "", properties.getFanoutMaxWaitMs(),
                 "", rootJobName, properties.getRunRetentionMs(), properties.getVisibilityTimeoutMs(),
                 keys.shardKeyPrefix(rootShard));
+        if ("JOB_DELETED".equals(value(response, 0))) {
+            // 对账观察者与原提交线程遵守同一删除门禁；否则提交响应丢失后，
+            // 看门狗仍可能依据桶内 roots 索引取得新的分片投递权。
+            cancellationRequester.accept(fanoutId, "JOB_DELETED");
+        }
     }
 
     /**
@@ -342,10 +368,15 @@ final class RedisJobFanoutCoordinator implements RedisJobFanoutService {
             String fanoutId = RedisJobIdentifiers.fanoutId(rootContext.runId(), rootContext.attempt());
             int rootShard = keys.scheduleShard(rootContext.jobName());
             List<Object> prepared = scripts.list(RedisJobScript.PREPARE_FANOUT_ROOT,
-                    new String[]{keys.run(rootShard, rootContext.runId()), keys.leases(rootShard), keys.waiting(rootShard)},
+                    new String[]{keys.run(rootShard, rootContext.runId()), keys.leases(rootShard),
+                            keys.waiting(rootShard), keys.job(rootShard, rootContext.jobName())},
                     rootContext.runId(), rootContext.owner(), rootContext.attemptToken(), fanoutId,
                     snapshot.snapshotId(), shards.size(), properties.getFanoutCreateTimeoutMs());
             String prepareCode = value(prepared, 0);
+            if ("JOB_DELETED".equals(prepareCode)) {
+                // 完成权威尚未转移，当前 attempt 仍由普通完成出口提交删除终态。
+                return RedisJobResult.cancelled("job deleted before fanout prepare");
+            }
             if (!"PREPARED".equals(prepareCode) && !"ADOPTED".equals(prepareCode)) {
                 throw new IllegalStateException("fanout prepare rejected: " + prepareCode);
             }
@@ -359,7 +390,9 @@ final class RedisJobFanoutCoordinator implements RedisJobFanoutService {
                     fanoutId, rootContext.runId(), rootContext.attempt(), snapshot.snapshotId(), snapshotPayload,
                     workerName, revision, selectedSchema, selectedCodec.name(), shards.size(),
                     rootReceiptTimeout(), rootReceiptRetries(), failurePolicy.name(), properties.getFanoutCreateTimeoutMs(),
-                    rootContext.jobName(), rootShard);
+                    rootContext.jobName(), rootShard,
+                    // 根记录自带来源声明, 监视器凭它发现被写错前缀的外来 Fanout
+                    keys.qualifier());
             require(value(begun, 0), "fanout begin");
             signalFanoutIndex(fanoutId, rootReceiptTimeout());
             addShards(fanoutId, snapshot, shards, revision, selectedSchema, selectedCodec);
@@ -368,13 +401,19 @@ final class RedisJobFanoutCoordinator implements RedisJobFanoutService {
                     fanoutId);
             require(value(committed, 0), "fanout commit");
 
-            scripts.list(RedisJobScript.FINISH_FANOUT_ROOT,
+            List<Object> rootTransition = scripts.list(RedisJobScript.FINISH_FANOUT_ROOT,
                     new String[]{keys.run(rootShard, rootContext.runId()), keys.waiting(rootShard),
                             keys.running(rootShard), keys.visible(rootShard), keys.waitq(rootShard, rootContext.jobName()),
                             keys.completion(rootShard)},
                     rootContext.runId(), fanoutId, rootContext.attempt(), "COMMITTED", "",
                     properties.getFanoutMaxWaitMs(), "", rootContext.jobName(), properties.getRunRetentionMs(),
                     properties.getVisibilityTimeoutMs(), keys.shardKeyPrefix(rootShard));
+            if ("JOB_DELETED".equals(value(rootTransition, 0))) {
+                // 桶已提交时必须立即发布保护态；只停止本调用的 deliver 不足以阻止
+                // 全局看门狗按持久 roots 索引补投。普通根等桶真实终态后再对账。
+                cancellationRequester.accept(fanoutId, "JOB_DELETED");
+                return RedisJobResult.cancelled("job deleted before fanout delivery");
+            }
             deliver(fanoutId, snapshot, shards, rootReceiptTimeout());
             return RedisJobResult.success(fanoutId);
         }
@@ -437,6 +476,9 @@ final class RedisJobFanoutCoordinator implements RedisJobFanoutService {
                 List<Object> args = new ArrayList<>();
                 args.add(snapshot.snapshotId());
                 args.add(end - offset);
+                // shard 自带来源与协议代次, 使 Fanout start 能像普通 Run 一样独立复验
+                args.add(keys.qualifier());
+                args.add(properties.getProtocolVersion());
                 for (int index = offset; index < end; index++) {
                     long seq = index;
                     scriptKeys[index - offset + 1] = keys.fanoutShard(fanoutId, seq);
@@ -450,7 +492,8 @@ final class RedisJobFanoutCoordinator implements RedisJobFanoutService {
                     args.add(selectedCodec.name());
                     args.add(shards.size());
                     args.add(seq);
-                    args.add(keys.namespace() + ':' + fanoutId + ':' + seq);
+                    // executionKey 是跨语言的业务幂等键: 必须带 qualifier, 否则两个数据源的同一分片会算出同一个值
+                    args.add(keys.executionKey(fanoutId, seq));
                     args.add(member.nodeIdentity());
                     args.add(member.startupId());
                     args.add(member.heartbeatRevision());

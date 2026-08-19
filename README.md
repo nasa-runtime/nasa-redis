@@ -13,12 +13,34 @@ Stream 派发和 `XAUTOCLAIM` 完成故障恢复；根任务还可以按实际�
 <dependency>
     <groupId>io.github.nasa-runtime</groupId>
     <artifactId>nasa-redis</artifactId>
-    <version>1.0.0</version>
+    <version>2.0.0</version>
 </dependency>
 ```
 
 要求 JDK 21+、Maven 3.6.3+。RedisJob 默认使用 Redis 7+ 的 Sharded Pub/Sub；选择
 `BROADCAST` 降级模式时最低要求 Redis 6.2，并需要评估普通 Pub/Sub 在 Cluster 总线上的放大量。
+
+RedisJob 是显式、按数据源启用的运行时：`@EnableRedis` 只建立 RedisProxy 等基础能力；业务还必须添加
+`@EnableRedisJob` 并设置 `nasa.redis.job.enabled=true`。每个 `@RedisJob` 都必须声明 `qualifier`，编程式
+调用也必须通过 `RedisJobSchedulers.scheduler(sourceId)` 选择 source。没有任务或静态调用引用的数据源
+不会创建 Scheduler、扫描线程、订阅或执行器注册记录，框架也不会把未知 source 回退到 `primary`。
+
+## 从 1.0.0 升级到 2.0.0
+
+`2.0.0` 引入多数据源 source id，RedisJob 的 Redis hash tag、稳定 `runId`、Fanout `executionKey` 和
+公开构造入口均发生不兼容变化，不能把它当作 `1.0.0` 的原地滚动升级：即使继续使用相同的 `namespace`，
+`2.0.0` 也会写入包含 qualifier 的新键空间，不读取或接管 `1.0.0` 的定义、Run、Stream、租约与 Fanout。
+框架不提供两个键布局之间的在线迁移。
+
+RedisJob 不再随 `@EnableRedis` 自动装配，也不再提供默认 `RedisJobScheduler` Bean。业务必须显式添加
+`@EnableRedisJob`，每个 `@RedisJob` 必须填写 `qualifier`；编程式控制通过
+`RedisJobSchedulers.scheduler("<source-id>")` 明确选择数据源。原根级 `nasa.redis.job.qualifier` 已取消；
+Scheduler 的 source id 由注解、静态入口或直接传入的 RedisProxy 确定。
+
+升级前先在全部 `1.0.0` 节点暂停新触发，等待普通 Run 和 Fanout 到达终态，再停止所有旧节点；确认没有旧进程
+继续扫描后才能启动 `2.0.0`。新版本应按一套新调度集接入并重新登记定义。由于稳定幂等标识也已改变，跨版本
+仍可能到达的业务事件必须使用订单号、结算号等版本无关业务键在目标系统去重；不能依赖新旧 `runId` 相同。
+需要保留旧记录时先归档或按业务方案离线迁移，不能让两个版本同时处理同一业务副作用。
 
 ## 接入前必读：必须允许 Bean 定义覆盖
 
@@ -71,7 +93,7 @@ RedisJob 不选举应用主节点，也不依赖数据库调度中心。多个�
 根 Handler: context.fanout(worker)
       │
       ▼
-兼容能力快照 ──▶ 按成员数分片 ──▶ 每节点持久 inbox + Pub/Sub 通知/回执
+兼容能力快照 ──▶ 按成员数分片 ──▶ 持久投递信封 + Pub/Sub 定向通知/回执
                                       │
                                       ▼
                              分片 Worker 执行与聚合
@@ -81,21 +103,68 @@ RedisJob 不选举应用主节点，也不依赖数据库调度中心。多个�
 
 - **没有单点调度主节点**：分片扫描可以重复，状态迁移依靠 Redis `TIME`、Lua CAS 与 Redis Cluster hash tag 收敛。
 - **执行权可判定**：每个 attempt 都携带单调 `attemptToken`；旧 owner 的续期和完成提交会被拒绝。
+- **同名任务默认集群串行**：`SERIAL_QUEUE` 在 Redis 中按任务身份占用唯一执行槽；fixed rate 的后续 Run 可以持久排队，但不会在前一 attempt 仍运行时提交第二个业务 Handler。
 - **至少一次恢复**：派发消息、可见性索引、租约索引和 `XAUTOCLAIM` 共同覆盖进程退出与响应丢失，因此 Handler 必须幂等。
 - **定义冲突不按启动顺序裁决**：同名任务的修订号与规范摘要持久化；相同修订号但不同定义会进入冲突并停止触发。
 - **Fanout 只选择兼容节点**：目标必须登记同一 Worker、`contractRevision`、`schemaId` 和 `codec`，没有该能力的 Java、Go 或 Rust 节点不会收到分片。
-- **稳定分片幂等键**：`executionKey` 在通知重发、执行重试和节点重分配期间保持不变；`assignmentEpoch` 只在目标变化时递增。
+- **稳定分片幂等键**：`executionKey` 在通知重发、执行重试和 assignment 重建期间保持不变；每次重建都会递增 `assignmentEpoch`，包括换节点和原稳定节点出现新启动或心跳证据后的恢复。
 - **跨语言 JSON 不携带 JVM 类型信息**：Job 使用独立 Jackson 映射器，强制关闭 Default Typing，并拒绝 `@class` / `@type` 字段。
+
+#### 实现架构与原子边界
+
+RedisJob 把发现、调度、执行和恢复拆成可独立重试的组件，持久状态始终先于进程内通知：
+
+| 组件 | 业务职责 |
+|---|---|
+| `@EnableRedisJob` / `RedisJobInfrastructureConfiguration` | 显式建立配置绑定、运行时提示、唯一管理器和注解登记器；自身不创建具体 source 的 Scheduler |
+| `RedisJobAnnotationRegistrar` | 在全部 Spring 单例就绪后先完成本地签名、泛型、身份和 source 校验，再把任务登记到对应 Scheduler |
+| `RedisJobSchedulers` | 按实际引用的 qualifier 惰性建立彼此隔离的 Scheduler，并统一驱动 start、stop 和 close；单 source 的 drain/activate 由对应 Scheduler 提供 |
+| `RedisJobScheduler` | 对外提供登记、触发、控制、查询和健康状态，周期驱动 schedule、visible、lease、Fanout 与回收索引 |
+| `RedisJobRepository` + Lua | 在单个 Redis slot 内原子复验定义、Run、串行槽、租约、等待队列和终态 |
+| `RedisJobDispatcher` | 消费普通 Dispatch Stream，在提交 Handler 前取得 `attemptToken` 与 lease，结束后提交重试或终态 |
+| `RedisJobExecutorRegistry` | 维护节点身份、心跳、Worker 能力合同和不可变布局，提供 Fanout 兼容存活快照 |
+| `RedisJobFanoutCoordinator` | 把普通根 Run 的完成权威转交给 Fanout，分批创建 shard，并在 commit 后建立投递信封和通知 |
+| `RedisJobFanoutDispatcher` | 订阅目标 Pub/Sub 频道，读取权威 shard 后持久确认、取得分片执行权并调用 Worker |
+| `RedisJobFanoutMonitor` | 扫描 receipt、ready、lease、root 与 gc 索引，负责重发、容量路由、失联策略、聚合和回收 |
+| `RedisJobLeaseRenewer` | 批量续期普通 Run 与 Fanout shard，并维护本地更保守的持权截止点 |
+
+Redis Cluster 中有三个原子域：schedule slot 保存定义、Run、Dispatch、visible、lease、串行等待和回收状态；
+registry slot 保存布局、执行器心跳与能力合同；Fanout bucket slot 保存根、shard、投递信封及全部恢复索引。
+单段 Lua 只跨同一 hash tag 的键，跨域流程依靠稳定标识、幂等状态码和持久 intent 衔接，不宣称跨 slot 事务。
+
+普通任务的顺序是“扫描候选 → Lua 复验并创建唯一 Run → 写 Dispatch 与 visible → start Lua 取得
+`attemptToken`/lease/串行槽 → Handler → finish Lua 提交重试或终态”。Stream 消息只是可重复投递的定位信号，
+Run 才是权威状态；消息丢失、裁剪或消费者退出后由 visible、lease 和 PEL 恢复，同一时刻只有通过 owner 与
+token 复验的 attempt 可以改变调度状态。
+
+Fanout 需要跨 schedule、registry 和 bucket 三个 slot，提交顺序固定为：
+
+1. 在 schedule slot 写入确定性 `fanoutId`、快照标识和创建期限，使根 Run 进入 `FANOUT_CREATING`；成功后普通 Handler 不再拥有根完成权威。
+2. 在 bucket slot 建根记录、分批写 shard 并 commit；任一步响应丢失都能按同一 intent 幂等重放。
+3. 回到 schedule slot 把普通根推进为 `WAITING_CHILDREN`，再分批写 inbox 投递信封、receipt deadline 并发布定向通知。
+4. 若 bucket 已 commit 但删除 fence 阻止根转换，立即把桶切入 `CANCELLING`，阻止全局看门狗继续开放新分片。
+5. 桶内全部 shard 收敛后先形成唯一聚合终态，再回填普通根；保留期到达后才有界删除根、shard 与索引。
+
+状态发布顺序同样是安全边界：持久状态和恢复索引先提交，Pub/Sub 只在其后用于低延迟唤醒。Java Worker 不通过
+`XREADGROUP` 轮询 Fanout inbox；它订阅目标频道，再以通知中的 `fanoutId/seq/assignmentEpoch` 读取并复验
+持久 shard。通知丢失时，receipt 或 ready 扫描器根据权威状态重新发布；inbox 中的稳定消息 ID 用于接收确认、
+assignment 切换时撤销旧投递以及终态清理，旧节点不能凭迟到通知越过新代次。
 
 #### Spring 接入
 
-应用入口添加 `@EnableRedis`，并显式开启 RedisJob。`RedisJobConfiguration` 会装配一个
-`RedisJobScheduler`，`RedisJobAnnotationRegistrar` 在单例就绪后发现 Spring Bean 上的注解方法；
-调度器作为 `SmartLifecycle` 随容器启动、drain 和关闭。
+`@EnableRedis` 只装配 RedisTemplate、RedisProxy 与分布式锁；RedisJob 必须通过 `@EnableRedisJob` 独立开启。
+该入口只建立 `RedisJobSchedulers` 管理器、配置绑定、运行时提示和注解登记器，不创建任何具体 source 的
+Scheduler，也不向容器暴露默认 `RedisJobScheduler` Bean。注解登记器只为 `@RedisJob.qualifier` 实际声明的
+source 建立运行时；编程式任务在首次调用 `RedisJobSchedulers.scheduler(sourceId)` 时建立对应运行时。
+同一 source 在进程内只创建一次，全部实际建立的 Scheduler 由管理器统一启动、停止和关闭；滚动发布时的
+`drain()` / `activate()` 是单个 `RedisJobScheduler` 的控制入口，不是管理器的全数据源广播操作。
+管理器同时承载静态门面的生命周期权威：一个 JVM 同一时刻只允许一套活动管理器，第二个并行应用上下文会
+在初始化时被拒绝；容器关闭后静态入口立即失效，不能持有旧 Scheduler 跨上下文继续使用。
 
 ```java
 @SpringBootApplication
 @EnableRedis
+@EnableRedisJob
 public class Application {
 }
 ```
@@ -121,7 +190,6 @@ nasa:
     job:
       enabled: true
       namespace: settlement-service
-      qualifier: primary
       application-name: ${spring.application.name}
       instance-identity: ${HOSTNAME:}
       shard-count: 64
@@ -145,6 +213,7 @@ public class WalletSweepJobs {
 
     @RedisJob(
             name = "contract-wallet-sweep",
+            qualifier = "primary",
             cron = "0/30 * * * * *",
             zone = "UTC",
             concurrency = RedisJobConcurrency.SERIAL_QUEUE,
@@ -163,12 +232,13 @@ public class WalletSweepJobs {
 
     @RedisJob(
             name = "contract-wallet-sweep-worker",
+            qualifier = "primary",
             trigger = RedisJobTrigger.FANOUT_ONLY,
             schema = "contract-wallet-sweep-shard",
             codecs = RedisJobWireCodec.JSON,
             timeoutMs = 120_000L
     )
-    public RedisJobResult sweepShard(RedisJobContext context, List<?> wallets) {
+    public RedisJobResult sweepShard(RedisJobContext context, List<String> wallets) {
         RedisJobFanoutContext shard = context.fanoutContext().orElseThrow();
         context.checkpoint();
         sweepWallets(wallets, shard.executionKey(), context.attemptToken());
@@ -182,6 +252,20 @@ public class WalletSweepJobs {
 fencing 的目标资源上同时校验 `attemptToken`。Redis 调度状态同一时刻只承认一个当前 attempt；已经失权的
 业务线程仍可能运行到下一个 `checkpoint()`，因此框架不承诺外部副作用 exactly-once。
 
+#### 固定周期与同任务串行
+
+`SERIAL_QUEUE` 是注解和编程式定义的默认并发策略，约束范围是同一
+`(qualifier, namespace, jobName)`，在多实例和 Redis Cluster 部署下同样成立。以一分钟 fixed rate 为例：
+某次 Handler 执行超过一分钟时，下一个逻辑时刻仍会形成持久 Run，但它在原子领取阶段进入 `BLOCKED`
+等待队列，不会提交第二个业务线程；当前 attempt 释放串行槽后，队首才重新变为可派发状态。
+积压由 `max-serial-backlog` 限制，并按 `serial-overflow-policy` 选择跳过最旧或最新 Run。
+
+若业务语义是“上一 Run 进入终态后再等一分钟”，使用 `fixedDelayMs`；若到点时仍在运行就应放弃本轮，
+使用 `DISCARD_IF_RUNNING`；只有显式选择 `PARALLEL` 才允许同名 Run 并行。`timeoutMs` 默认 120 秒且取消是
+协作式的，预计执行时间更长时应同时调整定义超时，并保证 Handler 在批量边界和外部副作用前调用
+`checkpoint()`。实际取消阈值取 `timeoutMs` 与 `max-run-duration-ms` 的较小值；Handler 未返回前框架不会
+强制释放串行槽。
+
 #### Fanout 失败策略
 
 | 策略 | 目标不可用时的行为 | 根结果 |
@@ -190,16 +274,25 @@ fencing 的目标资源上同时校验 `attemptToken`。Redis 调度状态同一
 | `STRICT_SNAPSHOT` | 保留冻结快照，不换目标；持续恢复直到根等待超时或被取消 | 超时后外层 Run 为 `FAILED` |
 | `BEST_EFFORT` | 无法执行的分片记为 `SKIPPED`，其余分片继续 | 桶内为 `PARTIAL_FAILED`；外层 Run 为 `FAILED`，`resultCode=PARTIAL_FAILED` |
 
-Pub/Sub 只负责低延迟唤醒，持久 inbox、receipt deadline、ready、lease 和 root 看门狗负责通知丢失后的恢复。
+Pub/Sub 只负责低延迟唤醒。持久 shard 与 receipt deadline、ready、lease、root 索引负责发现未推进状态并
+重新发布通知；inbox 保存稳定投递信封和当前消息 ID，Java Worker 不轮询该 Stream。
 目标节点接受分片时先用 Lua 持久化确认，再通过 Pub/Sub 向根节点发送回执信号。根任务的
 `fanoutReceiptTimeoutMs` 默认是 `2000` 毫秒，`fanoutReceiptMaxRetries` 默认允许首次通知后重发 `3` 次；
 每次超时都先复验持久确认，次数耗尽后才按 `fanoutFailurePolicy` 重分配、等待原快照或跳过。
 每个分片的 `seq`、`executionKey`、assignment、attempt 与结果随 Fanout 记录保留，到
 `fanout-retention-ms` 后由有界清理删除，不会永久驻留 Redis。
 
+目标节点已经确认接收但本地执行槽暂满时，框架把它视为容量背压，而不是节点失联：不累计跨根失联证据，
+不产生 `SKIPPED`，也不消耗真实故障的 `assignmentCount`。即使进程在写入显式容量标记前发生控制队列拥塞，
+ready 普通唤醒耗尽后也会先读取一次兼容存活快照：当前目标仍在快照中时走同一容量出口，快照暂时不可读时
+继续等待，只有目标确定离开快照才进入失败策略。非严格策略跨过 `fanout-capacity-wait-ms` 后只在存在其它
+兼容节点时尝试容量路由；没有候选或容量路由处于静默窗口时继续保留当前 assignment。容量路由有独立的
+有限突发与静默恢复预算，后来出现空闲节点时仍可重新探测。`STRICT_SNAPSHOT` 始终保留冻结目标。
+
 #### 手工触发、控制与观测
 
 ```java
+RedisJobScheduler scheduler = RedisJobSchedulers.scheduler("primary");
 String runId = scheduler.triggerJson("contract-wallet-sweep", requestId, parameter);
 RedisJobRun run = scheduler.findRun("contract-wallet-sweep", runId).orElseThrow();
 
@@ -214,6 +307,16 @@ Map<String, Long> metrics = scheduler.metrics().snapshot();
 `requestId` 是手工触发的幂等键。`pause` 停止新触发与尚未 start 的积压，不撤销已经取得的 attempt；
 取消是协作式的。调度器启动后到首次成功心跳之间 `health()` 可能短暂返回 `DEGRADED`，最长为一个
 `heartbeat-ms` 周期；接入 readiness 时应保留相应启动宽限，并把 `DRAINING` 与 `DOWN` 分开处理。
+
+#### 多数据源
+
+`@RedisJob.qualifier` 是必填项；`@RedisJob(qualifier = "match")` 把任务登记到指定 Redis 数据源，任务身份是
+`(qualifier, namespace, jobName)`：每个数据源独享调度器、执行器注册表、线程池与 Fanout，互不可见；
+键前缀、`runId`、`executionKey` 和消息内的来源声明都包含语言无关 source id（`primary`、`match`，
+不带 Spring Bean 后缀）。数据源不存在时应用启动失败，不会静默回退到 `primary`；
+`nasa.redis.job.sources.<id>.*` 只覆盖参数，不会主动创建 Scheduler。没有注解或静态调用引用的 RedisProxy
+不会产生 RedisJob 线程、订阅或注册表成员。多数据源身份、来源复验与不可变布局门禁见
+[RedisJob 架构与运行指南](REDIS-JOB.md) 的「多数据源」章节。
 
 详细键模型、状态机、失败边界、配置关系和运维约束见 [RedisJob 架构与运行指南](REDIS-JOB.md)。
 
@@ -258,6 +361,7 @@ nasa:
 环形 HASH 桶和整桶 `PEXPIRE`。解析结果与 TTL、桶跨度、shard 数一起写入共享 layout marker；其它应用
 节点必须服从同一布局，运行期间不允许改变这些参数。目标键和 sidecar 账本键始终作为 Lua `KEYS` 传入，
 框架按目标键的真实 CRC16 slot 派生 canonical hash tag，并在客户端与 Redis Cluster 两侧复验同槽。
+环形桶只在 Redis 时间向前进入新代次时换代；时钟回拨命中较新代次时保留其中仍处于保证窗口的凭证。
 
 跨语言实现幂等身份时必须逐字节一致：`target-digest` 是目标键序列化字节的 SHA-256 小写 hex；凭证 field
 依次写入结构类型、字段或成员、nonce 的 4 字节大端长度与内容后取原始 SHA-256，其中结构类型固定为

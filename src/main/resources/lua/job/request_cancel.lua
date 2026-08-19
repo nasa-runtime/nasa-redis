@@ -33,25 +33,53 @@ elseif state == 'QUEUED' and not currentOwner then
 end
 redis.call('XADD', KEYS[7], 'MAXLEN', '~', 100000, '*', 'runId', ARGV[1], 'state', 'CANCELLED')
 redis.call('PEXPIRE', KEYS[1], ARGV[3])
+-- 固定延迟重排前必须复验定义未换代：Run 携带的 definitionRevision 与当前定义相等、
+-- 定义仍为 ENABLED 且仍声明 FIXED_DELAY。缺任一条件时，旧执行实例会取得新定义的调度写权，
+-- 把已改为 FIXED_RATE/CRON 的定义拉回旧固定延迟节奏，覆盖新修订已计算的调度时刻。
 if redis.call('HGET', KEYS[1], 'triggerType') == 'FIXED_DELAY'
-        and redis.call('HGET', KEYS[8], 'state') == 'ENABLED' then
+        and redis.call('HGET', KEYS[8], 'state') == 'ENABLED'
+        and redis.call('HGET', KEYS[8], 'scheduleType') == 'FIXED_DELAY'
+        and redis.call('HGET', KEYS[1], 'definitionRevision') == redis.call('HGET', KEYS[8], 'definitionRevision') then
     local nextFireAt = now + tonumber(redis.call('HGET', KEYS[8], 'intervalMs') or '0')
     redis.call('HSET', KEYS[8], 'lastFireAt', redis.call('HGET', KEYS[1], 'logicalFireAt'),
             'nextFireAt', nextFireAt)
     redis.call('ZADD', KEYS[9], nextFireAt, ARGV[2])
 end
 if releaseNext then
-    -- 只有占有串行槽或已成为无 running 记录的队首时，取消才负责开放下一成员。
+    -- 只有占有串行槽或已成为无 running 记录的队首时，取消才负责交接；删除 fence 内的旧成员
+    -- 直接终态化，单次最多处理固定数量，余量由 reaper 继续推进。
     local prefix = ARGV[4]
-    while true do
+    local jobState = redis.call('HGET', KEYS[8], 'state')
+    local deletedRevision = tonumber(redis.call('HGET', KEYS[8], 'deletedRevision') or '-1')
+    local handoffComplete = false
+    for index = 1, 100 do
         local nextEntry = redis.call('ZPOPMIN', KEYS[6], 1)
-        if not nextEntry[1] then break end
+        if not nextEntry[1] then
+            handoffComplete = true
+            break
+        end
         local nextRunKey = prefix .. 'run:' .. nextEntry[1]
         if redis.call('HGET', nextRunKey, 'state') == 'BLOCKED' then
-            redis.call('HSET', nextRunKey, 'state', 'QUEUED', 'nextVisibleAt', now)
-            redis.call('ZADD', KEYS[2], now, nextEntry[1])
-            return {'OK', '0'}
+            local nextRevision = tonumber(redis.call('HGET', nextRunKey, 'definitionRevision') or '0')
+            if jobState == 'DELETED' or nextRevision <= deletedRevision then
+                redis.call('HSET', nextRunKey, 'state', 'CANCELLED', 'finishedAt', now,
+                        'resultCode', 'JOB_DELETED')
+                redis.call('ZREM', KEYS[2], nextEntry[1])
+                redis.call('ZREM', KEYS[3], nextEntry[1])
+                redis.call('ZREM', KEYS[4], nextEntry[1])
+                redis.call('XADD', KEYS[7], 'MAXLEN', '~', 100000, '*',
+                        'runId', nextEntry[1], 'state', 'CANCELLED', 'resultCode', 'JOB_DELETED')
+                redis.call('PEXPIRE', nextRunKey, ARGV[3])
+            else
+                redis.call('HSET', nextRunKey, 'state', 'QUEUED', 'nextVisibleAt', now)
+                redis.call('ZADD', KEYS[2], now, nextEntry[1])
+                handoffComplete = true
+                return {'OK', '0'}
+            end
         end
+    end
+    if not handoffComplete and redis.call('ZCARD', KEYS[6]) > 0 then
+        redis.call('SADD', prefix .. 'reaping', ARGV[2])
     end
 end
 return {'OK', '-1'}

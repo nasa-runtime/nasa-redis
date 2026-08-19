@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.List;
 
 /**
  * 业务作用：按跨语言固定字节规范生成任务、运行、能力和分片标识。
@@ -19,26 +20,35 @@ public final class RedisJobIdentifiers {
     /**
      * 业务作用：生成自动调度 Run 的稳定幂等标识。
      *
+     * <p>qualifier 必须参与计算：调用方会把 runId 当作外部系统的业务幂等键，两个独立 Redis 上
+     * 同名、同一逻辑时刻的任务若算出同一个值，另一个数据源的合法任务会被误判为重复。
+     *
+     * @param qualifier     语言无关的 source id
      * @param namespace     命名空间
      * @param jobName       任务名
      * @param logicalFireAt 逻辑触发时刻
      * @param triggerType   触发类型
      * @return 32 位小写十六进制标识。
      */
-    public static String scheduledRunId(String namespace, String jobName, long logicalFireAt, String triggerType) {
-        return digest128(namespace, jobName, Long.toString(logicalFireAt), triggerType);
+    public static String scheduledRunId(String qualifier, String namespace, String jobName,
+                                        long logicalFireAt, String triggerType) {
+        return digest128(qualifier, namespace, jobName, Long.toString(logicalFireAt), triggerType);
     }
 
     /**
      * 业务作用：生成手工触发 Run 的稳定幂等标识，观测时刻不参与计算。
      *
+     * <p>qualifier 参与计算的理由同 {@link #scheduledRunId}：相同 requestId 在两个数据源上
+     * 必须是两次独立触发，不能互相顶替。
+     *
+     * @param qualifier 语言无关的 source id
      * @param namespace 命名空间
      * @param jobName   任务名
      * @param requestId 调用方幂等请求标识
      * @return 32 位小写十六进制标识。
      */
-    public static String manualRunId(String namespace, String jobName, String requestId) {
-        return digest128(namespace, jobName, "MANUAL", requestId);
+    public static String manualRunId(String qualifier, String namespace, String jobName, String requestId) {
+        return digest128(qualifier, namespace, jobName, "MANUAL", requestId);
     }
 
     /**
@@ -71,6 +81,31 @@ public final class RedisJobIdentifiers {
      */
     public static String workerKey(String workerName) {
         return digest256(workerName);
+    }
+
+    /**
+     * 业务作用：计算能力快照的跨语言摘要，每个身份字段独立参与，避免分隔符歧义。
+     *
+     * <p>不能先用分隔符把字段压成一个字符串再取摘要：namespace、workerName、nodeIdentity 与 executorId
+     * 都允许含冒号，压平后 {@code (namespace="a:b", workerName="c")} 与
+     * {@code (namespace="a", workerName="b:c")} 会得到完全相同的规范串。各语言必须按同一字段序列编码。
+     *
+     * @param qualifier  语言无关的 source id
+     * @param namespace  调度命名空间
+     * @param workerName Worker 能力名
+     * @param selectedAt 快照选定时刻
+     * @param members    按稳定顺序展开的成员字段，每个成员依次为 nodeIdentity、executorId、heartbeatRevision
+     * @return 64 位小写十六进制摘要。
+     */
+    public static String snapshotDigest(String qualifier, String namespace, String workerName,
+                                        long selectedAt, List<String> members) {
+        String[] fields = new String[4 + members.size()];
+        fields[0] = qualifier;
+        fields[1] = namespace;
+        fields[2] = workerName;
+        fields[3] = Long.toString(selectedAt);
+        for (int index = 0; index < members.size(); index++) fields[4 + index] = members.get(index);
+        return digest256(fields);
     }
 
     /**

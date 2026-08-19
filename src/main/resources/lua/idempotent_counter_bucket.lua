@@ -9,7 +9,7 @@
 -- ARGV[5]    nonce TTL 毫秒数
 -- ARGV[6]    单个环形桶跨度毫秒数
 --
--- 返回 {code, value, detail}。顶层数组保证 Lettuce 直发和批次路径使用相同 MULTI 返回形态。
+-- 返回 {code, value, detail}。顶层数组保证直发和批次路径使用相同 MULTI 返回形态。
 
 local targetKey = KEYS[1]
 local recordField = ARGV[1]
@@ -39,7 +39,9 @@ for index = 2, #KEYS do
         local storedEpoch = tonumber(redis.call('HGET', KEYS[index], '__epoch'))
         if storedEpoch ~= nil then
             local age = currentEpoch - storedEpoch
-            if age >= 0 and age < bucketCount then
+            -- 时钟回拨会让已写桶短暂位于“未来”；这类凭证仍在保证窗口内，必须继续参与判重。
+            -- 环形桶真正的陈旧边界只由 age >= bucketCount 判定，不能因负 age 放开同 nonce 重放。
+            if age < bucketCount then
                 local previous = redis.call('HGET', KEYS[index], recordField)
                 if previous then
                     return { 'DUPLICATE', previous, '' }
@@ -49,7 +51,7 @@ for index = 2, #KEYS do
     end
 end
 
--- Hash 没有 HDECRBY，只在首次请求路径改变符号，避免 Java 侧 Long.MIN_VALUE 取负溢出。
+-- Hash 没有 HDECRBY，只在首次请求路径改变符号；-9223372036854775808 取负会 int64 越界，单独拒绝。
 if opType == 'HASH_DECR' then
     if delta == '-9223372036854775808' then
         return { 'REJECTED_COMMAND', '', 'hash decrement delta is outside HINCRBY range' }
@@ -88,14 +90,14 @@ else
     value = redis.call('GET', targetKey)
 end
 
--- ring index 再利用时先整桶换代，旧窗口凭证不能进入新一轮判重。
+-- ring index 随时间前进再次利用时先整桶换代，旧窗口凭证不能进入新一轮判重。
+-- 时钟回拨命中未来代次时保留整桶，并把新凭证写入该较新代次；删除它会放开仍在保证窗口内的重放。
 local currentIndex = currentEpoch % bucketCount
 local currentLedgerKey = KEYS[currentIndex + 2]
-local storedEpoch = redis.call('HGET', currentLedgerKey, '__epoch')
-local currentEpochString = string.format('%d', currentEpoch)
-if storedEpoch ~= currentEpochString then
+local storedEpoch = tonumber(redis.call('HGET', currentLedgerKey, '__epoch'))
+if storedEpoch == nil or storedEpoch < currentEpoch then
     redis.call('DEL', currentLedgerKey)
-    redis.call('HSET', currentLedgerKey, '__epoch', currentEpochString)
+    redis.call('HSET', currentLedgerKey, '__epoch', string.format('%d', currentEpoch))
 end
 
 redis.call('HSET', currentLedgerKey, recordField, value)

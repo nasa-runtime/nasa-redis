@@ -4,11 +4,13 @@ package io.github.nasaruntime.redis.cache.redis.job;
  * 业务作用：枚举 RedisJob 随 jar 发布并由 SHA 缓存执行的权威状态脚本。
  */
 enum RedisJobScript {
+    JOB_LAYOUT("job_layout.lua"),
     JOB_REGISTER("job_register.lua"),
     JOB_PAUSE("job_pause.lua"),
     JOB_RESUME("job_resume.lua"),
     JOB_DELETE("job_delete.lua"),
     JOB_CLEANUP_TOMBSTONES("job_cleanup_tombstones.lua"),
+    JOB_REAP("job_reap.lua"),
     JOB_RESOLVE_CONFLICT("job_resolve_conflict.lua"),
     NAMESPACE_SET_STATE("namespace_set_state.lua"),
     SCAN_DUE("scan_due.lua"),
@@ -28,6 +30,7 @@ enum RedisJobScript {
     PROMOTE_VISIBLE("promote_visible.lua"),
     REQUEST_CANCEL("request_cancel.lua"),
     EXECUTOR_REGISTER("executor_register_capabilities.lua"),
+    EXECUTOR_REMOVE_CAPABILITY("executor_remove_capability.lua"),
     EXECUTOR_HEARTBEAT("executor_heartbeat.lua"),
     EXECUTOR_UNREGISTER("executor_unregister.lua"),
     EXECUTOR_RECORD_FANOUT_EVIDENCE("executor_record_fanout_evidence.lua"),
@@ -43,6 +46,7 @@ enum RedisJobScript {
     FANOUT_ACCEPT_SHARD("fanout_accept_shard.lua"),
     FANOUT_RETRY_RECEIPT("fanout_retry_receipt.lua"),
     FANOUT_PROMOTE_READY("fanout_promote_ready.lua"),
+    FANOUT_DEFER_READY("fanout_defer_ready.lua"),
     FANOUT_REASSIGN_SHARD("fanout_reassign_shard.lua"),
     FANOUT_AGGREGATE("fanout_aggregate.lua"),
     FANOUT_FAIL_CREATING("fanout_fail_creating.lua"),

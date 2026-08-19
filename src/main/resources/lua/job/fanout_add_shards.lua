@@ -1,6 +1,7 @@
 -- 业务作用：在 Fanout 提交前按有界批次幂等建立 shard HASH。
 -- KEYS[1] Fanout 根 HASH；KEYS[2..n] 本批 shard HASH。
--- ARGV[1] snapshotId；ARGV[2] 本批数量；之后每个 shard 使用 15 个字段：
+-- ARGV[1] snapshotId；ARGV[2] 本批数量；ARGV[3] schedulerQualifier；ARGV[4] protocolVersion；
+-- 之后每个 shard 使用 15 个字段：
 -- shardIndex、fanoutId、rootRunId、workerName、contractRevision、schemaId、wireCodec、shardTotal、seq、executionKey、
 -- targetNodeIdentity、targetStartupId、targetHeartbeatRevision、originExecutorId、parameterPayload。
 -- 返回：STATE_MISMATCH、CONFLICT，或 {OK, addedCount, createdShardCount}。
@@ -10,13 +11,17 @@ if redis.call('HGET', KEYS[1], 'state') ~= 'CREATING' then return {'STATE_MISMAT
 if redis.call('HGET', KEYS[1], 'snapshotId') ~= ARGV[1] then return {'CONFLICT'} end
 local count = tonumber(ARGV[2])
 local added = 0
-local cursor = 3
+-- 头部新增两个字段后, 每批 shard 的字段游标随之后移
+local cursor = 5
 for index = 1, count do
     local shardKey = KEYS[index + 1]
     local shardIndex = ARGV[cursor]
     if redis.call('EXISTS', shardKey) == 0 then
         redis.call('HSET', shardKey,
                 'fanoutId', ARGV[cursor + 1], 'rootRunId', ARGV[cursor + 2],
+                -- shard 自带来源与协议代次声明：Fanout 取得执行权时要能脱离键前缀独立复验，
+                -- 并像普通 Run 一样拒绝自己不理解的高协议消息。
+                'schedulerQualifier', ARGV[3], 'protocolVersion', ARGV[4],
                 'snapshotId', ARGV[1], 'workerName', ARGV[cursor + 3],
                 'contractRevision', ARGV[cursor + 4], 'schemaId', ARGV[cursor + 5],
                 'wireCodec', ARGV[cursor + 6], 'shardIndex', shardIndex,

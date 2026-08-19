@@ -1,12 +1,15 @@
 package io.github.nasaruntime.redis.cache.redis.job;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JavaType;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 
 import java.io.IOException;
+import java.lang.reflect.Type;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
@@ -60,12 +63,53 @@ public final class RedisJobJsonCodec {
      */
     public <T> T decode(byte[] bytes, Class<T> type) {
         Objects.requireNonNull(type, "type must not be null");
+        return decode(bytes, mapper.getTypeFactory().constructType(type));
+    }
+
+    /**
+     * 业务作用：按 Handler 提供的完整泛型类型解码 JSON，使集合、Map 和嵌套 DTO 保留元素类型。
+     *
+     * <p>类型只来自本地已登记的 Handler 静态签名，不由消息内容选择，因此不会成为跨语言协议的一部分。
+     *
+     * @param bytes JSON 字节
+     * @param type  Handler 声明的完整泛型
+     * @param <T>   参数类型
+     * @return 解码后的参数。
+     */
+    public <T> T decode(byte[] bytes, TypeReference<T> type) {
+        Objects.requireNonNull(type, "type must not be null");
+        return decode(bytes, mapper.getTypeFactory().constructType(type.getType()));
+    }
+
+    /**
+     * 业务作用：所有解码重载的唯一出口，保证 Class 与 TypeReference 两条路径共用同一套
+     * 安全映射器和 JVM 类型元数据门禁，任一路径都不能重新启用 Default Typing。
+     *
+     * @param bytes JSON 字节
+     * @param type  已解析的 Jackson 类型
+     * @param <T>   参数类型
+     * @return 解码后的参数；字节含类型元数据或结构不匹配时抛出 INVALID_PAYLOAD。
+     */
+    public <T> T decode(byte[] bytes, JavaType type) {
+        Objects.requireNonNull(type, "type must not be null");
+        // 先做类型元数据门禁再绑定: 一旦交给 readValue, 携带 @class/@type 的输入就有机会触发类型解析
         validate(bytes);
         try {
             return mapper.readValue(bytes, type);
         } catch (IOException e) {
             throw new IllegalArgumentException("INVALID_PAYLOAD", e);
         }
+    }
+
+    /**
+     * 业务作用：把注解方法反射得到的参数类型转成 Jackson 类型，使登记期确定的泛型契约与运行期解码一致。
+     *
+     * @param type 反射得到的参数类型
+     * @return 对应的 Jackson 类型。
+     */
+    public JavaType javaType(Type type) {
+        Objects.requireNonNull(type, "type must not be null");
+        return mapper.getTypeFactory().constructType(type);
     }
 
     /**

@@ -9,7 +9,7 @@
 -- ARGV[5] nonce TTL 毫秒数
 -- ARGV[6] 兼容统一调用协议，本布局不读取该值
 --
--- 返回 {code, value, detail}。顶层数组保证 Lettuce 直发和批次路径使用相同 MULTI 返回形态。
+-- 返回 {code, value, detail}。顶层数组保证直发和批次路径使用相同 MULTI 返回形态。
 
 local targetKey = KEYS[1]
 local ledgerKey = KEYS[2]
@@ -34,7 +34,7 @@ if previous then
     return { 'DUPLICATE', previous, '' }
 end
 
--- Hash 没有 HDECRBY，只在首次请求路径改变符号，避免 Java 侧 Long.MIN_VALUE 取负溢出。
+-- Hash 没有 HDECRBY，只在首次请求路径改变符号；-9223372036854775808 取负会 int64 越界，单独拒绝。
 if opType == 'HASH_DECR' then
     if delta == '-9223372036854775808' then
         return { 'REJECTED_COMMAND', '', 'hash decrement delta is outside HINCRBY range' }

@@ -19,7 +19,10 @@ local time = redis.call('TIME')
 local now = time[1] * 1000 + math.floor(time[2] / 1000)
 local workerName = redis.call('HGET', KEYS[1], 'workerName')
 local workerKey = redis.call('HGET', KEYS[1], 'workerKey')
+-- Run 的来源声明只从定义继承, 不由调用方传入: 定义是该数据源的唯一权威
+local sourceId = redis.call('HGET', KEYS[1], 'schedulerQualifier') or ''
 redis.call('HSET', KEYS[2],
+        'schedulerQualifier', sourceId,
         'runId', ARGV[1], 'requestId', ARGV[2], 'jobName', ARGV[9],
         'workerName', workerName, 'workerKey', workerKey,
         'protocolVersion', ARGV[7], 'scheduleShard', ARGV[8],
@@ -29,9 +32,11 @@ redis.call('HSET', KEYS[2],
         'triggerType', 'MANUAL', 'logicalFireAt', now, 'triggeredAt', now,
         'state', 'QUEUED', 'attempt', 0, 'dispatchAttempts', 0,
         'nextVisibleAt', now + tonumber(ARGV[6]), 'createdAt', now)
-local messageId = redis.call('XADD', KEYS[4], '*',
+-- 信封同样携带来源声明: 跨语言消费者不必先读 Run 记录就能拒绝串源消息
+local messageId = redis.call('XADD', KEYS[4], 'MAXLEN', '~', 100000, '*',
         'runId', ARGV[1], 'jobName', ARGV[9], 'workerName', workerName,
         'protocolVersion', ARGV[7],
-        'definitionRevision', redis.call('HGET', KEYS[1], 'definitionRevision'))
+        'definitionRevision', redis.call('HGET', KEYS[1], 'definitionRevision'),
+        'schedulerQualifier', sourceId)
 redis.call('ZADD', KEYS[3], now + tonumber(ARGV[6]), ARGV[1])
 return {'OK', ARGV[1], tostring(now), messageId}

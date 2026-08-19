@@ -24,7 +24,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /**
- * 业务作用：接收定向 Fanout 通知、持久确认 shard，并以公共状态脚本启动和完成 Worker。
+ * 业务作用：订阅定向 Fanout Pub/Sub 通知，读取并持久确认权威 shard，再以公共状态脚本启动和完成 Worker。
+ *
+ * <p>Java 运行时不轮询 inbox Stream；通知只携带定位与 assignment 代次，receipt/ready 索引负责丢失后的
+ * 重新发布，inbox 消息 ID 用于确认、撤销旧 assignment 和终态清理。
  */
 @Slf4j
 final class RedisJobFanoutDispatcher implements AutoCloseable {
@@ -102,6 +105,22 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
     void register(RedisJobDefinition definition, RedisJobHandler handler) {
         definitions.put(definition.workerName(), definition);
         handlers.put(definition.workerName(), handler);
+    }
+
+    /**
+     * 业务作用：撤销已删除 Worker 的本地定义与 Handler，使新通知不再被本节点认领执行。
+     *
+     * <p>能力名可能被多个本地定义共享，仅在无其它定义仍使用时移除；已取得执行权的 shard 按
+     * "允许当前 attempt 完成"语义继续，由持有线程自行收尾。
+     *
+     * @param definition       Worker 定义
+     * @param workerStillUsed  同名能力是否仍被其它本地定义使用
+     *                         返回：无返回值。
+     */
+    void unregister(RedisJobDefinition definition, boolean workerStillUsed) {
+        if (workerStillUsed) return;
+        definitions.remove(definition.workerName());
+        handlers.remove(definition.workerName());
     }
 
     /**
@@ -205,9 +224,16 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
                         keys.fanoutReceipts(fanoutId), keys.fanoutReady(fanoutId),
                         keys.fanoutReceiptChannel(fanoutId, shard.originExecutorId())},
                 fanoutId, seq, registry.nodeIdentity(), registry.executorId(), epoch,
-                properties.getMinScanIntervalMs(), pubSub.publishCommand());
+                properties.getMinScanIntervalMs(), pubSub.publishCommand(),
+                // 持久确认前复验来源、协议代次与本地 Worker 合同: 确认即承诺执行,
+                // 不可执行的 shard 必须留在 AWAITING_RECEIPT, 由接收重试按失败策略换兼容节点
+                keys.qualifier(), properties.getProtocolVersion(),
+                definition.contractRevision(), definition.schemaId(), definition.wireCodecs());
         String acceptCode = value(accepted, 0);
-        if (!"OK".equals(acceptCode) && !"ADOPTED".equals(acceptCode)) return;
+        if (!"OK".equals(acceptCode) && !"ADOPTED".equals(acceptCode)) {
+            metrics.incrementClassified("redis_job_fanout_accept", acceptCode, "");
+            return;
+        }
         metrics.increment("redis_job_fanout_received_total");
         start(definition, handler, read(fanoutId, seq), messageId);
     }
@@ -260,7 +286,11 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
      */
     private void start(RedisJobDefinition definition, RedisJobHandler handler,
                        FanoutShardData shard, String messageId) {
-        if (shard == null || !capacity.tryAcquire()) return;
+        if (shard == null) return;
+        if (!capacity.tryAcquire()) {
+            deferForCapacity(shard);
+            return;
+        }
         String fanoutId = shard.fanoutId();
         long seq = shard.seq();
         List<Object> response;
@@ -273,7 +303,12 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
                     shard.workerName(), RedisJobIdentifiers.shardRunId(fanoutId, seq), registry.executorId(),
                     messageId, properties.getLeaseMs(), RedisJobConcurrency.PARALLEL.name(), 0,
                     properties.getMinScanIntervalMs(), INBOX_GROUP, properties.getFanoutRetentionMs(),
-                    "FANOUT", registry.nodeIdentity(), shard.assignmentEpoch(), fanoutId, seq, "", "", "");
+                    // ARGV[16] 期望 executionKey: shard 记录的身份字段被错误改写时在取得执行权前拒绝
+                    "FANOUT", registry.nodeIdentity(), shard.assignmentEpoch(), fanoutId, seq,
+                    keys.executionKey(fanoutId, seq), "", "",
+                    // 取得执行权前复验来源、协议代次与本地 Worker 合同, 与普通 Run 同一条不变量
+                    keys.qualifier(), properties.getProtocolVersion(),
+                    definition.contractRevision(), definition.schemaId(), definition.wireCodecs());
         } catch (RuntimeException error) {
             capacity.release();
             throw error;
@@ -303,6 +338,30 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
     }
 
     /**
+     * 业务作用：本地执行槽暂满时保留当前 assignment，并把已确认分片延后到下一轮可见性扫描。
+     *
+     * <p>节点已经收到定向通知且通过合同复验，短时容量不足不能作为目标失联证据；连续等待超过容量
+     * 窗口后，非严格策略开放容量路由，使其它兼容节点有机会接管；严格快照保留固定目标与既有退避。
+     *
+     * @param shard 已确认接收的 shard
+     *              返回：无返回值；assignment 已变化时不改写新代次。
+     */
+    private void deferForCapacity(FanoutShardData shard) {
+        List<Object> response = scripts.list(RedisJobScript.FANOUT_DEFER_READY,
+                new String[]{keys.fanoutShard(shard.fanoutId(), shard.seq()),
+                        keys.fanoutReady(shard.fanoutId()), keys.fanoutRoot(shard.fanoutId())},
+                shard.fanoutId(), shard.seq(), registry.nodeIdentity(), shard.assignmentEpoch(),
+                properties.getMinScanIntervalMs(), properties.getFanoutCapacityWaitMs(),
+                properties.getReadyMaxWakeups(), "CONTINUE");
+        String code = value(response, 0);
+        if ("CAPACITY_EXHAUSTED".equals(code)) {
+            metrics.increment("redis_job_fanout_capacity_exhausted_total");
+        } else if (!"DEFERRED".equals(code) && !"STALE".equals(code) && !"STALE_ASSIGNMENT".equals(code)) {
+            metrics.incrementClassified("redis_job_fanout_capacity_defer", code, "");
+        }
+    }
+
+    /**
      * 业务作用：运行已取得 shard 执行权的 Worker，并通过公共 finish_run.lua 聚合根终态。
      *
      * @param definition  Worker 定义
@@ -326,7 +385,8 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
             RedisJobRepository.RunData runData = new RedisJobRepository.RunData(run, shard.payload(),
                     shard.schemaId(), shard.codec(), shard.fanoutId(), shard.snapshotId(), 0, 0L);
             RedisJobFanoutContext fanoutContext = new FanoutContext(shard);
-            DefaultRedisJobContext context = new DefaultRedisJobContext(keys.namespace(), runData, attempt, token,
+            DefaultRedisJobContext context = new DefaultRedisJobContext(keys.qualifier(),
+                    keys.namespace(), runData, attempt, token,
                     properties.getLeaseMs(), properties.getRenewRttAllowanceMs() + properties.getClockDriftAllowanceMs(),
                     jsonCodec, null, fanoutContext);
             leaseHandle = leaseRenewer.registerFanout(shard.fanoutId(), shard.seq(), context);
@@ -374,10 +434,14 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
                 RedisJobIdentifiers.shardRunId(shard.fanoutId(), shard.seq()), registry.executorId(), token,
                 shard.workerName(), result.code().name(), result.summary(), definition.maxAttempts(),
                 definition.retryDelayMs(), properties.getFanoutRetentionMs(), "FANOUT",
-                shard.fanoutId(), shard.seq(), shard.assignmentEpoch(), "");
+                shard.fanoutId(), shard.seq(), shard.assignmentEpoch(),
+                // 完成结果只能记到本节点实际执行的分片身份上, executionKey 由本地键路由权威重新推导
+                keys.executionKey(shard.fanoutId(), shard.seq()));
         String state = value(response, 1);
         if (!state.isEmpty()) metrics.incrementClassified("redis_job_fanout_shard", state, "");
-        if ("STALE_ASSIGNMENT".equals(value(response, 0))) {
+        String finishCode = value(response, 0);
+        if (!"OK".equals(finishCode)) metrics.incrementClassified("redis_job_fanout_finish", finishCode, "");
+        if ("STALE_ASSIGNMENT".equals(finishCode)) {
             metrics.increment("redis_job_fanout_stale_assignment_total");
         }
     }

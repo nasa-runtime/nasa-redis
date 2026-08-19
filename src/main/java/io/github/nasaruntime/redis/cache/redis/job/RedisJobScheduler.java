@@ -23,6 +23,15 @@ import java.util.concurrent.atomic.AtomicLongArray;
 
 /**
  * 业务作用：作为 RedisJob 门面统一管理定义、触发、查询、调度扫描、租约恢复与 Fanout 生命周期。
+ *
+ * <p>调度器不选举应用级主节点；多个实例可以扫描同一固定分片，Redis TIME、同 slot Lua、持久 Run、
+ * Dispatch Stream、租约与 fencing token 共同裁决唯一当前执行权。普通任务是至少一次语义，外部副作用
+ * 仍需使用 runId、executionKey 或目标系统 fencing 幂等。
+ *
+ * <p>同名任务默认使用 {@link RedisJobConcurrency#SERIAL_QUEUE} 在集群范围串行；fixed rate 可以形成
+ * 有界积压但不会并行提交 Handler，fixed delay 则在当前 Run 终态后计算下一时刻。Fanout 按 Worker
+ * 能力合同冻结节点快照；Java Worker 由 Pub/Sub 唤醒后读取权威 shard，receipt、ready、lease 与 root
+ * 索引负责重新发布和恢复，inbox 保存可原子撤销的稳定投递身份。容量背压不会被当作节点失联。
  */
 @Slf4j
 public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
@@ -48,6 +57,7 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicBoolean draining = new AtomicBoolean();
+    private final AtomicBoolean layoutConfirmed = new AtomicBoolean();
     private final AtomicLong lastHeartbeatAt = new AtomicLong();
     private final AtomicLong lastScheduleScanAt = new AtomicLong();
 
@@ -60,16 +70,20 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     public RedisJobScheduler(RedisProxy redisProxy, RedisJobProperties properties) {
         this.properties = Objects.requireNonNull(properties, "properties must not be null").validate();
         this.visibleScanUpperBoundMs = this.properties.getMaxScanIntervalMs();
-        RedisProxy selected = RedisProxy.load(properties.getQualifier());
-        if (selected == null) selected = Objects.requireNonNull(redisProxy, "redisProxy must not be null");
-        this.keys = new RedisJobKeyspace(properties.getNamespace(), properties.getShardCount(),
+        // source id 必须来自调用方实际选中的 RedisProxy，而不是另一份可漂移的配置字段；这样键前缀、
+        // 物理连接和上下文声明天然绑定同一来源，也不存在遗漏配置后回退 primary 的路径。
+        RedisProxy supplied = Objects.requireNonNull(redisProxy, "redisProxy must not be null");
+        String sourceId = RedisJobSchedulers.sourceId(supplied.getQualifier());
+        RedisProxy selected = requireRoutedProxy(sourceId, supplied);
+        this.keys = new RedisJobKeyspace(sourceId, properties.getNamespace(), properties.getShardCount(),
                 properties.getFanoutBucketCount());
         this.scripts = new RedisJobScriptExecutor(selected);
         this.repository = new RedisJobRepository(properties, keys, scripts);
         this.jsonCodec = new RedisJobJsonCodec();
         this.registry = new RedisJobExecutorRegistry(properties, keys, scripts);
-        this.fanoutCoordinator = new RedisJobFanoutCoordinator(properties, keys, scripts, registry, jsonCodec);
-        this.fanoutMonitor = new RedisJobFanoutMonitor(properties, keys, scripts, registry);
+        this.fanoutMonitor = new RedisJobFanoutMonitor(properties, keys, scripts, registry, metrics);
+        this.fanoutCoordinator = new RedisJobFanoutCoordinator(
+                properties, keys, scripts, registry, jsonCodec, fanoutMonitor::requestCancel);
         this.leaseRenewer = new RedisJobLeaseRenewer(properties, keys, scripts, registry.executorId());
         this.dispatcher = new RedisJobDispatcher(selected, properties, keys, repository, jsonCodec,
                 fanoutCoordinator, registry, leaseRenewer, metrics);
@@ -93,6 +107,9 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     public void register(RedisJobDefinition definition, RedisJobHandler handler) {
         Objects.requireNonNull(definition, "definition must not be null");
         Objects.requireNonNull(handler, "handler must not be null");
+        // 布局门禁必须早于任何定义写入: 分片数或桶数不一致的节点若先写了定义,
+        // 同一任务就形成两份定义与两套调度时刻, 之后只能人工对账
+        confirmLayout();
         RedisJobDefinition current = definitions.get(definition.name());
         if (current != null && current.definitionRevision() == definition.definitionRevision()
                 && !current.definitionDigest().equals(definition.definitionDigest())) {
@@ -180,6 +197,19 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
         refreshLocalShards();
         handlers.remove(jobName);
         fanoutMonitor.unregister(definition);
+        // 撤销派发与 Fanout 侧的全部登记：只删门面层映射时，注册表心跳会继续续期旧能力，
+        // 删除之后创建的新根仍会把该 Worker 冻结进快照并由本地 Handler 真实执行
+        dispatcher.unregister(definition);
+        // Fanout 能力所有权只属于 FANOUT_ONLY 定义：普通定义复用 workerName 不提供 Fanout Handler，
+        // 把它计入引用会让被删 Worker 的能力与 Handler 全部保留，删除之后创建的新根仍会选中并执行它
+        boolean fanoutStillUsed = definitions.values().stream()
+                .anyMatch(other -> other.trigger() == RedisJobTrigger.FANOUT_ONLY
+                        && other.workerName().equals(definition.workerName()));
+        fanoutDispatcher.unregister(definition, fanoutStillUsed);
+        fanoutCoordinator.unregister(definition, fanoutStillUsed);
+        if (definition.trigger() == RedisJobTrigger.FANOUT_ONLY && !fanoutStillUsed) {
+            registry.removeCapability(definition.workerName());
+        }
     }
 
     /**
@@ -195,7 +225,7 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     }
 
     /**
-     * 业务作用：最终一致地关闭全部调度分片的新触发门禁，不撤销已经取得的执行权。
+     * 业务作用：最终一致地关闭全部调度分片的普通 Run 新执行权门禁，不撤销已经取得的 attempt。
      *
      * @param actor 操作来源
      *              返回：无返回值；任一分片拒绝时抛出异常。
@@ -205,7 +235,7 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     }
 
     /**
-     * 业务作用：最终一致地重新开放全部调度分片的新触发门禁。
+     * 业务作用：最终一致地重新开放全部调度分片的普通 Run 新执行权门禁。
      *
      * @param actor 操作来源
      *              返回：无返回值；任一分片拒绝时抛出异常。
@@ -273,6 +303,91 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     }
 
     /**
+     * 业务作用：把本节点的不可变布局写入或比对该数据源的 layout marker，不一致时拒绝参与调度。
+     *
+     * <p>相同 {@code (qualifier, namespace)} 的所有 Java、Go、Rust 节点必须使用相同分片数、Fanout 桶数、
+     * 协议代次和派发消费组。分片数不同会让同一任务落到不同分片、形成两份定义和两套调度时刻并产生重复 Run；
+     * Fanout 桶数不同会让相同 fanoutId 的 root、receipt、lease 和清理游标分散到不同 slot；
+     * 消费组不同则让同一条 Stream 被两个消费组各消费一次。这些都不会自行收敛，必须在加入前挡住。
+     *
+     * <p>marker 位于 registry slot，与被比对的分片布局无关；首个节点原子写入，其余节点只允许完全一致。
+     *
+     * <p>参数说明: 无。
+     * <p>
+     * 返回：无返回值；布局不一致时抛出异常阻止本节点启动。
+     */
+    private void confirmLayout() {
+        if (layoutConfirmed.get()) return;
+        // pubsubMode 是同一任务集的线协议布局而非本地调优项: SHARDED 用 SSUBSCRIBE/SPUBLISH、
+        // BROADCAST 用 SUBSCRIBE/PUBLISH, 两套通道互不可见。混配节点会互相收不到 Fanout 通知,
+        // 根节点只能按自己的模式重发, 健康目标最终被误判失联并触发重分配。
+        String fingerprint = properties.getProtocolVersion() + "|" + keys.qualifier() + "|" + keys.namespace()
+                + "|" + keys.shardCount() + "|" + keys.fanoutBucketCount() + "|" + properties.getDispatchGroup()
+                + "|" + properties.getPubsubMode().name();
+        List<Object> result = scripts.list(RedisJobScript.JOB_LAYOUT,
+                new String[]{keys.layoutMarker()}, fingerprint);
+        String code = result == null || result.isEmpty() ? "" : String.valueOf(result.get(0));
+        if (!"OK".equals(code)) {
+            String existing = result != null && result.size() > 1 ? String.valueOf(result.get(1)) : "";
+            throw new IllegalStateException("RedisJob layout mismatch for qualifier=" + keys.qualifier()
+                    + " namespace=" + keys.namespace() + "; this node=" + fingerprint
+                    + "; already established=" + existing
+                    + "; protocol version, shard count, fanout bucket count and dispatch group are immutable"
+                    + " for an established namespace");
+        }
+        layoutConfirmed.set(true);
+    }
+
+    /**
+     * 业务作用：确认 qualifier、传入代理与进程内登记表三者指向同一个数据源，任一不符即拒绝建立调度器。
+     *
+     * <p>强路由必须在每一条创建入口成立，而不只是在多数据源聚合器里。编程式构造若允许用另一台代理顶替，
+     * Scheduler 会对外报告一个 source id、把定义和 Run 写进另一台物理 Redis，键前缀还伪装成该 source id，
+     * 观测和对账都无法发现。
+     *
+     * @param sourceId   已归一的 source id
+     * @param redisProxy 调用方传入的命令代理，可为 null
+     * @return 登记表中与 sourceId 对应的命令代理。
+     */
+    private static RedisProxy requireRoutedProxy(String sourceId, RedisProxy redisProxy) {
+        RedisProxy registered = RedisProxy.load(sourceId);
+        if (registered == null) {
+            throw new IllegalStateException("unknown RedisJob qualifier: " + sourceId
+                    + "; RedisJob refuses to fall back to another RedisProxy");
+        }
+        if (redisProxy != null && redisProxy != registered) {
+            throw new IllegalStateException("RedisJob qualifier " + sourceId
+                    + " is registered to a different RedisProxy than the one supplied ("
+                    + redisProxy.getQualifier() + ")");
+        }
+        return registered;
+    }
+
+    /**
+     * 业务作用：读取本 Scheduler 永久绑定的语言无关 source id，供多数据源部署区分同名任务的归属。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return source id，不携带 Spring Bean 后缀。
+     */
+    public String qualifier() {
+        // 从构造期冻结的 keyspace 读取而不是可变的配置对象: RedisJobProperties 暴露 setter,
+        // 构造后被改写会让 Redis 键仍在原数据源、而对外报告的 source id 变成另一个, 观测与幂等维度全部失真。
+        return keys.qualifier();
+    }
+
+    /**
+     * 业务作用：读取本 Scheduler 绑定的调度命名空间，与 qualifier 共同构成任务的本地唯一身份。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 命名空间。
+     */
+    public String namespace() {
+        return keys.namespace();
+    }
+
+    /**
      * 业务作用：暴露当前进程的基础指标容器，便于应用桥接 Micrometer 或其它观测系统。
      *
      * <p>参数说明: 无。
@@ -310,24 +425,43 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     @Override
     public void start() {
         if (closed.get()) throw new IllegalStateException("RedisJobScheduler is closed");
+        // 没有任何注解任务的节点也要过门禁: 它仍会登记执行器能力并参与 Fanout 快照
+        confirmLayout();
         if (!running.compareAndSet(false, true)) return;
-        draining.set(false);
-        metrics.gauge("redis_job_executor_capacity", properties.getExecutorCapacity());
-        fanoutDispatcher.start();
-        definitions.values().forEach(registry::register);
-        dispatcher.start();
-        monitors.scheduleWithFixedDelay(this::safeHeartbeat, properties.getHeartbeatMs(),
-                properties.getHeartbeatMs(), TimeUnit.MILLISECONDS);
-        monitors.schedule(this::scheduleScanCycle, 0L, TimeUnit.MILLISECONDS);
-        monitors.schedule(this::indexScanCycle, 0L, TimeUnit.MILLISECONDS);
-        monitors.schedule(this::fanoutRootScanCycle, 0L, TimeUnit.MILLISECONDS);
-        for (int bucket = 0; bucket < keys.fanoutBucketCount(); bucket++) {
-            scheduleFanoutIndexScan(bucket, 0L, fanoutIndexEpochs.get(bucket));
+        try {
+            draining.set(false);
+            metrics.gauge("redis_job_executor_capacity", properties.getExecutorCapacity());
+            fanoutDispatcher.start();
+            definitions.values().forEach(registry::register);
+            dispatcher.start();
+            monitors.scheduleWithFixedDelay(this::safeHeartbeat, properties.getHeartbeatMs(),
+                    properties.getHeartbeatMs(), TimeUnit.MILLISECONDS);
+            monitors.schedule(this::scheduleScanCycle, 0L, TimeUnit.MILLISECONDS);
+            monitors.schedule(this::indexScanCycle, 0L, TimeUnit.MILLISECONDS);
+            monitors.schedule(this::fanoutRootScanCycle, 0L, TimeUnit.MILLISECONDS);
+            for (int bucket = 0; bucket < keys.fanoutBucketCount(); bucket++) {
+                scheduleFanoutIndexScan(bucket, 0L, fanoutIndexEpochs.get(bucket));
+            }
+            long registryGcInterval = Math.max(properties.getHeartbeatMs(),
+                    Math.min(properties.getRegistryGcGraceMs() / 4L, properties.getMaxScanIntervalMs() * 10L));
+            monitors.scheduleWithFixedDelay(this::safeRegistryGc, registryGcInterval,
+                    registryGcInterval, TimeUnit.MILLISECONDS);
+            // 删除任务的 waitq 存量收敛：全分片扫描（删除后任务不再出现在 localShards），
+            // reaping 标记为空时每分片只付出一次 SRANDMEMBER 成本
+            monitors.scheduleWithFixedDelay(this::safeReapDeleted, properties.getMaxScanIntervalMs(),
+                    properties.getMaxScanIntervalMs(), TimeUnit.MILLISECONDS);
+        } catch (RuntimeException | Error error) {
+            // 启动中途失败必须撤销已完成的步骤并把 running 恢复为 false：
+            // 保留 running=true 会让健康检查报告正在运行，而能力登记、Dispatcher 或监视循环其实只起了一部分，
+            // 该节点既不领任务也不会被外部发现异常。
+            running.set(false);
+            try {
+                stop();
+            } catch (RuntimeException | Error ignored) {
+                // 回滚期间的停机失败不能顶替真正的启动失败原因
+            }
+            throw error;
         }
-        long registryGcInterval = Math.max(properties.getHeartbeatMs(),
-                Math.min(properties.getRegistryGcGraceMs() / 4L, properties.getMaxScanIntervalMs() * 10L));
-        monitors.scheduleWithFixedDelay(this::safeRegistryGc, registryGcInterval,
-                registryGcInterval, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -344,6 +478,14 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
                 RedisJobRepository.ScheduleDueScan scan = repository.scanScheduleDue(
                         shard, properties.getScanBatchSize());
                 metrics.increment("redis_job_due_scan_total");
+                if (!scan.namespaceEnabled()) {
+                    // 暂停期间保留 schedule 的权威逻辑时刻，不推进也不反复提交必然被拒绝的触发；
+                    // 扫描器按空闲上界复查，使其它节点的恢复动作仍能在有界时间内被观察到。
+                    nextDelay = Math.min(nextDelay, RedisJobScanInterval.delay(properties,
+                            registry.executorId(), scan.redisNow(), 0L, false,
+                            RedisJobScanInterval.SCHEDULE, shard, properties.getMaxScanIntervalMs()));
+                    break;
+                }
                 List<RedisJobRepository.FireRequest> requests = scan.members().isEmpty()
                         ? List.of() : new ArrayList<>();
                 for (RedisJobRepository.ScheduleDueMember member : scan.members()) {
@@ -352,7 +494,14 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
                             || definition.definitionRevision() != member.definitionRevision()) continue;
                     metrics.gauge("redis_job_schedule_lag_ms",
                             Math.max(0L, scan.redisNow() - member.score()));
-                    requests.addAll(fireRequests(definition, member.score(), scan.redisNow()));
+                    // 单任务异常必须就地隔离：时刻计算抛错（如极端参数溢出）若逃逸出本循环，
+                    // 会中止整轮扫描，让同批乃至全部分片的其它任务一起停止触发
+                    try {
+                        requests.addAll(fireRequests(definition, member.score(), scan.redisNow()));
+                    } catch (RuntimeException error) {
+                        log.error("RedisJob schedule advance failed: jobName={}", member.jobName(), error);
+                        metrics.incrementClassified("redis_job_fire", "ADVANCE_FAILED", "OK");
+                    }
                 }
                 List<String> codes = fireDueBatches(shard, requests);
                 for (String code : codes) {
@@ -447,7 +596,18 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
             cursor = Math.addExact(first, Math.multiplyExact(total, definition.intervalMs()));
         } else {
             cursor = first;
+            // 窗口内刻度总量由显式预算限制：只限制最终保留的 Run 数挡不住病态配置（超大窗口 + 高频
+            // cron）在枚举阶段消耗整轮扫描。预算耗尽即放弃本轮补偿，仅推进到当前时刻之后，
+            // 语义等同 DO_NOTHING 并计入 ADVANCE_FAILED 观测。
+            int budget = 100_000;
             while (cursor <= redisNow) {
+                if (--budget < 0) {
+                    log.warn("RedisJob catch-up enumeration exceeded budget: jobName={}", definition.name());
+                    metrics.incrementClassified("redis_job_fire", "ADVANCE_FAILED", "OK");
+                    long advanced = definition.firstFireAtAfter(expected, redisNow);
+                    return List.of(new RedisJobRepository.FireRequest(
+                            definition, expected, advanced, true, true, true));
+                }
                 if (selected.size() == properties.getMaxCatchUpRuns()) selected.removeFirst();
                 selected.addLast(cursor);
                 cursor = definition.nextFireAt(cursor);
@@ -482,14 +642,17 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
      */
     private long firstAtOrAfter(RedisJobDefinition definition, long expected, long cutoff) {
         if (expected >= cutoff) return expected;
-        if (definition.scheduleType() == RedisJobScheduleType.FIXED_RATE) {
-            long distance = cutoff - expected;
-            long steps = Math.floorDiv(distance + definition.intervalMs() - 1L, definition.intervalMs());
-            return Math.addExact(expected, Math.multiplyExact(steps, definition.intervalMs()));
+        if (definition.scheduleType() == RedisJobScheduleType.FIXED_RATE
+                || definition.scheduleType() == RedisJobScheduleType.FIXED_DELAY) {
+            // 两者的补偿窗口定位都必须保持 expected 等差序列。FIXED_DELAY 不能借用 firstFireAtAfter：
+            // 那是"以当前时刻重建延迟"的恢复语义，会让窗口首时刻漂移出历史序列并少保留应补偿时刻。
+            // gridFireAtAfter 自带极值防护，普通减法在可表示边界的静默环绕也一并消除。
+            return definition.gridFireAtAfter(expected, cutoff - 1L);
         }
-        long cursor = expected;
-        while (cursor < cutoff) cursor = definition.nextFireAt(cursor);
-        return cursor;
+        // CRON 刻度由表达式自身决定、没有锚点漂移，直接从窗口下界求第一个不早于 cutoff 的刻度；
+        // 从陈旧 expected 逐刻度追赶时，一年积压的每秒 cron 要先走完约三千万个明确不补偿的刻度，
+        // 这种不抛错的长计算会卡住整轮扫描，异常隔离接不到它。
+        return definition.firstFireAtAfter(expected, cutoff - 1L);
     }
 
     /**
@@ -538,24 +701,30 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
             RedisJobRepository.RunData data = candidate.get();
             RedisJobDefinition definition = definitions.get(data.run().jobName());
             if (definition == null || data.fanoutId().isEmpty()) continue;
-            String rootState = fanoutMonitor.rootState(data.fanoutId());
+            ListResult root = watchFanoutRoot(data.fanoutId());
+            String rootState = root.state();
             if (data.run().state() == RedisJobState.FANOUT_CREATING) {
                 if ("CREATING".equals(rootState)) {
                     fanoutMonitor.advanceRoot(data.fanoutId());
-                    rootState = fanoutMonitor.rootState(data.fanoutId());
+                    root = watchFanoutRoot(data.fanoutId());
+                    rootState = root.state();
                 }
                 if ("COMMITTED".equals(rootState) || "WAITING_CHILDREN".equals(rootState)) {
                     fanoutCoordinator.reconcileCommitted(data.fanoutId(), data.run().runId(),
                             data.rootAttempt(), definition.name(), shard);
-                } else if (Set.of("SUCCEEDED", "PARTIAL_FAILED", "FAILED", "CANCELLED").contains(rootState)) {
+                } else if (root.terminal()) {
                     fanoutCoordinator.reconcileTerminal(data.fanoutId(), data.run().runId(), data.rootAttempt(),
-                            definition.name(), shard, rootState,
-                            "FAILED".equals(rootState) ? "FANOUT_CREATE_TIMEOUT" : "");
+                            definition.name(), shard, rootState, fanoutTerminalError(root));
                 } else if (rootState.isEmpty()) {
                     repository.failWaitingCreation(definition, data.run().runId());
                 }
             } else if (data.run().state() == RedisJobState.WAITING_CHILDREN) {
-                fanoutMonitor.requestCancel(data.fanoutId(), "WAIT_TIMEOUT");
+                if (root.terminal()) {
+                    fanoutCoordinator.reconcileTerminal(data.fanoutId(), data.run().runId(), data.rootAttempt(),
+                            definition.name(), shard, rootState, fanoutTerminalError(root));
+                } else {
+                    fanoutMonitor.requestCancel(data.fanoutId(), "WAIT_TIMEOUT");
+                }
             }
         }
         return waiting;
@@ -581,8 +750,7 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
                 ListResult result = watchFanoutRoot(fanoutId);
                 if (result.terminal()) {
                     fanoutCoordinator.reconcileTerminal(fanoutId, result.rootRunId(), result.rootAttempt(),
-                            result.rootJobName(), result.rootShard(), result.state(),
-                            "WAIT_TIMEOUT".equals(result.cancelReason()) ? "WAIT_TIMEOUT" : result.errorType());
+                            result.rootJobName(), result.rootShard(), result.state(), fanoutTerminalError(result));
                 }
             }
         }
@@ -605,6 +773,18 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
         boolean terminal = Set.of("SUCCEEDED", "PARTIAL_FAILED", "FAILED", "CANCELLED").contains(state);
         return new ListResult(state, value(response, 2), integer(response, 3), value(response, 4),
                 integer(response, 5), terminal, value(response, 6), value(response, 7));
+    }
+
+    /**
+     * 业务作用：按稳定优先级提取 Fanout 终态原因，使 waiting、roots 看门狗与删除收敛回填一致。
+     *
+     * @param result Fanout 根看门结果
+     * @return 删除和等待取消优先返回明确原因，其余返回桶内推进异常。
+     */
+    private String fanoutTerminalError(ListResult result) {
+        if ("WAIT_TIMEOUT".equals(result.cancelReason())) return "WAIT_TIMEOUT";
+        if ("JOB_DELETED".equals(result.cancelReason())) return "JOB_DELETED";
+        return result.errorType();
     }
 
     /**
@@ -631,13 +811,12 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
      */
     private long nextAfterNow(RedisJobDefinition definition, long logicalFireAt, long redisNow) {
         long next = definition.nextFireAt(logicalFireAt);
+        // CATCH_UP 的补偿数量与时间窗口由 catchUpRequests 单独裁决，不能在这里被闭式推进跳过
         if (definition.misfire() == RedisJobMisfire.CATCH_UP) return next;
-        int guard = 0;
-        while (next <= redisNow && guard++ < properties.getMaxCatchUpRuns() * 10) {
-            next = definition.nextFireAt(next);
-        }
-        if (next <= redisNow) throw new IllegalStateException("cannot advance RedisJob schedule beyond current time");
-        return next;
+        if (next > redisNow) return next;
+        // 闭式一步跳到严格晚于当前时刻的网格点：逐格循环存在推进次数上限，闲置超过
+        // 上限 × 间隔 的任务会永久卡死且每轮扫描抛错，必须人工重置才能恢复
+        return definition.firstFireAtAfter(logicalFireAt, redisNow);
     }
 
     /**
@@ -848,6 +1027,69 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
      */
     private void safeRegistryGc() {
         safely("registry gc", this::cleanupMetadata);
+    }
+
+    /**
+     * 业务作用：隔离单轮删除存量收敛异常，保留后续周期。
+     *
+     * <p>参数说明: 无。
+     * <p>
+     * 返回：无返回值。
+     */
+    private void safeReapDeleted() {
+        safely("deleted job reap", this::reapDeletedBacklog);
+    }
+
+    /**
+     * 业务作用：驱动已删除任务的四类索引存量（waitq、visible、leases、waiting）分批收敛，
+     * 使删除动作保持 O(1)、收敛不依赖本地定义仍然存在。
+     *
+     * <p>脚本用 ZSCAN 游标跨轮接力扫描共享索引，本轮零终态化不代表收敛完成——游标可能仍在
+     * 越过其它任务的成员，因此以脚本回报的 active 信号而不是终态化数量决定是否继续驱动；
+     * 单分片每轮设推进上限，避免大量积压时长时间占用监视线程。
+     *
+     * <p>参数说明: 无。
+     * <p>
+     * 返回：无返回值。
+     */
+    private void reapDeletedBacklog() {
+        long reaped = 0L;
+        for (int shard = 0; shard < keys.shardCount(); shard++) {
+            for (int round = 0; round < 10; round++) {
+                RedisJobRepository.ReapResult result = repository.reapDeleted(shard);
+                reaped += result.reaped();
+                for (RedisJobRepository.FanoutReapRequest request : result.fanoutRequests()) {
+                    driveDeletedFanout(shard, request);
+                }
+                if (!result.active()) break;
+            }
+        }
+        if (reaped > 0L) metrics.add("redis_job_deleted_reap_total", reaped);
+    }
+
+    /**
+     * 业务作用：在普通根的持久等待截止点后，跨 slot 关闭 Fanout 桶内新执行权，
+     * 并在桶已终态或从未建立时幂等回填普通根。
+     *
+     * @param shard   普通根所在调度分片
+     * @param request 跨 slot 定位证据
+     * <p>返回：无返回值；未终态桶保留 waiting/reaping 由后续周期继续驱动。
+     */
+    private void driveDeletedFanout(int shard, RedisJobRepository.FanoutReapRequest request) {
+        ListResult result = watchFanoutRoot(request.fanoutId());
+        if (result.state().isEmpty()) {
+            fanoutCoordinator.reconcileTerminal(request.fanoutId(), request.runId(), request.rootAttempt(),
+                    request.jobName(), shard, "CANCELLED", "JOB_DELETED");
+            return;
+        }
+        if (result.terminal()) {
+            fanoutCoordinator.reconcileTerminal(request.fanoutId(), request.runId(), request.rootAttempt(),
+                    request.jobName(), shard, result.state(), fanoutTerminalError(result));
+            return;
+        }
+        // 普通根仍保留在 waiting 中，取消跨 slot 失败时下一删除收敛周期会重试，
+        // 不会先撤 tombstone 再丢失桶内运行中 shard 的唯一协作式取消入口。
+        fanoutMonitor.requestCancel(request.fanoutId(), "JOB_DELETED");
     }
 
     /**

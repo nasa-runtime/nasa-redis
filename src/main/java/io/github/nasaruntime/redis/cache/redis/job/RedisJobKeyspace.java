@@ -8,6 +8,7 @@ import java.util.Objects;
  */
 public final class RedisJobKeyspace {
 
+    private final String qualifier;
     private final String namespace;
     private final int shardCount;
     private final int fanoutBucketCount;
@@ -32,12 +33,25 @@ public final class RedisJobKeyspace {
     /**
      * 业务作用：建立不可变键路由器并冻结调度分片数与 Fanout 桶数。
      *
+     * <p>全部键前缀都以 {@code <qualifier>:<namespace>} 开头。两个 qualifier 即使指向同一台 Redis、
+     * 又用了相同 namespace，控制面键、Stream、执行器注册表与 Fanout inbox 也完全不相交；
+     * 否则一个数据源的消费者会读到另一个数据源的派发消息并抢走执行权。
+     *
+     * @param qualifier         语言无关的 source id
      * @param namespace         调度命名空间
      * @param shardCount        调度分片数
      * @param fanoutBucketCount Fanout 桶数
      */
-    public RedisJobKeyspace(String namespace, int shardCount, int fanoutBucketCount) {
+    public RedisJobKeyspace(String qualifier, String namespace, int shardCount, int fanoutBucketCount) {
+        this.qualifier = RedisJobNames.requireName(qualifier, "qualifier");
         this.namespace = RedisJobNames.requireName(namespace, "namespace");
+        // qualifier 内禁止分隔符, 否则 (a:b, c) 与 (a, b:c) 会拼出同一个 scope, 两套 Scheduler 的定义、
+        // Run、注册表和 Fanout 全部重合, (qualifier, namespace, jobName) 的唯一身份就不成立。
+        // 只约束 qualifier 即可让第一个冒号成为无歧义的分界点, namespace 仍可自由使用冒号分层。
+        if (this.qualifier.indexOf(':') >= 0) {
+            throw new IllegalArgumentException("RedisJob qualifier must not contain ':' : " + this.qualifier);
+        }
+        String scope = this.qualifier + ":" + this.namespace;
         if (shardCount <= 0) throw new IllegalArgumentException("shardCount must be greater than zero");
         if (fanoutBucketCount <= 0) throw new IllegalArgumentException("fanoutBucketCount must be greater than zero");
         this.shardCount = shardCount;
@@ -53,7 +67,7 @@ public final class RedisJobKeyspace {
         this.fenceKeys = new String[shardCount];
         this.completionKeys = new String[shardCount];
         for (int shard = 0; shard < shardCount; shard++) {
-            String prefix = "rjob:{" + namespace + ":" + paddedIndex(shard) + "}:";
+            String prefix = "rjob:{" + scope + ":" + paddedIndex(shard) + "}:";
             shardPrefixes[shard] = prefix;
             scheduleKeys[shard] = prefix + "schedule";
             jobsKeys[shard] = prefix + "jobs";
@@ -65,7 +79,7 @@ public final class RedisJobKeyspace {
             fenceKeys[shard] = prefix + "fences";
             completionKeys[shard] = prefix + "completion";
         }
-        this.registryPrefix = "rjob:{" + namespace + ":registry}:";
+        this.registryPrefix = "rjob:{" + scope + ":registry}:";
         this.fanoutPrefixes = new String[fanoutBucketCount];
         this.fanoutRootsKeys = new String[fanoutBucketCount];
         this.fanoutGcKeys = new String[fanoutBucketCount];
@@ -73,7 +87,7 @@ public final class RedisJobKeyspace {
         this.fanoutReadyKeys = new String[fanoutBucketCount];
         this.fanoutLeaseKeys = new String[fanoutBucketCount];
         for (int bucket = 0; bucket < fanoutBucketCount; bucket++) {
-            String prefix = "rjob:{" + namespace + ":fanout:" + paddedIndex(bucket) + "}:";
+            String prefix = "rjob:{" + scope + ":fanout:" + paddedIndex(bucket) + "}:";
             fanoutPrefixes[bucket] = prefix;
             fanoutRootsKeys[bucket] = prefix + "roots";
             fanoutGcKeys[bucket] = prefix + "gc";
@@ -84,7 +98,14 @@ public final class RedisJobKeyspace {
     }
 
     /**
-     * 业务作用：读取命名空间。 @return 命名空间。
+     * 业务作用：读取本键空间绑定的语言无关 source id。 @return source id。
+     */
+    public String qualifier() {
+        return qualifier;
+    }
+
+    /**
+     * 业务作用：读取命名空间；不含 qualifier，供上下文与业务按纯命名空间使用。 @return 命名空间。
      */
     public String namespace() {
         return namespace;
@@ -121,6 +142,46 @@ public final class RedisJobKeyspace {
      */
     String registryKeyPrefix() {
         return registryPrefix;
+    }
+
+    /**
+     * 业务作用：生成 Fanout 分片的跨语言业务幂等键，是该值在产品代码中的唯一拼装入口。
+     *
+     * <p>executionKey 在通知重发、节点重分配和执行重试期间保持不变，业务用它做数据库唯一键或外部
+     * idempotency key。qualifier 必须参与：两个数据源的同一分片不能算出同一个值。
+     *
+     * @param fanoutId Fanout 标识
+     * @param seq      分片稳定序号
+     * @return executionKey。
+     */
+    String executionKey(String fanoutId, long seq) {
+        return qualifier + ":" + namespace + ":" + fanoutId + ":" + seq;
+    }
+
+    /**
+     * 业务作用：给出承载不可变布局指纹的 marker 键。
+     *
+     * <p>放在 registry slot 而不是调度分片下：分片数本身就是被比对的对象之一，
+     * marker 不能依赖一个尚未确认的布局来定位。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return layout marker 键。
+     */
+    String layoutMarker() {
+        return registryPrefix + "layout";
+    }
+
+    /**
+     * 业务作用：给出承载"已删除、存量待收敛"任务名的分片级 SET 键。
+     *
+     * <p>删除动作 O(1) 登记，后台按批终态化 waitq 存量；tombstone 清理凭该 SET 判断收敛是否完成。
+     *
+     * @param shard 分片下标
+     * @return reaping SET 键。
+     */
+    String reaping(int shard) {
+        return shardPrefix(shard) + "reaping";
     }
 
     /**

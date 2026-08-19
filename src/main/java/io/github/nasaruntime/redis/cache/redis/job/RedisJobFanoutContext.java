@@ -46,7 +46,9 @@ public interface RedisJobFanoutContext {
     String targetNodeIdentity();
 
     /**
-     * 业务作用：读取目标变化时单调增加的 assignment 代次。 @return assignment 代次。
+     * 业务作用：读取每次 assignment 重建时单调增加的代次，用于拒绝旧目标或旧启动实例的迟到提交。
+     *
+     * @return assignment 代次；换节点以及原稳定节点凭新启动或心跳证据恢复时都会增加。
      */
     long assignmentEpoch();
 }

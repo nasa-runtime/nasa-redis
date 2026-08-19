@@ -23,6 +23,8 @@ public final class RedisJobDefinition {
     private final RedisJobTrigger trigger;
     private final RedisJobScheduleType scheduleType;
     private final String cron;
+    /* CRON 表达式在构造期解析一次并缓存：补偿窗口枚举每个刻度都要求下一时刻，逐次重新解析会放大长循环成本。 */
+    private final CronExpression cronExpression;
     private final ZoneId zone;
     private final long intervalMs;
     private final RedisJobConcurrency concurrency;
@@ -55,6 +57,8 @@ public final class RedisJobDefinition {
                 "workerName");
         this.scheduleType = resolveScheduleType(builder);
         this.cron = builder.cron == null ? "" : builder.cron.trim();
+        this.cronExpression = this.scheduleType == RedisJobScheduleType.CRON
+                ? CronExpression.parse(this.cron) : null;
         this.zone = Objects.requireNonNull(builder.zone, "zone must not be null");
         this.intervalMs = resolveInterval(builder, this.scheduleType);
         this.concurrency = Objects.requireNonNull(builder.concurrency, "concurrency must not be null");
@@ -125,13 +129,69 @@ public final class RedisJobDefinition {
         return switch (scheduleType) {
             case CRON -> {
                 ZonedDateTime base = Instant.ofEpochMilli(logicalFireAt).atZone(zone);
-                ZonedDateTime next = CronExpression.parse(cron).next(base);
+                ZonedDateTime next = cronExpression.next(base);
                 if (next == null) throw new IllegalStateException("cron has no next fire time: " + name);
                 yield next.toInstant().toEpochMilli();
             }
             case FIXED_RATE, FIXED_DELAY -> Math.addExact(logicalFireAt, intervalMs);
             case MANUAL, FANOUT_ONLY -> 0L;
         };
+    }
+
+    /**
+     * 业务作用：一步计算严格晚于 redisNow 的第一个逻辑时刻，使长时间闲置的任务恢复不依赖逐格追赶。
+     *
+     * <p>逐格循环在闲置超过循环上限后会永久卡死任务并拖停整轮调度扫描；本方法与逐格推进语义一致但
+     * 复杂度 O(1)：FIXED_RATE 保持等差网格锚点不漂移；CRON 直接从当前时刻求下一刻度；FIXED_DELAY
+     * 以当前 Redis 时间重新建立延迟。溢出经 Math.multiplyExact/addExact 以异常暴露，由调用方隔离。
+     *
+     * @param logicalFireAt 当前权威逻辑时刻（网格锚点）
+     * @param redisNow      Redis 当前时刻
+     * @return 严格大于 redisNow 且不早于下一网格点的逻辑时刻。
+     */
+    public long firstFireAtAfter(long logicalFireAt, long redisNow) {
+        return switch (scheduleType) {
+            case FIXED_RATE -> gridFireAtAfter(logicalFireAt, redisNow);
+            case FIXED_DELAY -> Math.addExact(redisNow, intervalMs);
+            case CRON -> {
+                ZonedDateTime base = Instant.ofEpochMilli(Math.max(logicalFireAt, redisNow)).atZone(zone);
+                ZonedDateTime next = cronExpression.next(base);
+                if (next == null) throw new IllegalStateException("cron has no next fire time: " + name);
+                yield next.toInstant().toEpochMilli();
+            }
+            case MANUAL, FANOUT_ONLY -> 0L;
+        };
+    }
+
+    /**
+     * 业务作用：在以 anchor 为锚点的等差网格上求严格晚于 after 的第一个时刻，供 FIXED_RATE 推进与
+     * FIXED_RATE/FIXED_DELAY 的补偿窗口定位共用；两者的历史序列都是 anchor + k×interval。
+     *
+     * <p>与逐格推进语义一致但复杂度 O(1)，网格锚点不漂移。极值输入不允许静默环绕：
+     * 相位差超出 long 表示范围时改用 BigInteger 求相位后回到 long 域；结果无法用 long 表示时
+     * 由 Math.multiplyExact/addExact 抛出异常，交由调用方的单任务隔离处理。
+     *
+     * @param anchor 网格锚点（历史逻辑时刻）
+     * @param after  必须严格晚于的时刻
+     * @return 严格大于 after 且不早于下一网格点的逻辑时刻。
+     */
+    public long gridFireAtAfter(long anchor, long after) {
+        long distance;
+        try {
+            distance = Math.subtractExact(after, anchor);
+        } catch (ArithmeticException overflow) {
+            // 相位差超出 long 表示范围时不能做普通减法：静默环绕会返回一个看似成功的过去时刻，
+            // 违反"严格大于 after"的公开合同。改用 BigInteger 求相位后回到 long 域，
+            // 结果仍是同一等差网格上严格晚于 after 的第一个点。
+            long phase = java.math.BigInteger.valueOf(after)
+                    .subtract(java.math.BigInteger.valueOf(anchor))
+                    .mod(java.math.BigInteger.valueOf(intervalMs)).longValueExact();
+            return Math.addExact(Math.subtractExact(after, phase), intervalMs);
+        }
+        // steps 至少为 1：即使 after 未越过下一格也至少推进一格，与逐格推进的最小步进一致；
+        // after 恰好落在网格点时 floorDiv 结果 +1 保证严格大于。
+        long steps = Math.max(1L, Math.addExact(Math.floorDiv(distance, intervalMs), 1L));
+        return Math.addExact(anchor, Math.multiplyExact(steps, intervalMs));
     }
 
     /**

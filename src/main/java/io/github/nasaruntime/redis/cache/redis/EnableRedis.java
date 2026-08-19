@@ -1,19 +1,20 @@
 package io.github.nasaruntime.redis.cache.redis;
 
-import io.github.nasaruntime.redis.cache.redis.job.RedisJobConfiguration;
 import org.springframework.context.annotation.Import;
 
 import java.lang.annotation.*;
 
 /**
- * 业务作用：启用多数据源 RedisTemplate、RedisProxy、分布式锁及按配置开启的 RedisJob 装配。
+ * 业务作用：启用多数据源 RedisTemplate、RedisProxy 与分布式锁装配。
+ * RedisJob 具有独立的生命周期与数据源选择入口，需要业务显式使用
+ * {@link io.github.nasaruntime.redis.cache.redis.job.EnableRedisJob} 开启。
  */
 @SuppressWarnings("unused")
 @Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
 @Inherited
-@Import({RedisImportBeanDefinitionRegistrar.class, RedisJobConfiguration.class})
+@Import(RedisImportBeanDefinitionRegistrar.class)
 public @interface EnableRedis {
 
     /**

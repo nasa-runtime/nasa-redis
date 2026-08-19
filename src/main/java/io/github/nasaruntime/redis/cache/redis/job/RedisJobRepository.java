@@ -63,7 +63,9 @@ final class RedisJobRepository {
                 definition.timeoutMs(), definition.maxAttempts(), definition.retryDelayMs(),
                 definition.contractRevision(), definition.schemaId(), definition.wireCodecs(),
                 definition.fanoutReceiptTimeoutMs(), definition.fanoutReceiptMaxRetries(),
-                definition.fanoutFailurePolicy().name(), nextFireAt);
+                definition.fanoutFailurePolicy().name(), nextFireAt,
+                // 定义持久化所属数据源, 使 Run 与消息可以脱离键前缀独立核对来源
+                keys.qualifier());
         String code = text(result, 0);
         if ("OK".equals(code) || "ADOPTED".equals(code)) definitions.put(definition.name(), jobKeys);
         return code;
@@ -104,7 +106,9 @@ final class RedisJobRepository {
     String delete(String jobName, long revision) {
         int shard = keys.scheduleShard(jobName);
         String code = text(scripts.list(RedisJobScript.JOB_DELETE,
-                new String[]{keys.jobs(shard), keys.schedule(shard), keys.job(shard, jobName)},
+                new String[]{keys.jobs(shard), keys.schedule(shard), keys.job(shard, jobName),
+                        // KEYS[4] reaping：O(1) 登记待收敛标记，存量 Run 由 fence 与后台批次终态化
+                        keys.reaping(shard)},
                 jobName, revision, properties.getTombstoneRetentionMs()), 0);
         if ("OK".equals(code)) definitions.remove(jobName);
         return code;
@@ -118,9 +122,55 @@ final class RedisJobRepository {
      */
     long cleanupTombstones(int shard) {
         List<Object> result = scripts.list(RedisJobScript.JOB_CLEANUP_TOMBSTONES,
-                new String[]{keys.jobs(shard), keys.schedule(shard), keys.fences(shard)},
+                new String[]{keys.jobs(shard), keys.schedule(shard), keys.fences(shard), keys.reaping(shard)},
                 properties.getScanBatchSize(), keys.shardKeyPrefix(shard));
         return number(result, 0);
+    }
+
+    /**
+     * 业务作用：驱动一个已删除任务的全量存量收敛（waitq、visible、leases、waiting 四类索引），
+     * 删除动作自身保持 O(1)，收敛在这里分批完成且不依赖本地定义仍然存在。
+     *
+     * <p>共享索引用 ZSCAN 游标跨轮接力（游标持久在任务 HASH），单轮每索引至多 8 次迭代、
+     * 终态化总量受单批上限约束；未到期租约按"允许当前 attempt 完成"保留并阻止归零判定。
+     * 到期的在飞 Fanout 根以三元组返回 Java 驱动跨 slot 取消，取消与普通根回填完成前
+     * 保留 waiting 与 reaping 门禁。reaping 标记由脚本在四类存量全部归零后自行撤销。
+     *
+     * @param shard 调度分片
+     * @return 收敛推进结果；分片无待收敛任务时 active 为假。
+     */
+    ReapResult reapDeleted(int shard) {
+        List<Object> result = scripts.list(RedisJobScript.JOB_REAP,
+                new String[]{keys.reaping(shard), keys.visible(shard), keys.leases(shard), keys.completion(shard)},
+                properties.getScanBatchSize(), properties.getRunRetentionMs(), keys.shardKeyPrefix(shard));
+        String jobName = text(result, 0);
+        List<FanoutReapRequest> fanoutRequests = new ArrayList<>();
+        for (int index = 3; index + 2 < result.size(); index += 3) {
+            fanoutRequests.add(new FanoutReapRequest(jobName, text(result, index), text(result, index + 1),
+                    integer(result, index + 2)));
+        }
+        return new ReapResult(number(result, 1), number(result, 2) == 1L, List.copyOf(fanoutRequests));
+    }
+
+    /**
+     * 业务作用：承载一轮删除收敛的推进结果。
+     *
+     * @param reaped        本轮终态化数量
+     * @param active        该任务是否仍有待推进存量（游标未走完、存在未到期租约或索引尚未判定归零）
+     * @param fanoutRequests 已到截止点且需跨 slot 推进的 Fanout 根
+     */
+    record ReapResult(long reaped, boolean active, List<FanoutReapRequest> fanoutRequests) {
+    }
+
+    /**
+     * 业务作用：承载删除收敛中一个到期 Fanout 根的跨 slot 定位证据。
+     *
+     * @param jobName    普通根任务名
+     * @param runId      普通根 Run 标识
+     * @param fanoutId   Fanout 桶内根标识
+     * @param rootAttempt 转移完成权的根 attempt
+     */
+    record FanoutReapRequest(String jobName, String runId, String fanoutId, int rootAttempt) {
     }
 
     /**
@@ -139,7 +189,7 @@ final class RedisJobRepository {
     }
 
     /**
-     * 业务作用：设置一个调度分片的命名空间门禁，新触发会在权威脚本中复验该状态。
+     * 业务作用：设置一个调度分片的普通 Run 命名空间门禁，新触发、未领取 Run 与可见性重建均会复验该状态。
      *
      * @param shard 调度分片
      * @param state ENABLED 或 PAUSED
@@ -169,7 +219,7 @@ final class RedisJobRepository {
         }
         JobKeys jobKeys = jobKeys(definition);
         int shard = jobKeys.shard();
-        String runId = RedisJobIdentifiers.manualRunId(keys.namespace(), definition.name(),
+        String runId = RedisJobIdentifiers.manualRunId(keys.qualifier(), keys.namespace(), definition.name(),
                 RedisJobNames.requireName(requestId, "requestId"));
         List<Object> result = scripts.list(RedisJobScript.MANUAL_FIRE,
                 new String[]{jobKeys.job(), keys.run(shard, runId), keys.visible(shard),
@@ -208,20 +258,24 @@ final class RedisJobRepository {
      *
      * @param shard 调度分片
      * @param limit 单次最大任务数
-     * @return 调度扫描结果。
+     * @return Redis 时刻、索引最小 score、命名空间门禁状态与到期调度项。
      */
     ScheduleDueScan scanScheduleDue(int shard, int limit) {
         List<Object> result = scripts.list(RedisJobScript.SCAN_DUE,
-                new String[]{keys.schedule(shard)}, limit, "SCHEDULE", keys.shardKeyPrefix(shard));
-        if (result.size() <= 2) {
-            return new ScheduleDueScan(number(result, 0), optionalNumber(result, 1), List.of());
+                new String[]{keys.schedule(shard), keys.control(shard)},
+                limit, "SCHEDULE", keys.shardKeyPrefix(shard));
+        boolean namespaceEnabled = "ENABLED".equals(text(result, 2));
+        if (result.size() <= 3) {
+            return new ScheduleDueScan(number(result, 0), optionalNumber(result, 1),
+                    namespaceEnabled, List.of());
         }
-        List<ScheduleDueMember> members = new ArrayList<>((result.size() - 2) / 3);
-        for (int index = 2; index + 2 < result.size(); index += 3) {
+        List<ScheduleDueMember> members = new ArrayList<>((result.size() - 3) / 3);
+        for (int index = 3; index + 2 < result.size(); index += 3) {
             members.add(new ScheduleDueMember(text(result, index), number(result, index + 1),
                     number(result, index + 2)));
         }
-        return new ScheduleDueScan(number(result, 0), optionalNumber(result, 1), List.copyOf(members));
+        return new ScheduleDueScan(number(result, 0), optionalNumber(result, 1),
+                namespaceEnabled, List.copyOf(members));
     }
 
     /**
@@ -239,7 +293,7 @@ final class RedisJobRepository {
         JobKeys jobKeys = jobKeys(definition);
         int shard = jobKeys.shard();
         String triggerType = misfire ? "MISFIRE" : definition.scheduleType().name();
-        String runId = RedisJobIdentifiers.scheduledRunId(keys.namespace(), definition.name(), logicalFireAt,
+        String runId = RedisJobIdentifiers.scheduledRunId(keys.qualifier(), keys.namespace(), definition.name(), logicalFireAt,
                 triggerType);
         RedisJobWireCodec codec = definition.codecs().iterator().next();
         List<Object> result = scripts.list(RedisJobScript.FIRE_DUE,
@@ -272,7 +326,7 @@ final class RedisJobRepository {
             RedisJobDefinition definition = request.definition();
             JobKeys jobKeys = jobKeys(definition);
             String triggerType = request.misfire() ? "MISFIRE" : definition.scheduleType().name();
-            String runId = RedisJobIdentifiers.scheduledRunId(keys.namespace(), definition.name(),
+            String runId = RedisJobIdentifiers.scheduledRunId(keys.qualifier(), keys.namespace(), definition.name(),
                     request.logicalFireAt(), triggerType);
             RedisJobWireCodec codec = definition.codecs().iterator().next();
             int keyOffset = 3 + index * 3;
@@ -316,13 +370,21 @@ final class RedisJobRepository {
         List<Object> result = scripts.list(RedisJobScript.START_RUN,
                 new String[]{keys.run(shard, runId), keys.leases(shard), keys.visible(shard),
                         keys.running(shard), jobKeys.waitq(), keys.fences(shard),
-                        jobKeys.dispatch(), keys.completion(shard), jobKeys.job()},
+                        jobKeys.dispatch(), keys.completion(shard), jobKeys.job(),
+                        // KEYS[10] schedule：确定性终态出口在脚本内完成 FIXED_DELAY 重排，任务不得脱离调度
+                        keys.schedule(shard),
+                        // KEYS[11] control：尚未取得 attempt 的 Run 必须服从命名空间暂停门禁
+                        keys.control(shard)},
                 definition.name(), runId, executorId, messageId, properties.getLeaseMs(),
                 definition.concurrency().name(), properties.getMaxSerialBacklog(),
                 properties.getVisibilityTimeoutMs(), group, properties.getRunRetentionMs(),
                 "NORMAL", properties.getSerialOverflowPolicy().name(), properties.getProtocolVersion(),
                 definition.definitionRevision(), definition.contractRevision(), definition.schemaId(),
-                definition.wireCodecs(), keys.shardKeyPrefix(shard));
+                definition.wireCodecs(), keys.shardKeyPrefix(shard),
+                // 取得执行权前复验记录自身声明的来源与本 Scheduler 一致
+                keys.qualifier(),
+                // 暂停是可逆控制，积压按扫描上界复查；协议与合同异常仍使用 visibilityTimeoutMs 长退避
+                properties.getMaxScanIntervalMs());
         return new StartResult(text(result, 0), integer(result, 1), number(result, 2),
                 number(result, 3), number(result, 4));
     }
@@ -343,7 +405,7 @@ final class RedisJobRepository {
     }
 
     /**
-     * 业务作用：本节点缺少兼容 Handler 时确认已拉取消息，并把 Run 放回持久可见性索引等待其它节点。
+     * 业务作用：本节点缺少兼容 Handler 时确认已拉取消息；可执行 Run 延后，删除 fence 内 Run 直接终态化。
      *
      * @param jobName   任务名
      * @param runId     Run 标识
@@ -356,8 +418,9 @@ final class RedisJobRepository {
     String defer(String jobName, String runId, String messageId, String group, String stream, long delayMs) {
         int shard = keys.scheduleShard(jobName);
         List<Object> response = scripts.list(RedisJobScript.DEFER_RUN,
-                new String[]{keys.run(shard, runId), keys.visible(shard), stream},
-                runId, messageId, delayMs, group);
+                new String[]{keys.run(shard, runId), keys.visible(shard), stream,
+                        keys.job(shard, jobName), keys.completion(shard)},
+                runId, messageId, delayMs, group, properties.getRunRetentionMs());
         String code = text(response, 0);
         signalVisible(shard, response, 1);
         return code;
@@ -422,7 +485,7 @@ final class RedisJobRepository {
         List<Object> response = scripts.list(RedisJobScript.RECOVER_EXPIRED,
                 new String[]{keys.run(shard, runId), keys.leases(shard), keys.visible(shard), keys.running(shard),
                         jobKeys.waitq(), keys.waiting(shard), keys.completion(shard),
-                        jobKeys.job(), keys.schedule(shard), jobKeys.dispatch()},
+                        jobKeys.job(), keys.schedule(shard)},
                 runId, definition.name(), definition.maxAttempts(), retryDelay(definition, runId),
                 properties.getRunRetentionMs(), "NORMAL", properties.getVisibilityTimeoutMs(), 0L, 0L,
                 keys.shardKeyPrefix(shard));
@@ -439,8 +502,11 @@ final class RedisJobRepository {
      */
     PromotionResult promoteVisible(int shard) {
         List<Object> result = scripts.list(RedisJobScript.PROMOTE_VISIBLE,
-                new String[]{keys.visible(shard)}, properties.getScanBatchSize(), properties.getVisibilityTimeoutMs(),
-                properties.getMaxDispatchAttempts(), properties.getMaxScanIntervalMs(), keys.shardKeyPrefix(shard));
+                new String[]{keys.visible(shard), keys.control(shard)},
+                properties.getScanBatchSize(), properties.getVisibilityTimeoutMs(),
+                properties.getMaxDispatchAttempts(), properties.getMaxScanIntervalMs(), keys.shardKeyPrefix(shard),
+                // ARGV[6] 终态保留期：删除 fence 内的 Run 在提升路径直接终态化并进入保留期
+                properties.getRunRetentionMs());
         return new PromotionResult(number(result, 0), optionalNumber(result, 1), number(result, 2));
     }
 
@@ -677,7 +743,8 @@ final class RedisJobRepository {
     /**
      * 业务作用：承载调度专用扫描结果。
      */
-    record ScheduleDueScan(long redisNow, long nextScore, List<ScheduleDueMember> members) {
+    record ScheduleDueScan(long redisNow, long nextScore, boolean namespaceEnabled,
+                           List<ScheduleDueMember> members) {
     }
 
     /**

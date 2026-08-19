@@ -128,6 +128,20 @@ final class RedisJobDispatcher implements AutoCloseable {
     }
 
     /**
+     * 业务作用：撤销已删除任务的本地定义与 Handler，使新消息不再进入业务执行。
+     *
+     * <p>Stream 绑定保留：派发 Stream 按 workerKey 共享，其余任务可能仍在使用；已删除任务的
+     * 迟到消息在 handler 缺失时延后回 visible，最终由 start/promote 的删除 fence 终态化。
+     *
+     * @param definition 任务定义
+     *                   返回：无返回值。
+     */
+    void unregister(RedisJobDefinition definition) {
+        definitions.remove(definition.name(), definition);
+        handlers.remove(definition.name());
+    }
+
+    /**
      * 业务作用：启动已登记 Stream 的消费循环，只有框架生命周期开放后才领取新 Run。
      *
      * <p>参数说明: 无。
@@ -329,6 +343,14 @@ final class RedisJobDispatcher implements AutoCloseable {
     private void onMessage(StreamBinding binding, MapRecord<String, String, String> message) {
         String jobName = message.getValue().get("jobName");
         String runId = message.getValue().get("runId");
+        // 信封自带来源声明, 消费者不读 Run 记录即可发现串源消息。这里只告警与计数:
+        // 权威隔离在 start_run.lua 内完成——定义在本地时该 Run 会被终态隔离, 否则按无兼容执行器长退避。
+        String envelopeSource = message.getValue().get("schedulerQualifier");
+        if (envelopeSource != null && !envelopeSource.isEmpty() && !envelopeSource.equals(keys.qualifier())) {
+            log.warn("RedisJob dispatch envelope declares a different source: jobName={}, runId={}, source={}, local={}",
+                    jobName, runId, envelopeSource, keys.qualifier());
+            metrics.incrementClassified("redis_job_dispatch_envelope", "SOURCE_MISMATCH", "");
+        }
         if (!accepting.get()) {
             repository.defer(jobName, runId, message.getId().getValue(), binding.group, binding.stream,
                     properties.getMaxScanIntervalMs());
@@ -421,7 +443,8 @@ final class RedisJobDispatcher implements AutoCloseable {
             RedisJobRepository.RunData data = repository.read(definition.name(), runId)
                     .orElseThrow(() -> new IllegalStateException("started RedisJob run disappeared: " + runId));
             long allowance = properties.getRenewRttAllowanceMs() + properties.getClockDriftAllowanceMs();
-            DefaultRedisJobContext context = new DefaultRedisJobContext(keys.namespace(), data,
+            DefaultRedisJobContext context = new DefaultRedisJobContext(keys.qualifier(),
+                    keys.namespace(), data,
                     start.attempt(), start.attemptToken(), properties.getLeaseMs(), allowance,
                     jsonCodec, fanoutService, null);
             leaseHandle = leaseRenewer.registerNormal(definition, runId, context);

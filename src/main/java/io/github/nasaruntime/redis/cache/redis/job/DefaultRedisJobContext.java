@@ -1,5 +1,7 @@
 package io.github.nasaruntime.redis.cache.redis.job;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -10,6 +12,7 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 final class DefaultRedisJobContext implements RedisJobContext {
 
+    private final String qualifier;
     private final String namespace;
     private final RedisJobRepository.RunData data;
     private final int attempt;
@@ -24,6 +27,7 @@ final class DefaultRedisJobContext implements RedisJobContext {
     /**
      * 业务作用：建立当前 attempt 的本地执行视图，并把服务端租约换算为保守单调时钟截止点。
      *
+     * @param qualifier         当前 Scheduler 绑定的语言无关 source id
      * @param namespace         调度命名空间
      * @param data              Run 数据
      * @param attempt           当前 attempt
@@ -34,9 +38,11 @@ final class DefaultRedisJobContext implements RedisJobContext {
      * @param fanoutService     Fanout 服务
      * @param fanoutContext     Fanout shard 元数据
      */
-    DefaultRedisJobContext(String namespace, RedisJobRepository.RunData data, int attempt, long attemptToken,
+    DefaultRedisJobContext(String qualifier, String namespace, RedisJobRepository.RunData data,
+                           int attempt, long attemptToken,
                            long leaseMs, long safetyAllowanceMs, RedisJobJsonCodec jsonCodec,
                            RedisJobFanoutService fanoutService, RedisJobFanoutContext fanoutContext) {
+        this.qualifier = qualifier;
         this.namespace = namespace;
         this.data = Objects.requireNonNull(data, "data must not be null");
         this.attempt = attempt;
@@ -45,6 +51,14 @@ final class DefaultRedisJobContext implements RedisJobContext {
         this.fanoutService = fanoutService;
         this.fanoutContext = Optional.ofNullable(fanoutContext);
         this.ownershipDeadlineNanos = new AtomicLong(deadline(leaseMs, safetyAllowanceMs));
+    }
+
+    /**
+     * 业务作用：读取当前 Run 所属的语言无关 source id。 @return source id。
+     */
+    @Override
+    public String qualifier() {
+        return qualifier;
     }
 
     /**
@@ -116,6 +130,20 @@ final class DefaultRedisJobContext implements RedisJobContext {
         if (type == byte[].class) return type.cast(data.payload().clone());
         throw new IllegalArgumentException("non-JSON RedisJob payload can only be read as byte[]");
     }
+
+    /**
+     * 业务作用：按 Handler 声明的完整泛型解码 JSON 参数，使集合与嵌套 DTO 保留元素类型。
+     *
+     * @param type 完整泛型类型引用
+     * @param <T>  目标类型
+     * @return 解码参数；非 JSON 编码只能读原始字节。
+     */
+    @Override
+    public <T> T parameter(TypeReference<T> type) {
+        if (data.codec() == RedisJobWireCodec.JSON) return jsonCodec.decode(data.payload(), type);
+        throw new IllegalArgumentException("non-JSON RedisJob payload can only be read as byte[]");
+    }
+
 
     /**
      * 业务作用：读取参数原始字节副本。 @return 参数副本。
