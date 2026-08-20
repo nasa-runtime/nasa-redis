@@ -692,7 +692,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
                 continue;
             }
 
-            // 加载 channel 注解 (stream 端只通过 StreamSubscribe 接口扫描, 不再有方法注解)
+            // 方法注解只声明即时频道订阅；Stream 订阅统一通过 StreamSubscribe 接口登记。
             List<Method> methods = ReflectUtils.allMethod(AopUtils.getTargetClass(o));
             methods.forEach(method -> {
                 Subscriber subscriber = method.getAnnotation(Subscriber.class);
@@ -846,12 +846,26 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
             }
             subscribedTopics.add(topic);
             this.subscribe(topic, group, event, reference, new FactorConsumer2<String, Object, StreamSubscribe>() {
+                /**
+                 * 业务作用：向消费框架暴露原始订阅声明，供批量模式与自动删除策略判定。
+                 *
+                 * <p>参数说明: 无。
+                 *
+                 * @return 当前正在注册的订阅声明。
+                 */
                 @Override
                 public StreamSubscribe factor() {
                     // 给框架内部的 isBatchConsumer 检测用
                     return ss;
                 }
 
+                /**
+                 * 业务作用：把反序列化后的消息交给业务订阅者，并在回调结束后释放事件包装和按需删除 Stream 记录。
+                 *
+                 * @param e 消息事件名
+                 * @param m 已反序列化的消息或批量消息
+                 * 返回：业务回调结束后完成本地资源释放；启用自动删除时异步提交对应记录的删除命令。
+                 */
                 @Override
                 public void accept(String e, Object m) {
                     try {
@@ -1016,7 +1030,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param keys 缓存键集合
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public Long del(String... keys) {
         if (ColUtils.isEmpty(keys)) {
@@ -1044,7 +1058,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public byte[] dump(String key) {
         if (StringUtils.isBlank(key)) {
@@ -1068,7 +1082,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public boolean exists(String key) {
         if (StringUtils.isBlank(key)) {
@@ -1091,7 +1105,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param timeout 超时时长
      * @param unit 时长单位
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public boolean expire(String key, long timeout, TimeUnit unit) {
         return expire(key, unit.toMillis(timeout));
@@ -1108,7 +1122,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param millis 毫秒数
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public boolean expire(String key, long millis) {
         if (StringUtils.isBlank(key)) {
@@ -1135,7 +1149,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param millis 毫秒数
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public boolean expireAt(String key, long millis) {
         if (StringUtils.isBlank(key)) {
@@ -1162,7 +1176,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public boolean persist(String key) {
         if (StringUtils.isBlank(key)) {
@@ -1244,7 +1258,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long pttl(String key) {
         if (StringUtils.isBlank(key)) {
@@ -1271,7 +1285,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param pattern 匹配模式
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public Set<String> keys(String pattern) {
         if (StringUtils.isBlank(pattern)) {
@@ -1306,7 +1320,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> T get(String key) {
         if (StringUtils.isBlank(key)) {
@@ -1332,7 +1346,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param start 起始下标
      * @param end 结束下标
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public String getRange(String key, long start, long end) {
         if (StringUtils.isBlank(key)) {
@@ -1399,7 +1413,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param keys 缓存键集合
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> List<T> multiGet(Collection<String> keys) {
         if (ColUtils.isEmpty(keys)) {
@@ -1542,7 +1556,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param val 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public boolean setIfAbsent(String key, Object val) {
         if (StringUtils.isBlank(key) || Objects.isNull(val)) {
@@ -1596,7 +1610,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long strLen(String key) {
         if (StringUtils.isBlank(key)) {
@@ -1656,7 +1670,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long increment(String key) {
         Objects.requireNonNull(key);
@@ -1682,7 +1696,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param delta 增减量
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long increment(String key, long delta) {
         Objects.requireNonNull(key);
@@ -1707,7 +1721,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long decrement(String key) {
         Objects.requireNonNull(key);
@@ -1733,7 +1747,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param delta 增减量
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long decrement(String key, long delta) {
         Objects.requireNonNull(key);
@@ -1836,7 +1850,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param hashKeys 哈希字段名集合
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long hDel(String key, String... hashKeys) {
         if (StringUtils.isBlank(key) || ColUtils.isEmpty(hashKeys)) {
@@ -1886,7 +1900,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param hashKey 哈希字段名
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> T hGet(String key, String hashKey) {
         if (StringUtils.isBlank(key) || StringUtils.isBlank(hashKey)) {
@@ -1912,7 +1926,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Map<String, T> hGet(String key) {
         if (StringUtils.isBlank(key)) {
@@ -1943,7 +1957,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param hashKey 哈希字段名
      * @param delta 增减量
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long hIncrBy(String key, String hashKey, long delta) {
         Objects.requireNonNull(key);
@@ -1964,7 +1978,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param hashKey 哈希字段名
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long hIncrBy(String key, String hashKey) {
         return hIncrBy(key, hashKey, 1);
@@ -1976,7 +1990,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param hashKey 哈希字段名
      * @param delta 增减量
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long hDecrBy(String key, String hashKey, long delta) {
         return hIncrBy(key, hashKey, 0 - delta);
@@ -1987,7 +2001,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param hashKey 哈希字段名
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long hDecrBy(String key, String hashKey) {
         return hDecrBy(key, hashKey, 1);
@@ -2147,7 +2161,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public Set<String> hKeys(String key) {
         if (StringUtils.isBlank(key)) {
@@ -2179,7 +2193,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long hLen(String key) {
         if (StringUtils.isBlank(key)) {
@@ -2205,7 +2219,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param hashKeys 哈希字段名集合
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> List<T> hMGet(String key, Collection<String> hashKeys) {
         if (StringUtils.isBlank(key) || ColUtils.isEmpty(hashKeys)) {
@@ -2420,7 +2434,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param hashKey 哈希字段名
      * @param val 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public boolean hSetNx(String key, String hashKey, Object val) {
         if (StringUtils.isBlank(key) || StringUtils.isBlank(hashKey) || Objects.isNull(val)) {
@@ -2474,7 +2488,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param index 下标
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> T lIndex(String key, long index) {
         if (StringUtils.isBlank(key)) {
@@ -2498,7 +2512,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long lLen(String key) {
         if (StringUtils.isBlank(key)) {
@@ -2553,7 +2567,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param val 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long lPushIfAbsent(String key, Object val) {
         if (StringUtils.isBlank(key)) {
@@ -2581,7 +2595,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> T lPop(String key) {
         if (StringUtils.isBlank(key)) {
@@ -2607,7 +2621,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param count 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> List<T> lPop(String key, int count) {
         if (StringUtils.isBlank(key) || count <= 0) {
@@ -2663,7 +2677,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param start 起始下标
      * @param end 结束下标
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> List<T> lRange(String key, long start, long end) {
         if (StringUtils.isBlank(key)) {
@@ -2694,7 +2708,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param count 数量上限
      * @param val 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long lRem(String key, long count, Object val) {
         if (StringUtils.isBlank(key)) {
@@ -2809,7 +2823,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param val 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long rPushIfAbsent(String key, Object val) {
         if (StringUtils.isBlank(key)) {
@@ -2837,7 +2851,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> T rPop(String key) {
         if (StringUtils.isBlank(key)) {
@@ -2863,7 +2877,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param count 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> List<T> rPop(String key, int count) {
         if (StringUtils.isBlank(key) || count <= 0) {
@@ -2925,7 +2939,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long sCard(String key) {
         if (StringUtils.isBlank(key)) {
@@ -2951,7 +2965,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param keys 缓存键集合
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> sDiff(String... keys) {
         if (ColUtils.isEmpty(keys)) {
@@ -2982,7 +2996,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param keys 缓存键集合
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> sInter(String... keys) {
         if (ColUtils.isEmpty(keys)) {
@@ -3071,7 +3085,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> sMembers(String key) {
         if (StringUtils.isBlank(key)) {
@@ -3100,7 +3114,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> T sPop(String key) {
         if (StringUtils.isBlank(key)) {
@@ -3125,7 +3139,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param count 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> sPop(String key, int count) {
         if (StringUtils.isBlank(key)) {
@@ -3154,7 +3168,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> T sRandMember(String key) {
         if (StringUtils.isBlank(key)) {
@@ -3179,7 +3193,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param count 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> List<T> sRandMember(String key, int count) {
         if (StringUtils.isBlank(key)) {
@@ -3238,7 +3252,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param keys 缓存键集合
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> sUnion(String... keys) {
         if (ColUtils.isEmpty(keys)) {
@@ -3274,7 +3288,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param score 有序集合分值
      * @param val 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public boolean zAdd(String key, double score, Object val) {
         if (StringUtils.isBlank(key) || Objects.isNull(val)) {
@@ -3361,7 +3375,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param vals 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long zRem(String key, Object... vals) {
         if (StringUtils.isBlank(key) || ColUtils.isEmpty(vals)) {
@@ -3393,7 +3407,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param min 区间下界
      * @param max 区间上界
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long zRemRangeByLex(String key, String min, String max) {
         if (StringUtils.isBlank(key)) {
@@ -3424,7 +3438,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param start 起始下标
      * @param end 结束下标
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long zRemRange(String key, long start, long end) {
         if (StringUtils.isBlank(key)) {
@@ -3453,7 +3467,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param min 区间下界
      * @param max 区间上界
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long zRemRangeByScore(String key, double min, double max) {
         if (StringUtils.isBlank(key)) {
@@ -3482,7 +3496,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param rang 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long zRemRangeByScore(String key, Range<Double> rang) {
         if (StringUtils.isBlank(key)) {
@@ -3515,7 +3529,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long zCard(String key) {
         if (StringUtils.isBlank(key)) {
@@ -3543,7 +3557,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param min 区间下界
      * @param max 区间上界
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long zCount(String key, double min, double max) {
         if (StringUtils.isBlank(key)) {
@@ -3571,7 +3585,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param range 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long zCount(String key, Range<Double> range) {
         if (StringUtils.isBlank(key)) {
@@ -3605,7 +3619,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param val 见方法语义
      * @param delta 增减量
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public double zIncrBy(String key, Object val, double delta) {
         if (StringUtils.isBlank(key) || Objects.isNull(val)) {
@@ -3649,7 +3663,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param start 起始下标
      * @param end 结束下标
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> zRange(String key, long start, long end) {
         if (StringUtils.isBlank(key)) {
@@ -3681,7 +3695,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param min 区间下界
      * @param max 区间上界
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> zRangeByLex(String key, String min, String max) {
         if (StringUtils.isBlank(key)) {
@@ -3719,7 +3733,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param max 区间上界
      * @param offset 偏移量
      * @param count 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> zRangeByLex(String key, String min, String max, int offset, int count) {
         if (StringUtils.isBlank(key)) {
@@ -3758,7 +3772,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param max 区间上界
      * @param offset 偏移量
      * @param count 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> zRangeByScore(String key, double min, double max, int offset, int count) {
         if (StringUtils.isBlank(key)) {
@@ -3786,7 +3800,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param min 区间下界
      * @param max 区间上界
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> zRangeByScore(String key, double min, double max) {
         return zRangeByScore(key, Range.create(min, max), null);
@@ -3803,7 +3817,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param range 见方法语义
      * @param limit 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> zRangeByScore(String key, Range<Double> range, Limit limit) {
         if (StringUtils.isBlank(key)) {
@@ -3853,7 +3867,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param val 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public Long zRank(String key, Object val) {
         Objects.requireNonNull(key);
@@ -3879,7 +3893,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param start 起始下标
      * @param end 结束下标
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> zRevRange(String key, long start, long end) {
         if (StringUtils.isBlank(key)) {
@@ -3912,7 +3926,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param max 区间上界
      * @param offset 偏移量
      * @param count 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> zRevRangeByScore(String key, double min, double max, int offset, int count) {
         if (StringUtils.isBlank(key)) {
@@ -3940,7 +3954,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param min 区间下界
      * @param max 区间上界
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> zRevRangeByScore(String key, double min, double max) {
         return zRevRangeByScore(key, Range.create(min, max), null);
@@ -3957,7 +3971,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param range 见方法语义
      * @param limit 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> Set<T> zRevRangeByScore(String key, Range<Double> range, Limit limit) {
         if (StringUtils.isBlank(key)) {
@@ -4007,7 +4021,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param val 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public Long zRevRank(String key, Object val) {
         Objects.requireNonNull(key);
@@ -4033,7 +4047,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param key 缓存键
      * @param val 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public Double zScore(String key, Object val) {
         Objects.requireNonNull(key);
@@ -4059,7 +4073,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param start 起始下标
      * @param end 结束下标
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <E, T extends ZSetOperations.TypedTuple<E>> Set<T> zRangeWithScores(String key, long start, long end) {
         if (StringUtils.isEmpty(key)) {
@@ -4090,7 +4104,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param start 起始下标
      * @param end 结束下标
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <E, T extends ZSetOperations.TypedTuple<E>> Set<T> zRevRangeWithScores(String key, long start, long end) {
         if (StringUtils.isEmpty(key)) {
@@ -4123,7 +4137,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param max 区间上界
      * @param offset 偏移量
      * @param count 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <E, T extends ZSetOperations.TypedTuple<E>> Set<T> zRangeByScoreWithScores(
             String key, double min, double max, int offset, int count) {
@@ -4153,7 +4167,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param min 区间下界
      * @param max 区间上界
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <E, T extends ZSetOperations.TypedTuple<E>> Set<T> zRangeByScoreWithScores(String key, double min, double max) {
         return zRangeByScoreWithScores(key, Range.create(min, max), null);
@@ -4170,7 +4184,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param range 见方法语义
      * @param limit 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <E, T extends ZSetOperations.TypedTuple<E>> Set<T> zRangeByScoreWithScores(
             String key, Range<Double> range, Limit limit) {
@@ -4225,7 +4239,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param max 区间上界
      * @param offset 偏移量
      * @param count 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <E, T extends ZSetOperations.TypedTuple<E>> Set<T> zRevRangeByScoreWithScores(
             String key, double min, double max, int offset, int count) {
@@ -4254,7 +4268,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param min 区间下界
      * @param max 区间上界
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <E, T extends ZSetOperations.TypedTuple<E>> Set<T> zRevRangeByScoreWithScores(String key, double min, double max) {
         return zRevRangeByScoreWithScores(key, Range.create(min, max), null);
@@ -4271,7 +4285,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param key 缓存键
      * @param range 见方法语义
      * @param limit 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <E, T extends ZSetOperations.TypedTuple<E>> Set<T> zRevRangeByScoreWithScores(String key, Range<Double> range, Limit limit) {
         if (StringUtils.isEmpty(key)) {
@@ -4323,7 +4337,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param script Lua 脚本
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public String scriptLoad(String script) {
         byte[] sc = keySerializer.serialize(script);
@@ -4416,7 +4430,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param script Lua 脚本
      * @param clazz 反序列化目标类型
      * @param args 脚本参数
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> T eval(String script, Class<?> clazz, Object... args) {
         return this.eval(script, clazz, null, args);
@@ -4430,7 +4444,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param clazz 反序列化目标类型
      * @param keys 缓存键集合
      * @param args 脚本参数
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> T eval(String script, Class<?> clazz, String[] keys, Object... args) {
         Objects.requireNonNull(script);
@@ -4462,7 +4476,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param keys 缓存键集合
      * @param args 脚本参数
      * @param <T> 返回类型
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> T evalDirectConnection(String script, Class<?> clazz, String[] keys, Object... args) {
         Objects.requireNonNull(script);
@@ -4589,7 +4603,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param sha1 见方法语义
      * @param clazz 反序列化目标类型
      * @param args 脚本参数
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> T evalSha(String sha1, Class<?> clazz, Object... args) {
         return this.evalSha(sha1, clazz, null, args);
@@ -4603,7 +4617,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param clazz 反序列化目标类型
      * @param keys 缓存键集合
      * @param args 脚本参数
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <T> T evalSha(String sha1, Class<?> clazz, String[] keys, Object... args) {
         Objects.requireNonNull(sha1);
@@ -4986,7 +5000,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param channel 频道名
      * @param message 消息体
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long pub(String channel, Object message) {
         if (StringUtils.isBlank(channel) || message == null) {
@@ -6345,7 +6359,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param stream Stream 键
      * @param message 消息体
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public String publish(String stream, Object message) {
         return this.publish(stream, STREAM_EVENT, message);
@@ -6358,7 +6372,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param stream Stream 键
      * @param event 事件名
      * @param message 消息体
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public String publish(String stream, String event, Object message) {
         // 前置校验 (在 borrow PooledEvtData/passthrough 之前, 避免无意义借还), 与 xAdd 单条一致
@@ -6447,7 +6461,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param topic 主题名
      * @param partition 见方法语义
      * @param data 业务数据
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public String partition(String topic, String partition, Object data) {
         return RedisPartition.load(this).publish(topic, partition, data);
@@ -6460,7 +6474,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param topic 主题名
      * @param partition 见方法语义
      * @param data 业务数据
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public String partition(String topic, long partition, Object data) {
         return RedisPartition.load(this).publish(topic, partition, data);
@@ -6474,7 +6488,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param event 事件名
      * @param partition 见方法语义
      * @param data 业务数据
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public String partition(String topic, String event, String partition, Object data) {
         return RedisPartition.load(this).publish(topic, event, partition, data);
@@ -6488,7 +6502,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param event 事件名
      * @param partition 见方法语义
      * @param data 业务数据
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public String partition(String topic, String event, long partition, Object data) {
         return RedisPartition.load(this).publish(topic, event, partition, data);
@@ -6500,7 +6514,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param stream Stream 键
      * @param message 消息体
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public String xAdd(String stream, Object message) {
         return xAdd(stream, STREAM_EVENT, message);
@@ -6518,7 +6532,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param stream Stream 键
      * @param field 哈希字段名
      * @param message 消息体
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public String xAdd(String stream, String field, Object message) {
         // 前置校验 (与多 field 版一致): Redis Stream 不接受 null/空 field/value, blank stream 也非法
@@ -6609,7 +6623,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param stream Stream 键
      * @param maxlen 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long xTrimMaxlen(String stream, long maxlen) {
         if (StringUtils.isBlank(stream) || maxlen < 1) {
@@ -6632,7 +6646,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param stream Stream 键
      * @param millis 毫秒数
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long xTrimMinId(String stream, long millis) {
         return xTrimMinId(stream, millis + "-0");
@@ -6649,7 +6663,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param stream Stream 键
      * @param minId 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long xTrimMinId(String stream, String minId) {
         if (StringUtils.isBlank(stream)) return 0l;
@@ -6742,7 +6756,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param stream Stream 键
      * @param messageIds 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long xDel(String stream, String... messageIds) {
         if (StringUtils.isBlank(stream) || ColUtils.isEmpty(messageIds)) {
@@ -6773,7 +6787,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * 当前线程未开启批次时不缓冲，本命令<b>立即单独发出</b>。
      *
      * @param stream Stream 键
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public long xLen(String stream) {
         if (StringUtils.isBlank(stream)) {
@@ -6801,7 +6815,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param stream Stream 键
      * @param messageIdRange 见方法语义
      * @param count 数量上限
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <V> List<Map<String, V>> xRange(String stream, Range<String> messageIdRange, Long count) {
         Objects.requireNonNull(stream);
@@ -6855,7 +6869,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param stream Stream 键
      * @param messageIdRange 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <V> List<Map<String, V>> xRange(String stream, Range<String> messageIdRange) {
         return xRange(stream, messageIdRange, null);
@@ -6867,7 +6881,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      * @param stream Stream 键
      * @param messageIdStart 见方法语义
      * @param messageIdEnd 见方法语义
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public <V> List<Map<String, V>> xRange(String stream, String messageIdStart, String messageIdEnd) {
         return xRange(stream, Range.create(messageIdStart, messageIdEnd), null);
@@ -7153,7 +7167,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param stream Stream 键
      * @param group 消费组名
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public PendingMessagesSummary xPending(String stream, String group) {
         Objects.requireNonNull(stream);
@@ -7172,7 +7186,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      *
      * @param stream Stream 键
      * @param args 脚本参数
-     * @return 命令的执行结果。
+     * @return 当前操作的 Redis 业务值；空目标与无效输入按上述边界返回空值、零值或 false，未声明为可忽略的执行失败以异常暴露。
      */
     public ClaimedMessages<byte[], byte[]> xAutoClaim(String stream, XAutoClaimArgs<byte[]> args) {
         Objects.requireNonNull(stream);

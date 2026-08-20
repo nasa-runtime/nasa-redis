@@ -45,8 +45,8 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
             Long.getLong("nasa.batch-stream.drain-timeout-ms", 30_000L);
 
     /**
-     * 原始订阅请求。主要给 ManagedRunner 批量路径用 — 提取 streamKey / consumer / autoAck 元信息;
-     * 非 group doLoop 路径仅在构造期通过它生成 readFunction, 之后不再直接读, 通过 readFunction / pollState 操作。
+     * 原始订阅请求。ManagedRunner 批量路径从中读取 streamKey、consumer 与 autoAck 元信息；
+     * 非 group 路径只在构造期用它生成 readFunction，运行期通过 readFunction 与 pollState 操作。
      */
     private final StreamReadRequest<K> streamRequest;
     /** 缓存的 stream key (与 streamRequest 同源), batch demux 热路径上避免每次穿透到 streamRequest */

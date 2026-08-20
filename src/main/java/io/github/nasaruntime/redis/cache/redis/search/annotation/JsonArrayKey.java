@@ -55,10 +55,14 @@ import java.lang.annotation.Target;
 public @interface JsonArrayKey {
 
     /**
-     * 多 {@code @JsonArrayKey} 字段拼接顺序, 升序排列, 默认 0.
+     * 业务作用：确定多个 {@code @JsonArrayKey} 字段形成聚合键时的稳定拼接顺序。
      * <p>
      * 单字段场景保持默认 0 即可; 同类多字段时必须显式区分 (例 {@code order = 1} / {@code order = 2}),
      * 否则 MetaResolver 启动期抛"duplicate order"错误.
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 升序参与拼接的顺序值。
      */
     int order() default 0;
 }

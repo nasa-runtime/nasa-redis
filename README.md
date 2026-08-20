@@ -25,22 +25,22 @@ RedisJob 是显式、按数据源启用的运行时：`@EnableRedis` 只建立 R
 调用也必须通过 `RedisJobSchedulers.scheduler(sourceId)` 选择 source。没有任务或静态调用引用的数据源
 不会创建 Scheduler、扫描线程、订阅或执行器注册记录，框架也不会把未知 source 回退到 `primary`。
 
-## 从 1.0.0 升级到 2.0.0
+## 旧键布局迁移边界
 
-`2.0.0` 引入多数据源 source id，RedisJob 的 Redis hash tag、稳定 `runId`、Fanout `executionKey` 和
-公开构造入口均发生不兼容变化，不能把它当作 `1.0.0` 的原地滚动升级：即使继续使用相同的 `namespace`，
-`2.0.0` 也会写入包含 qualifier 的新键空间，不读取或接管 `1.0.0` 的定义、Run、Stream、租约与 Fanout。
-框架不提供两个键布局之间的在线迁移。
+当前 RedisJob 把多数据源 source id 纳入 Redis hash tag、稳定 `runId`、Fanout `executionKey` 和全部公开
+构造入口。未包含 source id 的旧键布局与当前布局属于两套独立控制面：即使继续使用相同的 `namespace`，
+当前运行时也不会读取或接管旧布局中的定义、Run、Stream、租约与 Fanout。框架不提供两种键布局之间的
+在线迁移。
 
-RedisJob 不再随 `@EnableRedis` 自动装配，也不再提供默认 `RedisJobScheduler` Bean。业务必须显式添加
-`@EnableRedisJob`，每个 `@RedisJob` 必须填写 `qualifier`；编程式控制通过
-`RedisJobSchedulers.scheduler("<source-id>")` 明确选择数据源。原根级 `nasa.redis.job.qualifier` 已取消；
-Scheduler 的 source id 由注解、静态入口或直接传入的 RedisProxy 确定。
+当前装配要求是：`@EnableRedis` 不启用 RedisJob，业务必须显式添加 `@EnableRedisJob`；每个
+`@RedisJob` 必须填写 `qualifier`，编程式控制通过 `RedisJobSchedulers.scheduler("<source-id>")`
+明确选择数据源。框架不提供默认 `RedisJobScheduler` Bean，也不存在可以改写 Scheduler 来源的根级
+qualifier 配置；source id 只能由注解、静态入口或直接传入的 RedisProxy 确定。
 
-升级前先在全部 `1.0.0` 节点暂停新触发，等待普通 Run 和 Fanout 到达终态，再停止所有旧节点；确认没有旧进程
-继续扫描后才能启动 `2.0.0`。新版本应按一套新调度集接入并重新登记定义。由于稳定幂等标识也已改变，跨版本
-仍可能到达的业务事件必须使用订单号、结算号等版本无关业务键在目标系统去重；不能依赖新旧 `runId` 相同。
-需要保留旧记录时先归档或按业务方案离线迁移，不能让两个版本同时处理同一业务副作用。
+从旧布局迁移时，先在全部旧节点暂停新触发，等待普通 Run 和 Fanout 到达终态，再停止所有旧节点；确认没有
+旧进程继续扫描后，才能用当前布局启动并重新登记定义。两种布局的稳定幂等标识不同，迁移窗口内仍可能到达的
+业务事件必须使用订单号、结算号等布局无关业务键在目标系统去重，不能依赖两边 `runId` 相同。需要保留旧记录
+时先归档或按业务方案离线迁移，不能让两套布局同时处理同一业务副作用。
 
 ## 接入前必读：必须允许 Bean 定义覆盖
 
@@ -416,7 +416,7 @@ try {
 - **持有者标识 = JVM 实例 ID + 线程 ID**，跨节点与跨线程都唯一；
 - 锁实例走对象池回收，高并发下不产生锁对象垃圾。
 
-### Stream 分区消费 —— Kafka 式分区模型
+### Stream 分区消费 —— 独占分区与故障接管
 
 N 个分区 stream 共享一组消费者组，每个分区由分布式锁独占：抢到锁的节点执行 `XAUTOCLAIM` + `XREADGROUP` 消费该分区。节点增减时分区自动重新分配。
 
@@ -584,7 +584,7 @@ Fanout、回收和对账脚本。它们随主 JAR 发布。RedisJob 脚本通过
 
 ## 与 nasa-core 的关系
 
-分布式锁的看门狗续期依赖 `nasa-core` 的 `TimingWheel`；锁实例与 Pipeline 缓冲走 `ObjectPool`；分区消费的上下文用 `RecycleLinkedMap` 承载；`JdkSnowflake` 复用 core 中不依赖 Redis 的 ID 生成算法。因此本模块必须与 `nasa-core` 同时使用。
+分布式锁的看门狗续期依赖 `nasa-core` 的 `TimingWheel`；锁实例与 Pipeline 缓冲走 `ObjectPool`；分区消费的上下文用 `RecycleLinkedMap` 承载；`JdkSnowflake` 复用 core 中不依赖 Redis 的 ID 生成算法。当前发布坐标依赖 `io.github.nasa-runtime:nasa-core:1.0.3`，使用方应让 Maven 解析到该版本或兼容的更新版本。
 
 ## 构建
 
@@ -592,12 +592,11 @@ Fanout、回收和对账脚本。它们随主 JAR 发布。RedisJob 脚本通过
 mvn -B -ntp clean verify
 ```
 
-## 文档与发布
+## 相关文档
 
+- RedisJob 的完整状态机、配置与运维边界见 [REDIS-JOB.md](REDIS-JOB.md)。
 - 贡献方式见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 - 安全问题报告方式见 [SECURITY.md](SECURITY.md)。
-- Central Portal 和 GitHub 的发布流程见 [RELEASING.md](RELEASING.md)。
-- 版本变化见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可证
 

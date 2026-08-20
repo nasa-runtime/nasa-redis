@@ -102,7 +102,7 @@ public class DefaultRedisSimpleCache<V> implements SimpleCache<String, V> {
      * 键不存在时返回空。
      *
      * @param key 缓存键
-     * @return 命令的执行结果。
+     * @return 缓存值；键不存在时返回 null。
      */
     @Override
     public V get(String key) {
@@ -198,9 +198,9 @@ public class DefaultRedisSimpleCache<V> implements SimpleCache<String, V> {
      * 业务作用：读取哈希字段。
      * 字段不存在时返回空。
      *
-     * @param k 见方法语义
-     * @param hk 见方法语义
-     * @return 命令的执行结果。
+     * @param k  哈希缓存键
+     * @param hk 哈希字段名
+     * @return 字段值；键或字段不存在时返回 null。
      */
     @Override
     public V hGet(String k, String hk) {
@@ -211,8 +211,8 @@ public class DefaultRedisSimpleCache<V> implements SimpleCache<String, V> {
      * 业务作用：读取哈希字段。
      * 字段不存在时返回空。
      *
-     * @param k 见方法语义
-     * @return 命令的执行结果。
+     * @param k 哈希缓存键
+     * @return 全部字段及其值；键不存在时返回空 Map。
      */
     @Override
     public Map<String, V> hGet(String k) {
@@ -223,8 +223,8 @@ public class DefaultRedisSimpleCache<V> implements SimpleCache<String, V> {
      * 业务作用：读取哈希的全部字段名。
      * 字段极多时会一次性返回全部内容，应评估返回体量。
      *
-     * @param s 见方法语义
-     * @return 命令的执行结果。
+     * @param s 哈希缓存键
+     * @return 全部字段名；键不存在时返回空 Set。
      */
     @Override
     public Set<String> hKeys(String s) {

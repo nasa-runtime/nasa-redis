@@ -3,9 +3,8 @@ package io.github.nasaruntime.redis.cache.redis.search;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Nasa
- * {@link JsonArraySupport} 用的 LUA 脚本集合 — 拆顶级 public 类是因为 {@link io.github.nasaruntime.redis.cache.redis.LettucePipeline.Actuator}
- * 在外 package 直接调度 ARRAY 模式批量写时也需要复用同一份脚本字面值, 不再走 {@code JsonArraySupport} 间接调用.
+ * {@link JsonArraySupport} 与 {@link io.github.nasaruntime.redis.cache.redis.LettucePipeline.Actuator} 共用的 Lua 脚本集合，
+ * 保证 ARRAY 模式的直接写入和批量写入执行相同的原子语义。
  * <p>
  * 所有脚本配合 {@code JsonArraySupport.evalScript} 的 EVALSHA + NOSCRIPT fallback 机制使用.
  * 同名脚本内容变更会让 SHA1 改变, 部署后首次走 1 次 SCRIPT LOAD 重注册, 稳态 EVALSHA 1 RTT.

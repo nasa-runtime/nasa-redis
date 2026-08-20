@@ -23,8 +23,7 @@ import java.util.List;
 public final class FieldMeta {
 
     /**
-     * 反射 Field 句柄, 启动期解析 annotation / 字段类型 / 字段名等元信息用.
-     * 运行时 get/set 走 {@link #handle} VarHandle, 不再触碰 reflect (零反射热路径).
+     * 反射 Field 句柄，只在启动期解析 annotation、字段类型与字段名；运行期读写统一使用 {@link #handle}。
      */
     private final Field reflect;
 
@@ -134,11 +133,11 @@ public final class FieldMeta {
     }
 
     /**
-     * 业务作用：查询键的数据类型。
+     * 业务作用：读取字段对应的 RediSearch 索引类型。
      *
      * <p>参数说明: 无。
      *
-     * @return 命令的执行结果。
+     * @return TAG、NUMERIC、TEXT、GEO 或 ID 类型。
      */
     public FieldType type() {
         return type;
@@ -248,11 +247,10 @@ public final class FieldMeta {
     }
 
     /**
-     * 业务作用：读取字符串值。
-     * 键不存在时返回空。
+     * 业务作用：通过启动期固化的 VarHandle 读取实体字段值。
      *
-     * @param entity 见方法语义
-     * @return 命令的执行结果。
+     * @param entity 字段所属的业务实体
+     * @return 实体中的当前字段值；字段值本身允许为 null。
      */
     public Object get(Object entity) {
         return handle.get(entity);

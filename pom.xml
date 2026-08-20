@@ -54,7 +54,7 @@
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
         <project.build.outputTimestamp>2026-08-19T00:00:00Z</project.build.outputTimestamp>
 
-        <nasa-core.version>1.0.2</nasa-core.version>
+        <nasa-core.version>1.0.3</nasa-core.version>
         <lombok.version>1.18.42</lombok.version>
         <slf4j.version>2.0.17</slf4j.version>
         <graal-sdk.version>25.0.0</graal-sdk.version>
@@ -133,7 +133,6 @@
                     <include>LICENSE-MIT</include>
                     <include>README.md</include>
                     <include>REDIS-JOB.md</include>
-                    <include>CHANGELOG.md</include>
                 </includes>
             </resource>
         </resources>

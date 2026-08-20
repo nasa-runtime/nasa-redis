@@ -362,7 +362,7 @@ public class LettuceDistributedLock implements DistributedLock {
     // ==================== LockSubscriptionRegistry ====================
 
     /**
-     * 等锁订阅注册中心 (Redisson 思路).
+     * 等锁订阅注册中心。
      * <p>
      * 同 JVM 多线程等同一锁 → 共享一个真订阅, 引用计数管理:
      * <ul>
@@ -556,7 +556,7 @@ public class LettuceDistributedLock implements DistributedLock {
         // ==================== Lock 接口 ====================
 
         /**
-         * 业务作用：阻塞获取锁 (Redisson 思路: sub-on-fail + pub-on-unlock).
+         * 业务作用：阻塞获取锁；失败时订阅释放频道，解锁通知到达后立即重试。
          * <p>
          * 加锁失败 → 订阅 unlock 通道 → park; 收到 pub 立即重试, 不轮询。
          * 平均唤醒延迟为网络 RTT 量级，避免固定 sleep min(ttl, 100ms) 带来的额外等待。
@@ -644,7 +644,7 @@ public class LettuceDistributedLock implements DistributedLock {
         /**
          * 业务作用：带超时的尝试获取锁。在 deadline 内重试, 超时返回 false。
          * <p>
-         * 走 sub+park 路径 (Redisson 思路), 不再 sleep 轮询。
+         * 未取得锁时订阅释放通知并 park，减少固定间隔轮询造成的无效 Redis 请求。
          *
          * @param time 见上述说明
          * @param unit 时长单位

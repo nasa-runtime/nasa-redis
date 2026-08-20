@@ -2937,8 +2937,8 @@ public abstract class LettucePipeline {
      *   <li>容量 {@code nasa.object-pool.cmd-buffer-capacity} 默认 64 (单个 CmdBuffer 32KB+, 64 个 ≈ 2MB pool 上限)</li>
      * </ul>
      * <p>
-     * 与 ThreadLocal 配合: 一次 pipeline session 内 ThreadLocal 缓存 borrowed buf, session 结束 recycle + remove.
-     * 平台线程 / 虚拟线程行为统一, 不再有"虚拟线程每次 new 32KB"的 GC 压力.
+     * 与 ThreadLocal 配合：一次 Pipeline session 内缓存借出的缓冲区，session 结束时归池并移除；
+     * 平台线程与虚拟线程共用相同的有界池化生命周期。
      */
     static final class CmdBuffer implements ObjectPool.Recycler<CmdBuffer> {
 
@@ -6732,9 +6732,9 @@ public abstract class LettucePipeline {
 
         /* NOTE ------------------- ZSet 读 / 元数据 (回填 LettuceFuture) ------------------------------------------------- */
         /*
-         * ZSet 读命令族: 全部走 enqueueWithFuture, caller 持 LettuceFuture<RedisFuture<T>>, pipeline 内累积,
-         * flush 完成后 lf.getFinally() 拿真值. 入参 Object key/member 走 serKey/serVal 自动处理 byte[] 直通,
-         * 不再单独提供 byte[] 重载. 读命令不区分 sync/async — 都需要回填 future, async 语义在 pipeline 中没有意义.
+         * ZSet 读命令族全部走 enqueueWithFuture，调用方持有 LettuceFuture&lt;RedisFuture&lt;T&gt;&gt;，批次发出后通过
+         * getFinally() 取得结果。Object 类型的 key/member 由 serKey/serVal 处理并允许 byte[] 直通；读命令必须
+         * 回填结果句柄，因此不区分同步与异步重载。
          */
 
         /**
@@ -7534,7 +7534,7 @@ public abstract class LettucePipeline {
                 this.xAdd(stream, event, pm);
             } finally {
                 pm.recycle();
-                // PooledEvtData.restore 不再 cascade, caller 显式归还 passthrough 到池
+                // passthrough 的借用权属于当前调用，事件包装归池后仍要由本出口显式归还。
                 if (pt != null) pt.recycle();
             }
         }
@@ -8972,8 +8972,8 @@ public abstract class LettucePipeline {
          * 业务作用：外部传入 funcs (读命令) 直接 flush. 不走 ThreadLocal 缓冲, 一次性发完即返回结果.
          * 用于 pipeline(LinkedHashMap) 这类 get-with-converter 路径.
          * <p>
-         * 与 LettucePipeline 的 pipeline(funcs, consumers) 区别: 写命令的 Consumer list 已被 CmdBuffer 替代,
-         * 业务侧不再传 consumers. 如果业务方有自定义写命令 lambda 需求, 用 add(Function) 单独入队即可.
+         * 本入口只接收需要回填结果的读命令；写命令由 CmdBuffer 承载。业务若需要自定义写命令 lambda，
+         * 应通过 add(Function) 单独入队。
          *
          * @param funcs 见上述说明
          */

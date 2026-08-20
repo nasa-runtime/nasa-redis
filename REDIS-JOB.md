@@ -29,28 +29,28 @@ RedisJob 不提供：
 - 可视化管理控制台；
 - Go 或 Rust SDK。本制品只包含 Java 运行时，其线协议和能力合同允许其它运行时实现兼容客户端。
 
-## 从 1.0.0 升级
+## 旧键布局迁移边界
 
-`2.0.0` 把语言无关 source id 纳入全部 RedisJob 键路由和稳定标识。`1.0.0` 的 schedule、registry 与
-Fanout hash tag 不含 qualifier，`2.0.0` 则统一使用 `<qualifier>:<namespace>`；两种布局属于不同控制面，
-不存在自动发现、接管或在线迁移。继续填写相同 namespace 也不会读取旧定义和存量 Run。
+当前布局把语言无关 source id 纳入全部 RedisJob 键路由和稳定标识。未包含 qualifier 的旧 schedule、
+registry 与 Fanout hash tag 和当前统一使用的 `<qualifier>:<namespace>` 属于不同控制面，不存在自动发现、
+接管或在线迁移。继续填写相同 namespace 也不会读取旧定义和存量 Run。
 
-同时发生变化的公开合同包括：
+当前 source-aware 公开合同包括：
 
 - `RedisJobIdentifiers` 的 scheduled/manual Run 标识计算增加 qualifier，Fanout `executionKey` 随之变化；
 - `RedisJobKeyspace` 构造参数增加 qualifier，生成的全部键和频道进入新 hash tag；
-- RedisJob 从 `@EnableRedis` 的隐式装配中分离，业务必须显式使用 `@EnableRedisJob`；框架不再提供默认
+- RedisJob 与 `@EnableRedis` 分离，业务必须显式使用 `@EnableRedisJob`；框架不提供默认
   `RedisJobScheduler` Bean，编程式入口改为 `RedisJobSchedulers.scheduler(sourceId)`；
-- `@RedisJob.qualifier` 不再默认指向 primary，每个注解任务都必须显式声明 source；
-- 根级 `nasa.redis.job.qualifier` 取消；直接构造 Scheduler 时，source id 从传入 RedisProxy 冻结，不能由
+- `@RedisJob.qualifier` 没有默认 source，每个注解任务都必须显式声明；
+- 不提供根级 `nasa.redis.job.qualifier`；直接构造 Scheduler 时，source id 从传入 RedisProxy 冻结，不能由
   另一份配置字段伪装成其它来源；
-- `RedisJobContext` 增加 `qualifier()` 和泛型 `TypeReference` 解码入口。业务 Handler 只消费框架上下文无需改造，
-  自行实现该接口的代码必须补齐新方法。
+- `RedisJobContext` 提供 `qualifier()` 和泛型 `TypeReference` 解码入口；自行实现该接口的代码必须提供
+  相同合同。
 
-安全升级顺序是：旧集群 `pause` 停止新触发 → 等待普通 Run/Fanout 全部终态 → 停止全部 `1.0.0` 节点 →
-确认旧节点不再扫描 → 以 `2.0.0` 新键空间启动并重新登记任务。若旧批次无法排空，应先取消并确认其外部副作用；
-新旧稳定标识不同，目标系统必须用订单号、结算号等版本无关业务键去重。需要保存旧控制面记录时先离线归档，
-不要在两个版本并行运行时复制活动 Run、租约或 Stream 消息。
+安全迁移顺序是：旧控制面 `pause` 停止新触发 → 等待普通 Run/Fanout 全部终态 → 停止全部旧节点 →
+确认旧节点不再扫描 → 以当前键空间启动并重新登记任务。若旧批次无法排空，应先取消并确认其外部副作用；
+两种布局的稳定标识不同，目标系统必须用订单号、结算号等布局无关业务键去重。需要保存旧控制面记录时先
+离线归档，不要在两套布局并行运行时复制活动 Run、租约或 Stream 消息。
 
 ## 运行架构
 
@@ -628,6 +628,7 @@ RedisJob 扫描线程、订阅或注册表成员；空 source、未知 source �
 | `registry-gc-grace-ms` | `3600000` | 过期执行器回收宽限，必须大于 Fanout 最大等待时间 |
 | `max-result-summary-bytes` | `4096` | 持久化 Handler 结果摘要的 UTF-8 字节上限 |
 | `wire.json.default-typing` | `false` | 必须保持关闭 |
+| `sources` | 空映射 | 按 source id 覆盖根级属性；只影响业务显式引用的数据源，不会主动建立 Scheduler |
 
 构造 `RedisJobProperties` 时会在任何 Redis 写入和任务线程启动前校验租约、可见性、心跳、容量、Fanout
 等待、保留期和参数大小之间的关系；不安全组合直接使应用启动失败。

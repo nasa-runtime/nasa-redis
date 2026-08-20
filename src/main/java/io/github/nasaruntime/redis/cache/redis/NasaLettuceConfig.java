@@ -225,8 +225,7 @@ public class NasaLettuceConfig {
 
         template.setKeySerializer(RedisSerializer.string());
         template.setValueSerializer(valueSerializer);
-        // hash field 名是字符串, 用独立的 string serializer, 不再别名 keySerializer:
-        // 二者语义不同 (外层 redis key vs hash field), 解耦后 pipeline hash 路径的 key/field 序列化才各归各位.
+        // 外层 Redis key 与 hash field 是两类协议字段，分别设置序列化器可避免后续配置改动使二者意外耦合。
         template.setHashKeySerializer(RedisSerializer.string());
         template.setHashValueSerializer(valueSerializer);
 

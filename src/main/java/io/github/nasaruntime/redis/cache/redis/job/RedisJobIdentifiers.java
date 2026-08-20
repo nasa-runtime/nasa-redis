@@ -15,6 +15,11 @@ public final class RedisJobIdentifiers {
 
     private static final HexFormat HEX = HexFormat.of();
 
+    /**
+     * 业务作用：阻止实例化，使全部标识生成统一经由无状态静态入口完成。
+     *
+     * <p>参数说明: 无。
+     */
     private RedisJobIdentifiers() {}
 
     /**

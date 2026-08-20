@@ -200,11 +200,11 @@ public final class EntityMeta {
     }
 
     /**
-     * 业务作用：查询键的数据类型。
+     * 业务作用：读取这份元数据对应的业务实体类型。
      *
      * <p>参数说明: 无。
      *
-     * @return 命令的执行结果。
+     * @return 业务实体的 Class。
      */
     public Class<?> type() {
         return type;
