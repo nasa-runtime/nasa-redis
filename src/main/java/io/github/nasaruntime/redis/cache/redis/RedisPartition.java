@@ -34,12 +34,10 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
- * Redis Stream 分区消费框架。
+ * 业务作用：按业务分区键把 Redis Stream 消息稳定路由到独占消费者，在节点变化后重新分配分区并接管未确认消息。
  * <p>
- * 类似 Kafka 分区模型: N 个分区 stream 共享一组消费者组, 每个分区通过
- * {@link LettuceDistributedLock} 独占, tryLock 成功的节点跑 XAUTOCLAIM + XREADGROUP 消费.
- * 同一个 key 永远落到同一分区 → 同一节点 → 串行处理，使业务保持单线程语义，
- * 不再需要 Lua 原子算改写。
+ * N 个分区 Stream 共享一组消费者组，每个分区通过 {@link LettuceDistributedLock} 独占；取得锁的节点执行
+ * XAUTOCLAIM 与 XREADGROUP。同一个分区键始终落入同一分区，并由当前持锁节点串行处理；不同分区之间不保证顺序。
  *
  * <h2>架构特性</h2>
  * <ul>
@@ -414,54 +412,50 @@ public class RedisPartition {
     // ==================== publish: (topic, event, partition, data) 重载 ====================
 
     /**
-     * 业务作用：向频道发布消息。
-     * 订阅是即时的，发布时没有订阅者则消息直接丢弃，不做任何保留。
+     * 业务作用：按字符串分区键把事件持久写入对应分区 Stream，事件名默认使用 topic。
      *
      * @param topic 主题名
-     * @param partition 见方法语义
+     * @param partition 参与稳定分区计算的业务键；null 时使用轮转分区
      * @param data 业务数据
-     * @return 命令的执行结果。
+     * @return Redis Stream 消息 ID。
      */
     public String publish(String topic, String partition, Object data) {
         return this.publish(topic, topic, partition, data);
     }
 
     /**
-     * 业务作用：向频道发布消息。
-     * 订阅是即时的，发布时没有订阅者则消息直接丢弃，不做任何保留。
+     * 业务作用：按长整型分区键把事件持久写入对应分区 Stream，事件名默认使用 topic。
      *
      * @param topic 主题名
-     * @param partition 见方法语义
+     * @param partition 参与稳定分区计算的业务键
      * @param data 业务数据
-     * @return 命令的执行结果。
+     * @return Redis Stream 消息 ID。
      */
     public String publish(String topic, long partition, Object data) {
         return this.publish(topic, topic, partition, data);
     }
 
     /**
-     * 业务作用：向频道发布消息。
-     * 订阅是即时的，发布时没有订阅者则消息直接丢弃，不做任何保留。
+     * 业务作用：按字符串分区键把指定事件持久写入对应分区 Stream。
      *
      * @param topic 主题名
      * @param event 事件名
-     * @param partition 见方法语义
+     * @param partition 参与稳定分区计算的业务键；null 时使用轮转分区
      * @param data 业务数据
-     * @return 命令的执行结果。
+     * @return Redis Stream 消息 ID。
      */
     public String publish(String topic, String event, String partition, Object data) {
         return this.doPublish(topic, event, partition == null ? -1 : (partition.hashCode() & Integer.MAX_VALUE), partition == null, data);
     }
 
     /**
-     * 业务作用：向频道发布消息。
-     * 订阅是即时的，发布时没有订阅者则消息直接丢弃，不做任何保留。
+     * 业务作用：按长整型分区键把指定事件持久写入对应分区 Stream。
      *
      * @param topic 主题名
      * @param event 事件名
-     * @param partition 见方法语义
+     * @param partition 参与稳定分区计算的业务键
      * @param data 业务数据
-     * @return 命令的执行结果。
+     * @return Redis Stream 消息 ID。
      */
     public String publish(String topic, String event, long partition, Object data) {
         return this.doPublish(topic, event, Long.hashCode(partition) & Integer.MAX_VALUE, false, data);
@@ -747,7 +741,7 @@ public class RedisPartition {
     }
 
     /**
-     * 业务作用：当前节点持有的分区: groupName → 分区索引列表 (默认组用 "&lt;default&gt;"). 用于监控/调试
+     * 业务作用：按消费组返回当前节点持有的分区索引，供运行监控与故障诊断使用；默认组使用 "&lt;default&gt;"。
      *
      * @return 见上述说明。
      */
@@ -1997,8 +1991,7 @@ public class RedisPartition {
             // 反序列化失败 / 找不到 listener → 直接 ACK 丢弃, 防止 pending 堆积
             RecycleLinkedList<String> dropIds = null;
 
-            // 按 teKey 分桶累积本批次内每个 (topic, event) 的所有 traceId, 拼接后作为整桶 batch 日志染色
-            // (跨 teKey 不混: 之前全局拼成一份让每个 teKey 都拿到别 teKey 的 trace, 语义不准)
+            // traceId 必须按 (topic, event) 隔离聚合，避免无关事件共享日志上下文并造成错误归因。
             RecycleLinkedMap<String, HashSet<String>> traceIdsByTE = null;
             // PooledEvtData 路径 Jackson 经 RecycleModule 路由把 passthrough 池借出 RecycleLinkedMap;
             // listener 执行完后必须显式归还, 否则池借出不还稳态后退化到每次 new.

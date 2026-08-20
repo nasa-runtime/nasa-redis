@@ -1070,11 +1070,11 @@ public class RediSearch implements RediSearchOperations {
     }
 
     /**
-     * 业务作用：判断键是否存在。
+     * 业务作用：判断查询条件是否至少命中一个指定类型的索引文档，并在判断完成后回收查询对象。
      *
-     * @param query 见方法语义
+     * @param query 查询条件，调用结束后由本方法回收
      * @param type 反序列化目标类型
-     * @return 命令的执行结果。
+     * @return 至少命中一个文档时返回 true。
      */
     @Override
     public boolean exists(RsQuery query, Class<?> type) {
@@ -1218,8 +1218,7 @@ public class RediSearch implements RediSearchOperations {
     /**
      * 业务作用：JSON 模式单行解析: kvList 格式为 ["$", "&lt;jsonString&gt;"]
      * <p>
-     * id 参数语义: 无占位符模式从 key 反推得到 (用于 @RsId @JsonIgnore 场景从 key 回填; 但 @RsId 现在禁止 @JsonIgnore,
-     * 实际不再需要); 占位符模式下 id=null, entity 反序列化时 id 从 JSON 字段读出, 不回填.
+     * id 参数语义：无占位符模式允许从 key 反推标识；占位符模式传入 null，实体反序列化时从 JSON 字段读取标识。
      *
      * @param id     条目标识
      * @param kvList 见上述说明
@@ -1456,11 +1455,11 @@ public class RediSearch implements RediSearchOperations {
         }
 
         /**
-         * 业务作用：查询键的数据类型。
+         * 业务作用：读取当前类型绑定视图固定的实体类型。
          *
          * <p>参数说明: 无。
          *
-         * @return 命令的执行结果。
+         * @return 创建该绑定视图时指定的实体 Class。
          */
         public Class<T> type() {
             return type;
@@ -1738,10 +1737,10 @@ public class RediSearch implements RediSearchOperations {
         }
 
         /**
-         * 业务作用：判断键是否存在。
+         * 业务作用：判断查询条件是否至少命中一个当前绑定类型的索引文档。
          *
-         * @param query 见方法语义
-         * @return 命令的执行结果。
+         * @param query 查询条件，调用结束后由底层入口回收
+         * @return 至少命中一个文档时返回 true。
          */
         public boolean exists(RsQuery query) {
             return rs.exists(query, type);

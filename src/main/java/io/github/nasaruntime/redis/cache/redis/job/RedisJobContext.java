@@ -1,11 +1,22 @@
 package io.github.nasaruntime.redis.cache.redis.job;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+
 import java.util.Optional;
 
 /**
  * 业务作用：向 Handler 暴露稳定运行身份、取消信号、失权门禁和 Fanout 创建入口。
  */
 public interface RedisJobContext {
+
+    /**
+     * 业务作用：读取当前任务实际绑定的语言无关 source id，供日志、指标和业务幂等键区分数据源。
+     *
+     * <p>返回值不携带 Spring Bean 后缀，多数据源部署下同名任务靠它区分归属。
+     *
+     * @return source id；当前 Run 显式绑定 primary 数据源时为 {@code primary}。
+     */
+    String qualifier();
 
     /**
      * 业务作用：读取调度命名空间。 @return 命名空间。
@@ -50,6 +61,18 @@ public interface RedisJobContext {
      * @return 解码后的参数。
      */
     <T> T parameter(Class<T> type);
+
+    /**
+     * 业务作用：按 Handler 本地静态类型解码集合、Map、泛型 DTO 和嵌套复杂对象，保留元素类型。
+     *
+     * <p>类型只能由已登记的本地 Handler 代码提供，不写入消息也不由消息选择；与
+     * {@link #parameter(Class)} 共用同一套安全映射器与 JVM 类型元数据门禁。
+     *
+     * @param type 完整泛型类型引用
+     * @param <T>  目标类型
+     * @return 解码后的参数；字节携带 JVM 类型元数据时抛出 INVALID_PAYLOAD。
+     */
+    <T> T parameter(TypeReference<T> type);
 
     /**
      * 业务作用：读取线协议原始字节，供 Protobuf 或自定义 Codec 使用。 @return 参数副本。

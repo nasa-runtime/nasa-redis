@@ -36,6 +36,7 @@ class NasaCacheRuntimeHints implements RuntimeHintsRegistrar {
         reflectionHints.registerType(RedisImportBeanDefinitionRegistrar.class, MemberCategory.values());
 
         resourceHints.registerPatternIfPresent(classLoader, "lua", (hint) -> hint.includes("lua/*"));
+        resourceHints.registerPatternIfPresent(classLoader, "lua", (hint) -> hint.includes("lua/job/*"));
 
         try {
             if (ClassUtils.isPresent("org.redisson.api.RedissonClient", classLoader)) {

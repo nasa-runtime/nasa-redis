@@ -16,27 +16,47 @@ import java.lang.annotation.Target;
 public @interface TextField {
 
     /**
-     * 索引内字段名;默认空 → 取 Jackson {@code @JsonProperty} 值(若有), 否则 对象字段名
+     * 业务作用：指定索引内字段名，使查询别名能够与对象字段或 Jackson 名称解耦。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 显式索引名；空字符串表示依次使用 Jackson 名称和对象字段名。
      */
     String name() default "";
 
     /**
-     * 相关性权重
+     * 业务作用：设置全文检索相关性评分中的字段权重。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 传给 RediSearch schema 的正权重，默认 {@code 1.0}。
      */
     double weight() default 1.0;
 
     /**
-     * 是否可排序
+     * 业务作用：声明文本字段是否参与 RediSearch 排序。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return {@code true} 表示在索引 schema 中启用排序能力。
      */
     boolean sortable() default false;
 
     /**
-     * 是否禁用词干提取
+     * 业务作用：控制全文索引是否关闭词干提取，供必须精确保留词形的字段使用。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return {@code true} 表示关闭词干提取。
      */
     boolean noStem() default false;
 
     /**
-     * 拼音/语音匹配（如 dm:en），空表示不启用
+     * 业务作用：选择 RediSearch 的语音匹配算法。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 算法标识（如 {@code dm:en}）；空字符串表示不启用。
      */
     String phonetic() default "";
 }

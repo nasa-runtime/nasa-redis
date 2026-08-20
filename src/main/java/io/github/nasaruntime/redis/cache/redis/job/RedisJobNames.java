@@ -9,6 +9,11 @@ final class RedisJobNames {
 
     private static final Pattern SAFE = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._:-]{0,127}");
 
+    /**
+     * 业务作用：阻止实例化，确保名称约束只通过统一静态门禁执行。
+     *
+     * <p>参数说明: 无。
+     */
     private RedisJobNames() {}
 
     /**

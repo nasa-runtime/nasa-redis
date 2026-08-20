@@ -22,6 +22,19 @@ public @interface RedisJob {
     String name();
 
     /**
+     * 业务作用：指定本任务登记到哪个 Redis 数据源，决定它的调度器、注册表、线程池与 Fanout 归属。
+     *
+     * <p>任务的本地唯一身份是 {@code (qualifier, namespace, name)}，不同数据源可以声明同名任务且互不影响。
+     * 填写的名字不存在对应 {@code RedisProxy} 时应用启动失败，不会静默回退到默认数据源——回退会让任务
+     * 写进错误的 Redis，产生一份无人调度或被重复调度的定义。
+     *
+     * <p>必须显式填写且不能为空。框架不提供默认 source，避免遗漏配置时把任务静默登记到 primary。
+     *
+     * @return 任务所属的语言无关 source id。
+     */
+    String qualifier();
+
+    /**
      * 业务作用：允许多个任务共享同一个普通派发能力池；留空时等于 {@link #name()}。
      *
      * @return Worker 能力名。
@@ -64,9 +77,9 @@ public @interface RedisJob {
     long fixedDelayMs() default 0L;
 
     /**
-     * 业务作用：定义同名任务多个运行实例之间的并发关系。
+     * 业务作用：定义同一任务身份的多个 Run 之间如何竞争集群执行权，默认排队且不并行启动 Handler。
      *
-     * @return 并发策略。
+     * @return 并发策略，默认 {@link RedisJobConcurrency#SERIAL_QUEUE}。
      */
     RedisJobConcurrency concurrency() default RedisJobConcurrency.SERIAL_QUEUE;
 
@@ -78,9 +91,9 @@ public @interface RedisJob {
     RedisJobMisfire misfire() default RedisJobMisfire.FIRE_ONCE_NOW;
 
     /**
-     * 业务作用：限制单次 Handler attempt 的运行时间。
+     * 业务作用：定义单次 Handler attempt 请求协作式取消的时间阈值，不强制中断业务线程。
      *
-     * @return 超时毫秒数。
+     * @return 超时毫秒数，实际阈值还受全局 max-run-duration-ms 约束。
      */
     long timeoutMs() default 120_000L;
 

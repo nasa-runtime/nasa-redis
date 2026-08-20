@@ -10,4 +10,4 @@ return redis.call('HMGET', KEYS[1],
         'workerName', 'contractRevision', 'schemaId', 'wireCodec', 'shardTotal',
         'deliveryCursor', 'fanoutReceiptTimeoutMs', 'fanoutReceiptMaxRetries',
         'failurePolicy', 'expireAt', 'cleanupCursor', 'reconciledAt', 'cancelReason',
-        'capabilityCursor', 'cancelCursor', 'createDeadlineAt')
+        'capabilityCursor', 'cancelCursor', 'createDeadlineAt', 'schedulerQualifier')

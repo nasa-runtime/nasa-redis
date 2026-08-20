@@ -42,7 +42,7 @@ for index = 1, count do
     elseif tonumber(expected) > now then
         code = 'NOT_DUE'
     elseif scheduleType ~= 'FIXED_DELAY' and mustFuture == '1' and tonumber(proposed) <= now then
-        -- 批次在 Java 侧计算后可能已跨过下一时刻，拒绝提交并让调用方基于新 Redis TIME 重算。
+        -- 批次在调用侧计算后可能已跨过下一时刻，拒绝提交并让调用方基于新 Redis TIME 重算。
         code = 'NEED_RECOMPUTE'
     elseif decision == 'SKIP' then
         redis.call('HSET', jobKey, 'lastFireAt', expected, 'nextFireAt', proposed)
@@ -53,7 +53,10 @@ for index = 1, count do
     else
         local workerName = redis.call('HGET', jobKey, 'workerName')
         local workerKey = redis.call('HGET', jobKey, 'workerKey')
+        -- Run 的来源声明只从定义继承, 使消费者可以独立核对消息来源而不依赖键前缀
+        local sourceId = redis.call('HGET', jobKey, 'schedulerQualifier') or ''
         redis.call('HSET', runKey,
+                'schedulerQualifier', sourceId,
                 'runId', runId, 'jobName', jobName, 'workerName', workerName, 'workerKey', workerKey,
                 'protocolVersion', protocol, 'scheduleShard', shard,
                 'definitionRevision', revision,
@@ -63,9 +66,11 @@ for index = 1, count do
                 'logicalFireAt', expected, 'triggeredAt', now,
                 'state', 'QUEUED', 'attempt', 0, 'dispatchAttempts', 0,
                 'nextVisibleAt', now + visibility, 'createdAt', now)
-        messageId = redis.call('XADD', dispatchKey, '*',
+        -- 信封同样携带来源声明: 跨语言消费者不必先读 Run 记录就能拒绝串源消息
+        messageId = redis.call('XADD', dispatchKey, 'MAXLEN', '~', 100000, '*',
                 'runId', runId, 'jobName', jobName, 'workerName', workerName,
-                'protocolVersion', protocol, 'definitionRevision', revision)
+                'protocolVersion', protocol, 'definitionRevision', revision,
+                'schedulerQualifier', sourceId)
         redis.call('ZADD', KEYS[2], now + visibility, runId)
         if scheduleType == 'FIXED_DELAY' then
             redis.call('ZREM', KEYS[1], jobName)

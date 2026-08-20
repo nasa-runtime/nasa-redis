@@ -185,11 +185,11 @@ public interface RediSearchOperations {
     long count(RsQuery query, Class<?> type);
 
     /**
-     * 业务作用：判断键是否存在。
+     * 业务作用：判断查询条件是否至少命中一个指定类型的索引文档。
      *
-     * @param query 见方法语义
-     * @param type 反序列化目标类型
-     * @return 命令的执行结果。
+     * @param query 查询条件
+     * @param type  实体类型
+     * @return 至少命中一个文档时返回 true。
      */
     boolean exists(RsQuery query, Class<?> type);
 

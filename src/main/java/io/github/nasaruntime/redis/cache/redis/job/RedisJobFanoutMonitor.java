@@ -1,25 +1,33 @@
 package io.github.nasaruntime.redis.cache.redis.job;
 
+import lombok.extern.slf4j.Slf4j;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 /**
  * 业务作用：推进 Fanout 首次投递、接收回执、启动可见性、能力恢复、重分配和有界清理。
  */
+@Slf4j
 final class RedisJobFanoutMonitor {
 
     private static final String INBOX_GROUP = "redis-job-fanout";
+    /* 外来根的告警节流窗口：来源不一致是持续状态，逐次扫描都告警只会淹没日志 */
+    private static final long FOREIGN_ROOT_WARN_INTERVAL_NANOS = 60_000_000_000L;
     private final RedisJobProperties properties;
     private final RedisJobKeyspace keys;
     private final RedisJobScriptExecutor scripts;
     private final RedisJobExecutorRegistry registry;
+    private final RedisJobMetrics metrics;
     private final String publishCommand;
     private final Map<String, RedisJobDefinition> workers = new ConcurrentHashMap<>();
     private final AtomicLongArray rootReceiptScanUpperBounds;
+    private final AtomicLong lastForeignRootWarnAtNanos = new AtomicLong();
     private volatile long workerReceiptScanUpperBoundMs;
 
     /**
@@ -29,13 +37,18 @@ final class RedisJobFanoutMonitor {
      * @param keys       键路由器
      * @param scripts    状态脚本
      * @param registry   执行器能力注册表
+     * @param metrics    基础指标容器
      */
     RedisJobFanoutMonitor(RedisJobProperties properties, RedisJobKeyspace keys,
-                          RedisJobScriptExecutor scripts, RedisJobExecutorRegistry registry) {
+                          RedisJobScriptExecutor scripts, RedisJobExecutorRegistry registry,
+                          RedisJobMetrics metrics) {
         this.properties = properties;
         this.keys = keys;
         this.scripts = scripts;
         this.registry = registry;
+        this.metrics = Objects.requireNonNull(metrics, "metrics must not be null");
+        // nanoTime 起点任意（可为负），显式回拨一个窗口保证首次发现外来根立即告警
+        this.lastForeignRootWarnAtNanos.set(System.nanoTime() - FOREIGN_ROOT_WARN_INTERVAL_NANOS);
         this.publishCommand = properties.getPubsubMode() == RedisJobPubSubMode.SHARDED ? "SPUBLISH" : "PUBLISH";
         this.rootReceiptScanUpperBounds = new AtomicLongArray(keys.fanoutBucketCount());
         for (int bucket = 0; bucket < keys.fanoutBucketCount(); bucket++) {
@@ -142,14 +155,20 @@ final class RedisJobFanoutMonitor {
             ShardData shard = readShard(id.fanoutId(), id.seq());
             if (root == null || shard == null) continue;
             RedisJobDefinition definition = workers.get(shard.workerName());
-            if (definition == null) continue;
+            boolean cancellationOnly = definition == null;
+            if (cancellationOnly && !"CANCELLING".equals(root.state())) continue;
+            // 删除会撤销本地 Worker 契约，但 CANCELLING 桶仍必须能撤销崩溃 owner。
+            // 专用模式只允许取消聚合，不借用其它配置建立新 attempt 或改变原重试合同。
+            int maxAttempts = cancellationOnly ? 0 : definition.maxAttempts();
+            long retryDelayMs = cancellationOnly ? 0L : definition.retryDelayMs();
+            String recoveryMode = cancellationOnly ? "FANOUT_CANCEL_ONLY" : "FANOUT";
             scripts.list(RedisJobScript.RECOVER_EXPIRED,
                     new String[]{keys.fanoutShard(id.fanoutId(), id.seq()), keys.fanoutLeases(id.fanoutId()),
                             keys.fanoutReady(id.fanoutId()), keys.fanoutRoot(id.fanoutId()),
                             keys.fanoutReceipts(id.fanoutId()), keys.fanoutRoots(id.fanoutId()),
                             keys.fanoutCompletion(id.fanoutId()), keys.fanoutGc(id.fanoutId())},
-                    member.member(), shard.workerName(), definition.maxAttempts(), definition.retryDelayMs(),
-                    properties.getFanoutRetentionMs(), "FANOUT", id.fanoutId(), id.seq(),
+                    member.member(), shard.workerName(), maxAttempts, retryDelayMs,
+                    properties.getFanoutRetentionMs(), recoveryMode, id.fanoutId(), id.seq(),
                     root.failurePolicy().name(), "");
         }
         return scan;
@@ -187,17 +206,6 @@ final class RedisJobFanoutMonitor {
             deliver(root, shards, true);
         }
         recoverCapabilities(root);
-    }
-
-    /**
-     * 业务作用：读取桶内根状态，供普通 waiting 索引执行跨 slot 对账。
-     *
-     * @param fanoutId Fanout 标识
-     * @return 根不存在时为空字符串。
-     */
-    String rootState(String fanoutId) {
-        RootData root = readRoot(fanoutId);
-        return root == null ? "" : root.state();
     }
 
     /**
@@ -288,13 +296,15 @@ final class RedisJobFanoutMonitor {
                     id.fanoutId(), id.seq(), shard.assignmentEpoch(), root.receiptMaxRetries(),
                     root.receiptTimeoutMs(), publishCommand, root.failurePolicy().name(),
                     properties.getMaxScanIntervalMs());
-            if ("RETRY_EXHAUSTED".equals(value(response, 0))) handleUnavailable(root, shard, "RECEIPT_TIMEOUT");
+            if ("RETRY_EXHAUSTED".equals(value(response, 0))) {
+                handleUnavailable(root, shard, "RECEIPT_TIMEOUT", "FAILURE");
+            }
         }
         return scan;
     }
 
     /**
-     * 业务作用：扫描已接收但尚未 start 的分片，重新唤醒稳定 inbox 或升级根失败策略。
+     * 业务作用：扫描已接收但尚未 start 的分片，向当前 assignment 重新发布通知，并区分容量路由与节点失联出口。
      *
      * @param bucket Fanout 桶
      * @param scan   本轮到期成员与下一最小 score
@@ -313,20 +323,106 @@ final class RedisJobFanoutMonitor {
                     id.fanoutId(), id.seq(), shard.assignmentEpoch(), properties.getReadyMaxWakeups(),
                     properties.getMinScanIntervalMs(), publishCommand, root.failurePolicy().name(),
                     properties.getMaxScanIntervalMs());
-            if ("WAKEUP_EXHAUSTED".equals(value(response, 0))) handleUnavailable(root, shard, "START_TIMEOUT");
+            String code = value(response, 0);
+            if ("CAPACITY_EXHAUSTED".equals(code)) {
+                handleCapacityPressure(root, shard);
+            } else if ("WAKEUP_EXHAUSTED".equals(code)) {
+                handleAcceptedStall(root, shard);
+            }
         }
         return scan;
     }
 
     /**
+     * 业务作用：裁决已确认接收但连续未启动的分片，只在目标离开兼容存活快照后消耗故障改派额度。
+     *
+     * <p>目标仍在兼容存活快照时，接收后的阻塞尚不能证明节点失联，应按本地执行槽或控制队列拥塞
+     * 使用独立容量预算。快照读取失败同样不能证明节点失联，因此保留 assignment 继续等待。
+     *
+     * @param root  Fanout 根数据
+     * @param shard 已确认接收但尚未启动的 shard
+     * @return 无返回值；当前 assignment 已变化时原子脚本拒绝迟到裁决。
+     */
+    private void handleAcceptedStall(RootData root, ShardData shard) {
+        CapacityTargets targets = capacityTargets(root, shard.targetNodeIdentity());
+        if (!targets.known()) {
+            continueCapacityWait(root, shard);
+            return;
+        }
+        if (!targets.currentAvailable()) {
+            handleUnavailable(root, shard, "START_TIMEOUT", "FAILURE");
+            return;
+        }
+        routeCapacityPressure(root, shard, targets);
+    }
+
+    /**
+     * 业务作用：目标节点在线但持续没有本地槽位时优先改派其它兼容节点，无候选则保留当前 assignment 等待。
+     *
+     * <p>容量压力证明节点仍在响应，不能写跨根失联证据；换节点配额耗尽也只停止改派，不把忙碌节点
+     * 降级为能力缺失。
+     *
+     * @param root  Fanout 根数据
+     * @param shard 当前等待容量的 shard
+     * @return 无返回值；状态已变化时原子脚本拒绝迟到裁决。
+     */
+    private void handleCapacityPressure(RootData root, ShardData shard) {
+        CapacityTargets targets = capacityTargets(root, shard.targetNodeIdentity());
+        if (!targets.known()) {
+            continueCapacityWait(root, shard);
+            return;
+        }
+        if (!targets.currentAvailable()) {
+            // 容量证据只在目标仍属于兼容存活快照时有效；节点离开后必须恢复真实失联出口。
+            handleUnavailable(root, shard, "CAPACITY_TARGET_LOST", "CAPACITY_TARGET_LOST");
+            return;
+        }
+        routeCapacityPressure(root, shard, targets);
+    }
+
+    /**
+     * 业务作用：对仍在兼容存活快照中的拥塞目标执行容量专用路由，无候选或预算受限时继续原地等待。
+     *
+     * @param root    Fanout 根数据
+     * @param shard   当前等待启动的 shard
+     * @param targets 已确认包含当前目标的容量路由快照
+     * @return 无返回值；容量换节点不改变故障 assignment 计数。
+     */
+    private void routeCapacityPressure(RootData root, ShardData shard, CapacityTargets targets) {
+        if (targets.alternate() == null) {
+            continueCapacityWait(root, shard);
+            return;
+        }
+        String code = reassign(root, shard, targets.alternate(), "CAPACITY");
+        if ("CAPACITY_ROUTE_EXHAUSTED".equals(code)) continueCapacityWait(root, shard);
+    }
+
+    /**
+     * 业务作用：没有其它兼容目标时为当前 assignment 原子开启下一段容量等待窗口。
+     *
+     * @param root  Fanout 根数据
+     * @param shard 当前等待容量的 shard
+     * @return 无返回值；当前目标或代次变化时不改写新 assignment。
+     */
+    private void continueCapacityWait(RootData root, ShardData shard) {
+        scripts.list(RedisJobScript.FANOUT_DEFER_READY,
+                new String[]{keys.fanoutShard(root.fanoutId(), shard.seq()),
+                        keys.fanoutReady(root.fanoutId()), keys.fanoutRoot(root.fanoutId())},
+                root.fanoutId(), shard.seq(), shard.targetNodeIdentity(), shard.assignmentEpoch(),
+                properties.getMinScanIntervalMs(), properties.getFanoutCapacityWaitMs(),
+                properties.getReadyMaxWakeups(), "REOPEN");
+    }
+
+    /**
      * 业务作用：对已经确认无法由当前 assignment 启动的分片执行根级确定性失败策略。
      *
-     * @param root   Fanout 根数据
-     * @param shard  当前 shard 数据
-     * @param reason 失败原因
-     *               返回：无返回值。
+     * @param root             Fanout 根数据
+     * @param shard            当前 shard 数据
+     * @param reason           失败原因
+     * @param reassignmentKind FAILURE 或容量目标离开存活快照后的 CAPACITY_TARGET_LOST
+     * @return 无返回值。
      */
-    private void handleUnavailable(RootData root, ShardData shard, String reason) {
+    private void handleUnavailable(RootData root, ShardData shard, String reason, String reassignmentKind) {
         if (root.failurePolicy() == RedisJobFanoutFailurePolicy.STRICT_SNAPSHOT) return;
         registry.recordFanoutEvidence(shard.targetNodeIdentity(), shard.targetStartupId(),
                 shard.targetHeartbeatRevision(), root.fanoutId());
@@ -334,7 +430,7 @@ final class RedisJobFanoutMonitor {
             aggregateSkipped(root, shard, reason);
             return;
         }
-        reassign(root, shard, compatibleTarget(root, shard.targetNodeIdentity()));
+        reassign(root, shard, compatibleTarget(root, shard.targetNodeIdentity()), reassignmentKind);
     }
 
     /**
@@ -343,9 +439,10 @@ final class RedisJobFanoutMonitor {
      * @param root   Fanout 根数据
      * @param shard  当前 shard 数据
      * @param target 新目标；没有兼容节点时为 null
-     *               返回：无返回值。
+     * @param kind   FAILURE、CAPACITY 或 CAPACITY_TARGET_LOST
+     * @return 脚本裁决码；成功时已经建立并投递新 assignment。
      */
-    private void reassign(RootData root, ShardData shard, RedisJobExecutorMember target) {
+    private String reassign(RootData root, ShardData shard, RedisJobExecutorMember target, String kind) {
         String targetNode = target == null ? "" : target.nodeIdentity();
         String targetStartup = target == null ? "" : target.startupId();
         int maxAssignments = properties.getFanoutMaxAssignments();
@@ -355,10 +452,34 @@ final class RedisJobFanoutMonitor {
                         keys.fanoutInbox(root.fanoutId(), shard.targetNodeIdentity())},
                 root.fanoutId(), shard.seq(), shard.targetNodeIdentity(), shard.assignmentEpoch(),
                 targetNode, targetStartup, target == null ? 0L : target.heartbeatRevision(),
-                INBOX_GROUP, maxAssignments);
-        if (!"OK".equals(value(response, 0)) || target == null) return;
+                INBOX_GROUP, maxAssignments, kind, properties.getFanoutCapacityWaitMs());
+        String code = value(response, 0);
+        if (!"OK".equals(code) || target == null) return code;
         ShardData reassigned = readShard(root.fanoutId(), shard.seq());
         if (reassigned != null) deliver(root, List.of(reassigned), false);
+        return code;
+    }
+
+    /**
+     * 业务作用：一次读取容量路由所需的当前目标存活性与其它兼容候选，避免把快照读取失败误判为节点下线。
+     *
+     * @param root        Fanout 根数据
+     * @param currentNode 当前目标稳定身份
+     * @return 已知快照及候选；读取失败时 known=false，调用方只续开等待窗口。
+     */
+    private CapacityTargets capacityTargets(RootData root, String currentNode) {
+        try {
+            List<RedisJobExecutorMember> members = registry.snapshot(
+                    root.workerName(), root.contractRevision(), root.schemaId(), root.codec()).members();
+            boolean currentAvailable = members.stream()
+                    .anyMatch(member -> member.nodeIdentity().equals(currentNode));
+            RedisJobExecutorMember alternate = members.stream()
+                    .filter(member -> !member.nodeIdentity().equals(currentNode))
+                    .findFirst().orElse(null);
+            return new CapacityTargets(true, currentAvailable, alternate);
+        } catch (RuntimeException ignored) {
+            return new CapacityTargets(false, false, null);
+        }
     }
 
     /**
@@ -379,7 +500,37 @@ final class RedisJobFanoutMonitor {
     }
 
     /**
-     * 业务作用：轮转复查 `AWAITING_CAPABILITY` 分片，使后来加入的兼容节点能够接管。
+     * 业务作用：为失去有效 assignment 的分片选择恢复目标，优先换节点，并在原节点产生新存活证据后允许回退。
+     *
+     * <p>同一稳定节点只有启动标识变化或心跳修订号前进时才可重试，避免根看门周期把持续不可用的目标
+     * 反复写成新 assignment；达到换目标上限后也只允许这种原节点恢复，不再轮转到新节点。
+     *
+     * @param root  Fanout 根数据
+     * @param shard 当前等待能力的 shard
+     * @return 可复验的新目标；没有新增能力或存活证据时为 null。
+     */
+    private RedisJobExecutorMember recoveredTarget(RootData root, ShardData shard) {
+        try {
+            List<RedisJobExecutorMember> members = registry.snapshot(
+                    root.workerName(), root.contractRevision(), root.schemaId(), root.codec()).members();
+            if (shard.assignmentCount() < properties.getFanoutMaxAssignments()) {
+                RedisJobExecutorMember alternate = members.stream()
+                        .filter(member -> !member.nodeIdentity().equals(shard.targetNodeIdentity()))
+                        .findFirst().orElse(null);
+                if (alternate != null) return alternate;
+            }
+            return members.stream()
+                    .filter(member -> member.nodeIdentity().equals(shard.targetNodeIdentity()))
+                    .filter(member -> !member.startupId().equals(shard.targetStartupId())
+                            || member.heartbeatRevision() > shard.targetHeartbeatRevision())
+                    .findFirst().orElse(null);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * 业务作用：轮转复查 `AWAITING_CAPABILITY` 分片，使新兼容节点或产生新存活证据的原节点能够接管。
      *
      * @param root Fanout 根数据
      *             返回：无返回值。
@@ -392,8 +543,8 @@ final class RedisJobFanoutMonitor {
             long seq = (start + offset) % root.shardTotal();
             ShardData shard = readShard(root.fanoutId(), seq);
             if (shard != null && shard.state() == RedisJobState.AWAITING_CAPABILITY) {
-                RedisJobExecutorMember target = compatibleTarget(root, shard.targetNodeIdentity());
-                if (target != null) reassign(root, shard, target);
+                RedisJobExecutorMember target = recoveredTarget(root, shard);
+                if (target != null) reassign(root, shard, target, "FAILURE");
             }
         }
         int next = (start + count) % root.shardTotal();
@@ -553,6 +704,20 @@ final class RedisJobFanoutMonitor {
         List<Object> values = scripts.list(RedisJobScript.READ_FANOUT_ROOT,
                 new String[]{keys.fanoutRoot(fanoutId)});
         if (values.isEmpty()) return null;
+        // 根记录声明的来源与本 Scheduler 不一致说明它被写进了错误的键前缀。仍按原状态机驱动到
+        // 根等待超时收敛并清理——分片在 accept/start 门禁上无法执行，这条路径没有资金副作用；
+        // 跳过驱动反而会留下一个永不收敛、永占 roots 索引的外来记录。这里只计数并节流告警。
+        String rootSource = value(values, 22);
+        if (!rootSource.isEmpty() && !keys.qualifier().equals(rootSource)) {
+            metrics.incrementClassified("redis_job_fanout_root", "SOURCE_MISMATCH", "");
+            long now = System.nanoTime();
+            long last = lastForeignRootWarnAtNanos.get();
+            if (now - last >= FOREIGN_ROOT_WARN_INTERVAL_NANOS
+                    && lastForeignRootWarnAtNanos.compareAndSet(last, now)) {
+                log.warn("RedisJob fanout root declares a different source: fanoutId={}, source={}, local={}",
+                        fanoutId, rootSource, keys.qualifier());
+            }
+        }
         return new RootData(value(values, 0), value(values, 1), value(values, 2), integer(values, 3),
                 value(values, 4), integer(values, 5), value(values, 6), number(values, 7), value(values, 8),
                 codec(values, 9), integer(values, 10), integer(values, 11), number(values, 12),
@@ -657,6 +822,12 @@ final class RedisJobFanoutMonitor {
                              String schemaId, RedisJobWireCodec codec, String targetNodeIdentity,
                              String targetStartupId, long assignmentEpoch, int assignmentCount,
                              RedisJobState state, String inboxMessageId, long targetHeartbeatRevision) {
+    }
+
+    /**
+     * 业务作用：承载容量路由一次快照中的当前目标存活性与替代目标。
+     */
+    private record CapacityTargets(boolean known, boolean currentAvailable, RedisJobExecutorMember alternate) {
     }
 
     /**

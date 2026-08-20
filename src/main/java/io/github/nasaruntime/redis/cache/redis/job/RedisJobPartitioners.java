@@ -9,6 +9,11 @@ import java.util.List;
  */
 public final class RedisJobPartitioners {
 
+    /**
+     * 业务作用：阻止实例化，使通用分片策略只通过静态工厂公开。
+     *
+     * <p>参数说明: 无。
+     */
     private RedisJobPartitioners() {}
 
     /**

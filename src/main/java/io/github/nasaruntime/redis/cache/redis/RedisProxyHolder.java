@@ -33,22 +33,21 @@ public abstract class RedisProxyHolder {
     private static final String KEY_PASSTHROUGH = "passthrough";
 
     /**
-     * 业务作用：读取字符串值。
-     * 键不存在时返回空。
+     * 业务作用：读取当前线程绑定的 Redis 上下文 Map，供同一业务调用链传递连接与消息附加信息。
      *
      * <p>参数说明: 无。
      *
-     * @return 命令的执行结果。
+     * @return 当前线程的上下文 Map；尚未绑定时返回 null。
      */
     public static <K, V> Map<K, V> get() {
         return AnyHolder.get(KEY);
     }
 
     /**
-     * 业务作用：写入字符串值。
+     * 业务作用：向当前线程的 Redis 上下文写入一个键值，供同一调用链后续阶段读取。
      *
-     * @param key 缓存键
-     * @param o 见方法语义
+     * @param key 上下文键
+     * @param o   上下文值
      * 返回: 无返回值。
      */
     public static void set(Object key, Object o) {
@@ -56,11 +55,10 @@ public abstract class RedisProxyHolder {
     }
 
     /**
-     * 业务作用：读取字符串值。
-     * 键不存在时返回空。
+     * 业务作用：从当前线程的 Redis 上下文读取指定键。
      *
-     * @param key 缓存键
-     * @return 命令的执行结果。
+     * @param key 上下文键
+     * @return 对应上下文值；上下文或键不存在时返回 null。
      */
     public static <T> T get(Object key) {
         return AnyHolder.getAsMap(KEY, key);

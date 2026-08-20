@@ -45,7 +45,7 @@
     {
       "name": "nasa.redis.job.enabled",
       "type": "java.lang.Boolean",
-      "description": "是否装配并启动 RedisJobScheduler。",
+      "description": "是否允许 @EnableRedisJob 建立 RedisJob 管理基础设施；具体 Scheduler 仍按显式 source 惰性创建。",
       "defaultValue": false
     },
     {
@@ -55,10 +55,9 @@
       "defaultValue": "default"
     },
     {
-      "name": "nasa.redis.job.qualifier",
-      "type": "java.lang.String",
-      "description": "RedisJob 使用的 RedisProxy 实例名。",
-      "defaultValue": "primary"
+      "name": "nasa.redis.job.sources",
+      "type": "java.util.Map<java.lang.String,io.github.nasaruntime.redis.cache.redis.job.RedisJobProperties>",
+      "description": "按语言无关 source id 覆盖单个 RedisJob 数据源参数；未显式出现的字段继承 nasa.redis.job 根级值。"
     },
     {
       "name": "nasa.redis.job.protocol-version",
@@ -105,7 +104,7 @@
     {
       "name": "nasa.redis.job.handler-capacity",
       "type": "java.lang.Integer",
-      "description": "当前进程同时运行的 Handler 上限，不得大于 executor-capacity。",
+      "description": "普通任务按 Worker 限流；全部 Fanout Worker 共享独立的 Fanout 通道总上限；不得大于 executor-capacity。",
       "defaultValue": 8
     },
     {
@@ -171,14 +170,20 @@
     {
       "name": "nasa.redis.job.fanout-max-assignments",
       "type": "java.lang.Integer",
-      "description": "单个 Fanout shard 允许的目标 assignment 代次上限。",
+      "description": "单个 Fanout shard 的真实故障 assignment 上限；容量路由另行限频，并以该值减一作为单轮突发上限。",
       "defaultValue": 5
     },
     {
       "name": "nasa.redis.job.ready-max-wakeups",
       "type": "java.lang.Integer",
-      "description": "Fanout shard 已确认接收但未 start 时的低延迟唤醒上限。",
+      "description": "Fanout shard 已确认接收但未 start 时的普通唤醒上限；耗尽后先复验目标存活性，再分流到容量等待或故障策略。",
       "defaultValue": 3
+    },
+    {
+      "name": "nasa.redis.job.fanout-capacity-wait-ms",
+      "type": "java.lang.Long",
+      "description": "Fanout shard 在当前目标连续等待本地执行容量的窗口；超窗后只在存在其它兼容节点时尝试有界容量路由。",
+      "defaultValue": 10000
     },
     {
       "name": "nasa.redis.job.node-unready-evidence-count",
@@ -243,7 +248,7 @@
     {
       "name": "nasa.redis.job.max-dispatch-attempts",
       "type": "java.lang.Integer",
-      "description": "可见性消息的最大重建次数，防止无法派发的 Run 无限循环。",
+      "description": "连续重建派发消息的阈值；超限后保留低频重建入口，成功取得执行权时归零。",
       "defaultValue": 20
     },
     {
@@ -267,7 +272,7 @@
     {
       "name": "nasa.redis.job.max-run-duration-ms",
       "type": "java.lang.Long",
-      "description": "全局 Handler attempt 超时上限，同时用作停机等待本地 Handler 的边界。",
+      "description": "Handler 协作式取消、重试退避与停机等待的全局上界；不会强制中断业务线程。",
       "defaultValue": 3600000
     },
     {
@@ -321,7 +326,7 @@
     {
       "name": "nasa.redis.job.max-catch-up-runs",
       "type": "java.lang.Integer",
-      "description": "CATCH_UP 单轮保留的最近补偿 Run 上限。",
+      "description": "CATCH_UP 在一次闲置恢复中保留的最近补偿 Run 总量上限。",
       "defaultValue": 50
     },
     {

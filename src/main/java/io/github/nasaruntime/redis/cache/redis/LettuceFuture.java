@@ -19,8 +19,7 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
- * Nasa
- * pipeline 命令的"业务等候 future" — 把 lettuce 返回的 RedisFuture 投递给业务线程做同步等待.
+ * Pipeline 命令的业务等待句柄，把 Lettuce 返回的 RedisFuture 交给业务线程同步等待。
  *
  * <h2>用法</h2>
  * <pre>
@@ -30,8 +29,7 @@ import java.util.function.Function;
  * </pre>
  *
  * <h2>池化设计</h2>
- * 之前每次 sync 调用 {@code new LettuceFuture<>()} + {@code new CountDownLatch(1)} + {@code new CompletableFuture}
- * 内部 stack, 是撮合热路径上最大的 GC 来源. 改造为:
+ * 实例由对象池管理，使用单等待者信号状态承接命令结果，避免为每条同步命令建立多层 Future 与等待对象：
  * <ul>
  *   <li>{@link #of()} 从 {@link #POOL} 借实例 (空池时 new)</li>
  *   <li>complete/completeExceptionally 由信号线程 dispatch 阶段调一次, 唤醒 waiter</li>
@@ -39,14 +37,13 @@ import java.util.function.Function;
  * </ul>
  *
  * <h2>实现选择</h2>
- * 不再 extends {@code CompletableFuture} — 那个类的内部 result/waiter chain 没法 reset 干净
- * (需要 {@code --add-opens base module/JVM.util.concurrent} + native-image reflect-config). 自维护
- * {@code result/ex/done + LockSupport.park} 单 waiter 等待, 重置零反射, 也对 native-image 友好.
+ * 本类自行维护 {@code result/ex/done + LockSupport.park} 单等待者状态，使实例能够在不反射访问 JDK 内部字段的
+ * 前提下安全重置并归池，也不要求额外开放 JDK 模块。
  *
- * <h2>API 兼容</h2>
- * 仍 {@code implements RedisFuture<V>} 保接口签名, 但 {@link CompletionStage} 链式方法
- * (thenApply/thenCompose/...) 全部抛 {@link UnsupportedOperationException} — 现网 grep 验证无任何 caller
- * 在 LettuceFuture 实例上调链式 API.
+ * <h2>API 边界</h2>
+ * 本类实现 {@code RedisFuture<V>} 以承接 Pipeline 结果，但不提供 {@link CompletionStage} 链式编排；
+ * thenApply、thenCompose 等链式方法统一抛出 {@link UnsupportedOperationException}。调用方必须通过
+ * {@link #getFinally()} 等同步取值入口结束生命周期。
  *
  * <h2>recycle 约束</h2>
  * 业务方调 {@link #getFinally()} 后 lf 已归池, 不能再持有 lf 引用 (会变 dangling, 下次 borrow 后状态错乱).
@@ -251,8 +248,7 @@ public final class LettuceFuture<V> implements RedisFuture<V>, ObjectPool.Recycl
     }
 
     /**
-     * 业务作用：读取字符串值。
-     * 键不存在时返回空。
+     * 业务作用：阻塞等待 Pipeline 命令完成并取得结果；异常完成时以 ExecutionException 暴露原因。
      * <p>
      * 本方法把命令排入批次并标记为需要结果：批次统一发出后会等待本命令的响应，
      * 因此执行失败可被调用方感知。代价是批次的整体耗时受最慢的一条同步命令约束。
@@ -261,7 +257,7 @@ public final class LettuceFuture<V> implements RedisFuture<V>, ObjectPool.Recycl
      *
      * <p>参数说明: 无。
      *
-     * @return 命令的执行结果。
+     * @return 命令完成值；服务端合法返回空值时为 null。
      */
     @Override
     public V get() throws InterruptedException, ExecutionException {
@@ -273,8 +269,7 @@ public final class LettuceFuture<V> implements RedisFuture<V>, ObjectPool.Recycl
     }
 
     /**
-     * 业务作用：读取字符串值。
-     * 键不存在时返回空。
+     * 业务作用：在给定时限内等待 Pipeline 命令完成并取得结果，超时后保留未完成状态供调用方处置。
      * <p>
      * 本方法把命令排入批次并标记为需要结果：批次统一发出后会等待本命令的响应，
      * 因此执行失败可被调用方感知。代价是批次的整体耗时受最慢的一条同步命令约束。
@@ -283,7 +278,7 @@ public final class LettuceFuture<V> implements RedisFuture<V>, ObjectPool.Recycl
      *
      * @param timeout 超时时长
      * @param unit 时长单位
-     * @return 命令的执行结果。
+     * @return 时限内取得的命令完成值；服务端合法返回空值时为 null。
      */
     @Override
     public V get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
@@ -383,7 +378,7 @@ public final class LettuceFuture<V> implements RedisFuture<V>, ObjectPool.Recycl
         return o instanceof byte[] bs ? (T) serializer.deserialize(bs) : (T) o;
     }
 
-    // ==================== CompletionStage 桩 — 现网无 caller, 全部抛 UOE ====================
+    // CompletionStage 链式编排不属于池化等待句柄合同，所有入口统一拒绝。
 
     /**
      * 业务作用：产出统一的不支持异常，供各个链式接口的桩方法抛出。

@@ -622,7 +622,7 @@ public final class Criteria implements ObjectPool.Recycler<Criteria> {
      *   <li>{@link Enum}: 调 {@link io.github.nasaruntime.redis.cache.redis.search.meta.MetaResolver#numericJsonValueAccessor} 取 enum 上数字型 {@code @JsonValue}
      *       (方法或字段, 典型 {@code SerialEnum.serial()} 返数字) 的值。<b>必须有数字型 @JsonValue</b> ——
      *       没有是配置错误 (parseFieldAnnotation 处理 @NumericField/@TagField-auto 时已启动期 fail-fast),
-     *       此处 acc==null 直接抛 {@code RediSearchException}, <b>不再 fallback {@link Enum#ordinal()}</b> (静默 ordinal 会查错值)。
+     *       此处 acc==null 直接抛 {@code RediSearchException}；禁止回退到 {@link Enum#ordinal()}，否则查询值会与持久值分裂。
      *       对应 schema 推导端把 "enum + 数字型 @JsonValue + @TagField" 自动转 NUMERIC: 索引存数字, 查询也按数字 range 写,
      *       业务侧仍能用 {@code .is(Direction.BUY)} 自然语法, 框架内部按 @JsonValue 取数字。</li>
      * </ul>
@@ -636,7 +636,7 @@ public final class Criteria implements ObjectPool.Recycler<Criteria> {
             // v.getClass() 是匿名子类 isEnum() == false → 拿不到 @JsonValue, 跟 prefix 占位符 / Jackson 序列化脱节
             JsonValueAccessor acc = MetaResolver.numericJsonValueAccessor(e.getDeclaringClass());
             // NUMERIC enum 字段启动期已要求有数字型 @JsonValue (parseFieldAnnotation fail-fast), 此处不该为 null。
-            // 不再 fallback ordinal: 没有数字 @JsonValue 却走到这里说明配置非法, 静默用 ordinal 会查错值 → 直接抛。
+            // 缺少数字型 @JsonValue 表示配置合同不成立；回退到 ordinal 会查询错误持久值，必须直接拒绝。
             if (acc == null) {
                 throw new RediSearchException("NUMERIC query on enum " + e.getDeclaringClass().getName()
                         + " requires a numeric @JsonValue (启动期应已 fail-fast)");

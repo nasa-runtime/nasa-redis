@@ -1,6 +1,5 @@
 package io.github.nasaruntime.redis.cache.redis.job;
 
-import io.github.nasaruntime.redis.cache.redis.RedisProxy;
 import lombok.Getter;
 import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -23,11 +22,6 @@ public class RedisJobProperties {
      * 已写入数据后改名等同于启用一套全新任务集，旧数据不再被任何扫描器读取。
      */
     private String namespace = "default";
-
-    /**
-     * 选择使用哪个 RedisProxy 实例；多数据源部署时按实例名取用。
-     */
-    private String qualifier = RedisProxy.PRIMARY;
 
     /**
      * 派发消息携带的框架协议代次。执行器读到高于自身支持范围的消息时拒绝启动 Handler 并保留该 Run
@@ -72,8 +66,8 @@ public class RedisJobProperties {
     private long fanoutMaxWaitMs = 1_800_000L;
 
     /**
-     * 单个分片最多更换目标的次数。契约声明有误或能力异常时，
-     * 这个上限阻止分片在节点之间无限轮转，超限后进入等待并告警。
+     * 单个分片因真实故障可以建立的 assignment 上限。容量路由不消耗这份故障额度，
+     * 但以该值减一作为单轮容量迁移突发上限，并在静默窗口后恢复有限探测。
      */
     private int fanoutMaxAssignments = 5;
 
@@ -84,9 +78,17 @@ public class RedisJobProperties {
     private int fanoutDeliveryBatchSize = 64;
 
     /**
-     * 已确认接收但迟迟没有启动时的唤醒次数上限，超过后升级为带 epoch 的重分配。
+     * 已确认接收但迟迟没有启动时的普通唤醒次数上限。达到上限后先复验当前目标是否仍在兼容存活快照：
+     * 仍存活时进入独立容量窗口，快照不可读时继续等待，只有确认目标离开才进入失败策略。
      */
     private int readyMaxWakeups = 3;
+
+    /**
+     * Fanout shard 在当前目标节点连续等待本地执行容量的时间窗口。
+     * 窗口内保留当前 assignment；超过后只在存在其它兼容节点时尝试有界容量路由，
+     * 没有候选、能力快照暂时不可读或路由处于静默期时继续原地等待。
+     */
+    private long fanoutCapacityWaitMs = 10_000L;
 
     /**
      * 把一个节点整体降级为 FANOUT_UNREADY 所需的失联证据条数，且证据必须来自不同的 Fanout。
@@ -152,8 +154,8 @@ public class RedisJobProperties {
     private long visibilityTimeoutMs = 60_000L;
 
     /**
-     * 一个 Run 最多被重新派发的次数。超过后置为 NO_CAPABLE_EXECUTOR 长退避并告警，
-     * 防止没有任何节点具备该 Worker 能力时消息被无限重投。
+     * 一个 Run 连续重建派发消息的次数阈值。超过后置为 NO_CAPABLE_EXECUTOR，按最长扫描间隔降频并告警，
+     * 但保留低频重建入口；兼容执行器成功取得执行权时计数归零。
      */
     private int maxDispatchAttempts = 20;
 
@@ -163,7 +165,8 @@ public class RedisJobProperties {
     private int executorCapacity = 128;
 
     /**
-     * 单个 Worker 在本进程内同时运行的 Handler 上限，不得大于 {@code executorCapacity}。
+     * 普通任务中单个 Worker 在本进程内同时运行的 Handler 上限；Fanout 通道把同一个值作为
+     * 全部 Fanout Worker 共享的独立总上限。该值不得大于 {@code executorCapacity}。
      */
     private int handlerCapacity = 8;
 
@@ -190,8 +193,8 @@ public class RedisJobProperties {
     private long clockDriftAllowanceMs = 1_000L;
 
     /**
-     * 单个 attempt 的硬上限。到点后无论 Handler 是否响应中断都停止续期并进入本地自我隔离，
-     * 避免卡在不可中断 IO 上的 Handler 永久占用串行单活槽。
+     * Handler 协作式取消阈值、重试退避和停机等待的全局上界。
+     * 到点后请求取消但不强制中断业务线程；Handler 必须在安全点检查信号并主动返回。
      */
     private long maxRunDurationMs = 3_600_000L;
 
@@ -305,7 +308,8 @@ public class RedisJobProperties {
                 || maxParameterBytes > fanoutMaxTotalParameterBytes) {
             throw new IllegalArgumentException("fanout parameter byte limits are invalid");
         }
-        if (readyMaxWakeups < 0 || nodeUnreadyEvidenceCount <= 1 || fanoutCleanupBatchSize <= 0) {
+        if (readyMaxWakeups < 0 || fanoutCapacityWaitMs <= 0
+                || nodeUnreadyEvidenceCount <= 1 || fanoutCleanupBatchSize <= 0) {
             throw new IllegalArgumentException("fanout retry and cleanup limits are invalid");
         }
         if (pubsubMode == null) throw new IllegalArgumentException("pubsubMode must not be null");

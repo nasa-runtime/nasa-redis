@@ -72,11 +72,10 @@ public final class JsonValueAccessor {
     }
 
     /**
-     * 业务作用：读取字符串值。
-     * 键不存在时返回空。
+     * 业务作用：通过已解析的 {@code @JsonValue} 方法或字段读取枚举的持久化表示。
      *
-     * @param enumConstant 见方法语义
-     * @return 命令的执行结果。
+     * @param enumConstant 枚举常量
+     * @return {@code @JsonValue} 暴露的值；访问失败时抛出 RediSearchException。
      */
     public Object get(Object enumConstant) {
         try {

@@ -428,7 +428,7 @@ public class JsonArraySupport implements JsonArrayOperations {
      * 业务作用：把 Lua 脚本载入服务端缓存并取回其摘要。
      *
      * @param script Lua 脚本
-     * @return 命令的执行结果。
+     * @return Redis 为脚本内容生成的 SHA1 摘要；服务端未返回摘要时抛出 RediSearchException。
      */
     private String scriptLoad(String script) {
         List<Object> r = executor.execute("SCRIPT", "LOAD", script);
@@ -548,9 +548,9 @@ public class JsonArraySupport implements JsonArrayOperations {
      * 业务作用：删除 JSON 文档中的某个路径。
      * 路径不存在时不报错。
      *
-     * @param key 缓存键
-     * @param filter 见方法语义
-     * @return 命令的执行结果。
+     * @param key    JSON 文档键
+     * @param filter JSONPath 删除路径或过滤表达式
+     * @return 实际删除的 JSON 节点数；键或路径不存在时返回 0。
      */
     private long jsonDel(String key, String filter) {
         List<Object> raw = executor.execute("JSON.DEL", key, filter);

@@ -21,8 +21,10 @@ for index = 1, count do
     local inboxMessageId = redis.call('HGET', shardKey, 'inboxMessageId')
     if shardState == 'AWAITING_RECEIPT' and epoch == ARGV[cursor + 1]
             and (not inboxMessageId or inboxMessageId == '') then
+        -- inbox 信封携带 shard 的来源声明, 与 Dispatch 信封同构; 业务参数仍以持久 shard 为准
         local messageId = redis.call('XADD', inboxKey, '*', 'fanoutId', ARGV[2],
-                'seq', ARGV[cursor], 'assignmentEpoch', epoch, 'shardRunId', ARGV[cursor + 2])
+                'seq', ARGV[cursor], 'assignmentEpoch', epoch, 'shardRunId', ARGV[cursor + 2],
+                'schedulerQualifier', redis.call('HGET', shardKey, 'schedulerQualifier') or '')
         local deadline = now + tonumber(ARGV[cursor + 3])
         redis.call('HSET', shardKey, 'inboxMessageId', messageId, 'receiptDeadlineAt', deadline)
         redis.call('ZADD', KEYS[2], deadline, ARGV[2] .. ':' .. ARGV[cursor])

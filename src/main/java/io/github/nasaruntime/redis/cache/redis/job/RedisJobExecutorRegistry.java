@@ -83,10 +83,14 @@ final class RedisJobExecutorRegistry {
                 executorId, nodeIdentity, startupId, properties.getApplicationName(), "java", state,
                 workerName, definition.contractRevision(), definition.schemaId(), codecs,
                 implementationDigest, properties.getExecutorCapacity(), properties.getExecutorExpireMs(),
-                capabilityDigest, capabilityDigest);
+                capabilityDigest, capabilityDigest,
+                // Fanout 能力索引只由真正具备 Fanout Handler 的定义持有：普通定义复用 workerName 时
+                // 若也写入能力，快照会冻结一个无 Handler 的目标，删除 Worker 时也无法按引用撤权
+                definition.trigger() == RedisJobTrigger.FANOUT_ONLY ? "1" : "0");
         String code = value(result, 0);
         if (!"OK".equals(code)) throw new IllegalStateException("RedisJob capability rejected: " + code);
-        workers.add(workerName);
+        // workers 驱动心跳续期与全量注销的能力键组，普通定义不持有能力、不得进入
+        if (definition.trigger() == RedisJobTrigger.FANOUT_ONLY) workers.add(workerName);
     }
 
     /**
@@ -139,9 +143,17 @@ final class RedisJobExecutorRegistry {
                     value(result, index + 5), Long.parseLong(value(result, index + 6))));
         }
         members.sort(Comparator.comparing(RedisJobExecutorMember::nodeIdentity));
-        String canonical = members.stream().map(member -> member.nodeIdentity() + ':' + member.executorId()
-                + ':' + member.heartbeatRevision()).collect(Collectors.joining("|"));
-        String digest = RedisJobIdentifiers.workerKey(workerName + ':' + selectedAt + ':' + canonical);
+        // qualifier 与 namespace 必须参与快照摘要: 跨系统按 snapshotDigest 对账时,
+        // 两个数据源在同一毫秒选出同名、同身份的成员会算出相同标识, 无法区分是哪一批节点。
+        // 每个字段独立参与摘要而不是先拼成字符串, 否则含冒号的 namespace 或成员身份会产生歧义。
+        List<String> memberFields = new ArrayList<>(members.size() * 3);
+        for (RedisJobExecutorMember member : members) {
+            memberFields.add(member.nodeIdentity());
+            memberFields.add(member.executorId());
+            memberFields.add(Long.toString(member.heartbeatRevision()));
+        }
+        String digest = RedisJobIdentifiers.snapshotDigest(keys.qualifier(), keys.namespace(),
+                workerName, selectedAt, memberFields);
         String snapshotId = digest.substring(0, 32);
         return new RedisJobClusterSnapshot(snapshotId, workerName, selectedAt, members, digest);
     }
@@ -230,6 +242,23 @@ final class RedisJobExecutorRegistry {
         if (!"OK".equals(code) && !"NOT_FOUND".equals(code)) {
             throw new IllegalStateException("RedisJob executor unregister rejected: " + code);
         }
+    }
+
+    /**
+     * 业务作用：撤销本执行器在单个 Worker 能力下的登记，使删除该 Worker 后的新 Fanout 快照不再选中本节点。
+     *
+     * <p>心跳按本地 worker 集合续期能力成员，只删 Redis 不删本地集合会在下一次心跳被重新写回；
+     * 因此先移出本地集合再撤销 Redis 索引。能力可能被多个本地定义共享，是否可撤由调用方按引用判定。
+     *
+     * @param workerName Worker 能力名
+     *
+     * <p>返回：无返回值。
+     */
+    synchronized void removeCapability(String workerName) {
+        if (!workers.remove(workerName)) return;
+        scripts.list(RedisJobScript.EXECUTOR_REMOVE_CAPABILITY,
+                new String[]{keys.capability(workerName), keys.capabilityMeta(workerName), keys.executor(executorId)},
+                executorId, workerName);
     }
 
     /**

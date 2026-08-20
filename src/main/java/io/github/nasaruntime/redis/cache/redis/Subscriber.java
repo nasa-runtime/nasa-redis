@@ -6,8 +6,8 @@ import static java.lang.annotation.ElementType.METHOD;
 import static java.lang.annotation.RetentionPolicy.RUNTIME;
 
 /**
- * Nasa
- * redis订阅注解，反序列化依赖RedisTemplate配置
+ * 业务作用：声明方法需要订阅的 Redis Pub/Sub 频道及其数据源，消息反序列化沿用对应 RedisTemplate 配置。
+ *
  * @see io.github.nasaruntime.redis.cache.redis.Subscribe
  */
 @Target(METHOD)
@@ -25,7 +25,11 @@ public @interface Subscriber {
     String[] value();
 
     /**
-     * 服务于哪个redis server
+     * 业务作用：限定订阅使用的 Redis 数据源，避免同一频道在无关数据源上重复注册。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return RedisProxy qualifier 列表；空数组表示采用框架约定的默认选择规则。
      */
     String[] qualifier() default {};
 
