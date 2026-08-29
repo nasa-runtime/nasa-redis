@@ -25,6 +25,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.ApplicationContextAware;
+import org.springframework.context.ApplicationListener;
+import org.springframework.context.SmartLifecycle;
+import org.springframework.context.event.ContextClosedEvent;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.data.domain.Range.Bound;
@@ -59,7 +64,9 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
@@ -74,11 +81,14 @@ import java.util.function.Function;
 @Slf4j
 @Order(Ordered.HIGHEST_PRECEDENCE + 5)
 @ConfigurationProperties(prefix = "nasa.redis-proxy")
-public class RedisProxy extends OPS implements Initialization, DisposableBean {
+public class RedisProxy extends OPS implements Initialization, DisposableBean, SmartLifecycle, ApplicationContextAware,
+        ApplicationListener<ContextClosedEvent> {
 
     static final Map<String, RedisProxy> CACHE = new ConcurrentHashMap<>();
     public static final String PRIMARY = "primary";
     private static final Graceful.Shutdown SHUTDOWN_ALL = RedisProxy::shutdownAll;
+    private volatile boolean lifecycleRunning;
+    private volatile ApplicationContext owningApplicationContext;
 
     static {
         Graceful.registry(Integer.MAX_VALUE - 5000, SHUTDOWN_ALL);
@@ -295,7 +305,21 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
      */
     @Override
     public void destroy() {
+        lifecycleRunning = false;
         if (!destroyed.compareAndSet(false, true)) return;
+
+        // 分区消费者依赖本代理的连接、订阅与业务执行器，必须先停止拉取并排干在途批次，
+        // 再撤销代理基础设施；顺序反转会让关闭中的消费者继续向已停线程池投递。
+        try {
+            RedisPartition.destroy(this);
+        } catch (Throwable error) {
+            log.warn("[{}] partition shutdown failed", this.qualifier, error);
+        }
+        try {
+            LettuceDistributedLock.destroy(this);
+        } catch (Throwable error) {
+            log.warn("[{}] distributed lock registration removal failed", this.qualifier, error);
+        }
 
         // 先关闭会产生 Redis 外部副作用的周期入口，避免排干期间又有新批次进入。
         try {
@@ -313,11 +337,40 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
             log.warn("[{}] pipeline drain during shutdown failed", this.qualifier, error);
         }
 
+        RedisMessageListenerContainer pubSubContainer;
+        boolean stopPubSubContainer;
+        listenerContainerLock.lock();
+        try {
+            // destroyed 已禁止新订阅；取得注册门禁后，迟到的订阅已完成本地坐标发布。
+            // 此处只撤销本地投递权威并提交异步操作，不在门禁内访问外部容器。
+            for (String channel : new ArrayList<>(topicMap.keySet())) {
+                unsubscribe(false, channel);
+            }
+            pubSubContainer = redisMessageListenerContainer;
+            stopPubSubContainer = ownsRedisMessageListenerContainer;
+        } finally {
+            listenerContainerLock.unlock();
+        }
+        // 外部容器的单次撤销即使停顿，也不能无限推迟整个代理停机。
+        awaitPubSubListenerCleanup(PUBSUB_SHUTDOWN_DRAIN_MILLIS);
+        // 关闭预算耗尽后切断退避任务的自我续接；已经进入第三方容器的调用可以自然返回，
+        // 迟到 add 只允许一次精确终态 remove，不能恢复运行期调度链。
+        closePubSubListenerCleanup();
+        PubSubListenerCleanupMetrics cleanupMetrics = pubSubListenerCleanupMetrics();
+        if (cleanupMetrics.pending() > 0 || cleanupMetrics.inFlight() > 0) {
+            log.warn("[{}] pub/sub listener cleanup remains pending count={} oldestMs={} failures={} "
+                            + "inFlight={} oldestInFlightMs={} scheduledRetries={} removeReuses={} unknown={}",
+                    this.qualifier, cleanupMetrics.pending(), cleanupMetrics.oldestPendingMillis(),
+                    cleanupMetrics.failures(), cleanupMetrics.inFlight(), cleanupMetrics.oldestInFlightMillis(),
+                    cleanupMetrics.scheduledRetries(), cleanupMetrics.removalInFlightReuses(),
+                    cleanupMetrics.unknownDispatchers());
+        }
+
         // 只关闭本代理创建的共享容器；外部注入的容器仍由所属 Spring 上下文管理。
-        if (ownsRedisMessageListenerContainer && redisMessageListenerContainer != null
-                && redisMessageListenerContainer.isRunning()) {
+        // stop 是容器整体生命周期调用，不持有 listenerContainerLock，避免阻塞容器状态查询。
+        if (stopPubSubContainer && pubSubContainer != null && pubSubContainer.isRunning()) {
             try {
-                redisMessageListenerContainer.stop();
+                pubSubContainer.stop();
             } catch (Throwable error) {
                 log.warn("[{}] pub/sub container stop failed", this.qualifier, error);
             }
@@ -357,6 +410,95 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
                 log.warn("[{}] RediSearch registration removal failed", this.qualifier, error);
             }
         }
+    }
+
+    /**
+     * 业务作用：标记命令代理已经随 Spring 生命周期进入运行态。
+     * 真实基础设施仍由 Initialization 阶段准备，本入口只服务于有序停机编排。
+     *
+     * <p>参数说明: 无。
+     *
+     * 返回: 无返回值。
+     */
+    @Override
+    public void start() {
+        lifecycleRunning = true;
+    }
+
+    /**
+     * 业务作用：由 Spring 生命周期处理器触发有序停机，复用幂等销毁入口关闭分区消费与连接侧资源。
+     *
+     * <p>参数说明: 无。
+     *
+     * 返回: 无返回值。
+     */
+    @Override
+    public void stop() {
+        destroy();
+    }
+
+    /**
+     * 业务作用：完成 Spring 异步停机协议，在当前代理资源全部收口后通知生命周期处理器继续。
+     *
+     * @param callback 资源停止后的完成回调
+     * 返回: 无返回值；即使销毁抛出未预期异常也会执行回调。
+     */
+    @Override
+    public void stop(Runnable callback) {
+        try {
+            destroy();
+        } finally {
+            callback.run();
+        }
+    }
+
+    /**
+     * 业务作用：报告代理是否仍处于 Spring 运行阶段，防止生命周期处理器重复发出停止动作。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 已启动且尚未销毁时返回 true。
+     */
+    @Override
+    public boolean isRunning() {
+        return lifecycleRunning && !destroyed.get();
+    }
+
+    /**
+     * 业务作用：让 Redis 消费基础设施早于常规业务执行器进入停止阶段。
+     * Spring 按 phase 从高到低停止，较高值保证先关闭消费入口再收缩线程池。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return Redis 消费基础设施的停机阶段。
+     */
+    @Override
+    public int getPhase() {
+        return Integer.MAX_VALUE - 10_000;
+    }
+
+    /**
+     * 业务作用：记录实际托管本代理的 Spring 上下文，用于区分自身关闭与子上下文事件。
+     *
+     * @param applicationContext 实际创建并管理本代理生命周期的上下文
+     * 返回: 无返回值；后续关闭事件只接受同一上下文实例。
+     */
+    @Override
+    public void setApplicationContext(ApplicationContext applicationContext) {
+        this.owningApplicationContext = applicationContext;
+    }
+
+    /**
+     * 业务作用：在 ContextClosedEvent 广播阶段提前关闭 Redis 消费入口。
+     * Spring 的业务执行器也会监听该事件并提前拒绝新任务，因此不能只依赖随后发生的 phase 停机。
+     *
+     * @param event 当前应用上下文的关闭事件
+     * 返回: 无返回值；幂等销毁允许后续 DisposableBean 与 SmartLifecycle 再次调用。
+     */
+    @Override
+    public void onApplicationEvent(ContextClosedEvent event) {
+        // 子上下文事件会继续向父上下文传播；只有托管本实例的上下文关闭才有权撤销共享 Redis 基础设施。
+        if (event.getApplicationContext() == owningApplicationContext) destroy();
     }
 
     /**
@@ -507,6 +649,8 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
     public void refreshProperties(NasaLettuceConfig.RedisProperties p) {
         Objects.requireNonNull(p, "redis properties must not be null");
         NasaLettuceConfig.Stream sourceStream = Objects.requireNonNull(p.getStream(), "stream properties must not be null");
+        NasaLettuceConfig.Partition sourcePartition = Objects.requireNonNull(
+                sourceStream.getPartition(), "partition properties must not be null");
         if (p.getLowerMillis() < 1) {
             throw new IllegalArgumentException("lowerMillis must be greater than zero");
         }
@@ -531,6 +675,27 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
                         + streamName + "/" + groupName);
             }
         }));
+        if (StringUtils.isBlank(sourcePartition.getDefaultGroup()) || sourcePartition.getCount() < 1
+                || sourcePartition.getRebalanceMs() < 1
+                || sourcePartition.getRebalanceMs() > Long.MAX_VALUE / 3
+                || sourcePartition.getMinIdleMs() < 0
+                || sourcePartition.getHoldsCheckIntervalMs() < 1
+                || sourcePartition.getDrainTimeoutMs() < 1) {
+            throw new IllegalArgumentException("partition defaultGroup must be non-blank, count/rebalanceMs/"
+                    + "holdsCheckIntervalMs/drainTimeoutMs must be greater than zero, and minIdleMs must not be negative");
+        }
+        sourcePartition.getGroups().forEach((groupName, group) -> {
+            if (StringUtils.isBlank(groupName) || group == null || group.getCount() < 1
+                    || (group.getRebalanceMs() != null && (group.getRebalanceMs() < 1
+                    || group.getRebalanceMs() > Long.MAX_VALUE / 3))
+                    || (group.getMinIdleMs() != null && group.getMinIdleMs() < 0)
+                    || (group.getHoldsCheckIntervalMs() != null && group.getHoldsCheckIntervalMs() < 1)
+                    || (group.getDrainTimeoutMs() != null && group.getDrainTimeoutMs() < 1)
+                    || (group.getBatchSize() != null && group.getBatchSize() < 1)
+                    || (group.getPollTimeout() != null && group.getPollTimeout() < 1)) {
+                throw new IllegalArgumentException("partition group configuration is invalid: " + groupName);
+            }
+        });
         this.setActivateDefaultTyping(p.isActivateDefaultTyping());
         this.lower = p.getLower();
         this.setLowerMillis(p.getLowerMillis());
@@ -548,7 +713,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
         this.stream.setEventExecutorInflightMax(sourceStream.getEventExecutorInflightMax());
         this.stream.setNonGroupExecutorEnable(sourceStream.isNonGroupExecutorEnable());
         // 集合成员按当前配置整体替换，避免已删除的排除项或分区组继续生效。
-        NasaLettuceConfig.Partition partFrom = sourceStream.getPartition();
+        NasaLettuceConfig.Partition partFrom = sourcePartition;
         NasaLettuceConfig.Partition partTo = this.stream.getPartition();
         partTo.setEnabled(partFrom.isEnabled());
         partTo.setDefaultGroup(partFrom.getDefaultGroup());
@@ -556,6 +721,7 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
         partTo.setRebalanceMs(partFrom.getRebalanceMs());
         partTo.setMinIdleMs(partFrom.getMinIdleMs());
         partTo.setHoldsCheckIntervalMs(partFrom.getHoldsCheckIntervalMs());
+        partTo.setDrainTimeoutMs(partFrom.getDrainTimeoutMs());
         partTo.getGroups().clear();
         partTo.getGroups().putAll(partFrom.getGroups());
         // pipeline 专用连接池
@@ -4830,10 +4996,54 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
 
     private volatile RedisMessageListenerContainer redisMessageListenerContainer;
     private volatile boolean ownsRedisMessageListenerContainer;
-    /* 缓存频道和消费函数. ConcurrentHashMap + CopyOnWriteArrayList: 运行期并发 subscribe/unsubscribe 安全 (消息投递由 Spring container 处理, 不遍历本 map) */
-    private final Map<String, List<KeyValue<Topic, MessageListener>>> topicMap = new ConcurrentHashMap<>();
-
+    /* 保存频道的逻辑订阅快照；稳定 dispatcher 收到消息后遍历当前快照，已失效注册不会获得投递。 */
+    private final Map<String, List<ListenerRegistration>> topicMap = new ConcurrentHashMap<>();
     private final Lock listenerContainerLock = new ReentrantLock();
+    private static final long PUBSUB_CLEANUP_RETRY_BASE_MILLIS = 50L;
+    private static final long PUBSUB_CLEANUP_RETRY_MAX_MILLIS = 1000L;
+    private static final long PUBSUB_SHUTDOWN_DRAIN_MILLIS = 100L;
+    private static final long PUBSUB_DISPATCHER_RETIRE_MILLIS = 1000L;
+    private final ConcurrentMap<String, ChannelDispatcher> channelDispatchers = new ConcurrentHashMap<>();
+    private final ConcurrentMap<ChannelDispatcher, Long> pendingPubSubCleanups = new ConcurrentHashMap<>();
+    private final ConcurrentMap<ChannelDispatcher, Long> inFlightPubSubOperations = new ConcurrentHashMap<>();
+    private final AtomicLong pubSubCleanupFailures = new AtomicLong();
+    private final AtomicLong pubSubOperationSequence = new AtomicLong();
+    private final AtomicInteger scheduledPubSubRetries = new AtomicInteger();
+    private final AtomicLong pubSubRemovalReuses = new AtomicLong();
+
+    /**
+     * 业务作用：提供 Pub/Sub listener 异步清理的本地观测快照，供健康检查或指标桥接识别外部容器长时停顿。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 当前待清理、在途调用、退避任务、最长年龄、remove 在途复用次数及未知附着状态数的不可变快照。
+     */
+    public PubSubListenerCleanupMetrics pubSubListenerCleanupMetrics() {
+        long now = System.nanoTime();
+        long oldestPendingNanos = 0L;
+        for (long createdAtNanos : pendingPubSubCleanups.values()) {
+            oldestPendingNanos = Math.max(oldestPendingNanos, Math.max(0L, now - createdAtNanos));
+        }
+        long oldestInFlightNanos = 0L;
+        for (long createdAtNanos : inFlightPubSubOperations.values()) {
+            oldestInFlightNanos = Math.max(oldestInFlightNanos, Math.max(0L, now - createdAtNanos));
+        }
+        int unknownDispatchers = 0;
+        for (ChannelDispatcher dispatcher : channelDispatchers.values()) {
+            if (dispatcher.isAttachmentUnknown()) unknownDispatchers++;
+        }
+        return new PubSubListenerCleanupMetrics(pendingPubSubCleanups.size(),
+                TimeUnit.NANOSECONDS.toMillis(oldestPendingNanos), pubSubCleanupFailures.get(),
+                inFlightPubSubOperations.size(), TimeUnit.NANOSECONDS.toMillis(oldestInFlightNanos),
+                scheduledPubSubRetries.get(), pubSubRemovalReuses.get(), unknownDispatchers);
+    }
+
+    /** Pub/Sub listener 清理积压的不可变快照。 */
+    public record PubSubListenerCleanupMetrics(int pending, long oldestPendingMillis, long failures,
+                                               int inFlight, long oldestInFlightMillis,
+                                               int scheduledRetries, long removalInFlightReuses,
+                                               int unknownDispatchers) {
+    }
 
     /**
      * 业务作用：注入由外部容器管理的发布订阅监听容器。
@@ -4915,78 +5125,773 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
     }
 
     /**
-     * 业务作用：订阅频道。
+     * 业务作用：为频道登记逻辑 consumer，并确保首次使用时的物理 dispatcher 已完成注册。
+     * Pub/Sub 是 at-most-once 传输；若同频道物理 remove 已在途，本方法复用稳定 dispatcher，remove 返回后按需重新注册，
+     * 交接窗口内的消息不提供补发保证。需要可靠消费时应使用 Stream。
      *
      * @param channel 频道名
      * @param consumer 消费者名
-     * 返回: 无返回值。
+     * 返回: 无返回值；首次物理注册失败时抛出底层异常，remove 在途时复用尚在线的稳定 dispatcher。
      */
     public <P> void subscribe(String channel, Consumer<P> consumer) {
         subscribe(true, channel, consumer);
     }
 
     /**
-     * 业务作用：订阅频道。
+     * 业务作用：按日志策略登记频道逻辑 consumer，并复用同频道稳定 dispatcher。
      *
      * @param enableLog 见方法语义
      * @param channel 频道名
      * @param consumer 消费者名
-     * 返回: 无返回值。
+     * 返回: 无返回值；首次物理注册失败时抛出底层异常。
      */
     <P> void subscribe(boolean enableLog, String channel, Consumer<P> consumer) {
+        subscribeOwned(enableLog, channel, consumer);
+    }
+
+    /**
+     * 业务作用：登记一个可独立撤销的频道监听，使内部组件只能释放自己创建的 listener，不影响同频道其它订阅者。
+     *
+     * @param enableLog 是否记录订阅成功日志
+     * @param channel 频道名
+     * @param consumer 消息消费者
+     * @return 本次逻辑 consumer 的幂等关闭句柄；关闭不影响同频道其它 consumer，最后一个关闭才触发物理回收。
+     */
+    <P> ListenerRegistration subscribeOwned(boolean enableLog, String channel, Consumer<P> consumer) {
         if (StringUtils.isBlank(channel)) {
             throw new IllegalArgumentException("channel must not be blank");
         }
         Objects.requireNonNull(consumer, "consumer must not be null");
-        Topic topic = ChannelTopic.of(channel);
-        MessageListener listener = (message, pattern) -> {
-            try {
-                P p;
-                try {
-                    p = (P) valueSerializer.deserialize(message.getBody());
-                } catch (Throwable e) {
-                    p = (P) RedisSerializer.string().deserialize(message.getBody());
-                }
-                consumer.accept(p);
-            } catch (Throwable t) {
-                log.error("{} {}", AnyHolder.getTraceId(), t.getMessage(), t);
-            }
-        };
-        topicMap.compute(channel, (key, listeners) -> {
-            getRedisMessageListenerContainer().addMessageListener(listener, topic);
-            if (listeners == null) listeners = new CopyOnWriteArrayList<>();
-            listeners.add(KeyValue.just(topic, listener));
-            return listeners;
-        });
+        ListenerRegistration registration;
+        ChannelDispatcher dispatcher;
+        listenerContainerLock.lock();
+        try {
+            if (destroyed.get()) throw new IllegalStateException("RedisProxy is destroyed: " + qualifier);
+            RedisMessageListenerContainer container = getRedisMessageListenerContainer();
+            dispatcher = channelDispatchers.computeIfAbsent(channel,
+                    key -> new ChannelDispatcher(this, container, key));
+            registration = new ListenerRegistration(this, dispatcher, channel, (Consumer<Object>) consumer);
+            topicMap.compute(channel, (key, listeners) -> {
+                if (listeners == null) listeners = new CopyOnWriteArrayList<>();
+                listeners.add(registration);
+                return listeners;
+            });
+        } finally {
+            listenerContainerLock.unlock();
+        }
+        try {
+            // remove 已在途时 dispatcher 仍物理在线，新逻辑订阅可立即复用；
+            // remove 返回后再根据当前逻辑清单决定是否重新 add。
+            awaitPubSubChannelOperation(dispatcher.ensureAttached());
+        } catch (RuntimeException | Error registrationFailure) {
+            // addMessageListener 的失败结果可能不确定，仍交由精确句柄收口，不影响频道内既有注册。
+            registration.close();
+            throw registrationFailure;
+        }
+        if (registration.removalRequested.get()) {
+            throw new IllegalStateException("RedisProxy subscription was closed during registration: " + qualifier);
+        }
         if (enableLog) log.info("{} Subscribed to channel {}", this.qualifier, channel);
+        return registration;
     }
 
     /**
-     * 业务作用：取消订阅频道。
+     * 业务作用：取消频道的全部本地订阅，返回前先禁止向业务 consumer 投递新消息。
      *
      * @param channel 频道名
-     * 返回: 无返回值。
+     * 返回: 无返回值；底层容器的物理撤销异步执行，失败时保留句柄并退避重试。
      */
     public void unsubscribe(String channel) {
         unsubscribe(true, channel);
     }
 
     /**
-     * 业务作用：取消订阅频道。
+     * 业务作用：按日志策略取消频道的全部本地订阅。
      *
      * @param enableLog 见方法语义
      * @param channel 频道名
-     * 返回: 无返回值。
+     * 返回: 无返回值；物理撤销由独立任务继续收口。
      */
     void unsubscribe(boolean enableLog, String channel) {
-        List<KeyValue<Topic, MessageListener>> kvs = topicMap.remove(channel);
-        if (Objects.isNull(kvs)) return;
-        kvs.forEach(kv -> {
-            Topic topic = kv.getKey();
-            MessageListener listener = kv.getValue();
-            getRedisMessageListenerContainer().removeMessageListener(listener, topic);
-        });
+        List<ListenerRegistration> removed = topicMap.remove(channel);
+        if (removed != null) {
+            // 先删除本地路由权威，handler 随即停止投递；物理撤销由独立任务最终收口。
+            for (ListenerRegistration registration : removed) registration.close();
+        }
         if (enableLog) log.info("{} Unsubscribed from channel {}", this.qualifier, channel);
+    }
+
+    /**
+     * 业务作用：按注册身份删除本地 listener 坐标，使同频道其它监听者不受影响。
+     *
+     * @param registration 当前代理创建的 listener 注册
+     * 返回: 无返回值；只改变本地路由，不调用外部容器。
+     */
+    private void detachListenerRegistration(ListenerRegistration registration) {
+        topicMap.computeIfPresent(registration.channel, (key, registrations) -> {
+            registrations.remove(registration);
+            return registrations.isEmpty() ? null : registrations;
+        });
+        registration.dispatcher.logicalRegistrationRemoved();
+    }
+
+    /**
+     * 业务作用：判定频道 dispatcher 是否仍有可投递的逻辑订阅，供物理操作完成时重新核对目标状态。
+     *
+     * @param dispatcher 要核对的频道 dispatcher
+     * @return 至少一个未关闭且属于该 dispatcher 的逻辑订阅存在时返回 true。
+     */
+    private boolean hasLogicalListeners(ChannelDispatcher dispatcher) {
+        List<ListenerRegistration> registrations = topicMap.get(dispatcher.channel);
+        if (registrations == null) return false;
+        for (ListenerRegistration registration : registrations) {
+            if (registration.dispatcher == dispatcher && !registration.removalRequested.get()) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 业务作用：由频道稳定 dispatcher 将一条 Redis 消息分发给当前有效的逻辑订阅，某个 consumer 失败不中断其它 consumer。
+     *
+     * @param dispatcher 接收到消息的物理 dispatcher
+     * @param body Redis 消息体
+     * 返回: 无返回值；过期 dispatcher 或空逻辑清单直接忽略。
+     */
+    private void dispatchPubSubMessage(ChannelDispatcher dispatcher, byte[] body) {
+        List<ListenerRegistration> registrations = topicMap.get(dispatcher.channel);
+        if (registrations == null) return;
+        Object value;
+        try {
+            try {
+                value = valueSerializer.deserialize(body);
+            } catch (Throwable ignored) {
+                value = RedisSerializer.string().deserialize(body);
+            }
+        } catch (Throwable failure) {
+            log.error("{} Pub/Sub message deserialization failed channel={}",
+                    AnyHolder.getTraceId(), dispatcher.channel, failure);
+            return;
+        }
+        for (ListenerRegistration registration : registrations) {
+            if (registration.dispatcher != dispatcher || !registration.active.get()) continue;
+            try {
+                registration.consumer.accept(value);
+            } catch (Throwable failure) {
+                log.error("{} {}", AnyHolder.getTraceId(), failure.getMessage(), failure);
+            }
+        }
+    }
+
+    /**
+     * 业务作用：在独立虚拟线程执行单个频道的物理 add/remove，每个 dispatcher 任一时刻最多一个外部操作在途。
+     *
+     * @param dispatcher 要操作的频道 dispatcher
+     * @param operation 物理 add 或 remove
+     * @param completion add 的完成状态；remove 无需业务等待时为 null
+     * 返回: 无返回值；外部调用长时停顿只占用本频道的虚拟线程，不消耗跨频道固定配额。
+     */
+    private void startPubSubPhysicalOperation(ChannelDispatcher dispatcher, PubSubPhysicalOperation operation,
+                                              CompletableFuture<Void> completion) {
+        long startedAtNanos = System.nanoTime();
+        inFlightPubSubOperations.put(dispatcher, startedAtNanos);
+        try {
+            Thread.ofVirtual().name("redis-pubsub-operation-" + qualifier + "-"
+                            + pubSubOperationSequence.incrementAndGet())
+                    .start(() -> {
+                        Throwable failure = null;
+                        try {
+                            if (operation == PubSubPhysicalOperation.ADD) {
+                                dispatcher.container.addMessageListener(dispatcher.listener, dispatcher.topic);
+                            } else {
+                                dispatcher.container.removeMessageListener(dispatcher.listener, dispatcher.topic);
+                            }
+                        } catch (RuntimeException | Error operationFailure) {
+                            failure = operationFailure;
+                        } finally {
+                            inFlightPubSubOperations.remove(dispatcher, startedAtNanos);
+                            dispatcher.physicalOperationCompleted(operation, completion, failure);
+                        }
+                    });
+        } catch (RuntimeException | Error startFailure) {
+            inFlightPubSubOperations.remove(dispatcher, startedAtNanos);
+            dispatcher.physicalOperationCompleted(operation, completion, startFailure);
+        }
+    }
+
+    /**
+     * 业务作用：按退避时刻重新驱动单频道物理操作，等待期间不占用外部调用线程或全局槽位。
+     *
+     * @param dispatcher 需要重试的频道 dispatcher
+     * @param add 重试 add 时为 true，重试 remove 时为 false
+     * @param generation 本次重试的 dispatcher 代次
+     * @param delayMillis 单调时钟等待毫秒数
+     * @param ticket 本次延迟任务的可取消凭证
+     * @return 延迟任务已成功启动时返回 true；启动失败已记录并返回 false。
+     */
+    private boolean schedulePubSubRetry(ChannelDispatcher dispatcher, boolean add,
+                                        long generation, long delayMillis, PubSubRetryTicket ticket) {
+        scheduledPubSubRetries.incrementAndGet();
+        try {
+            Thread.ofVirtual().name("redis-pubsub-retry-" + qualifier + "-"
+                            + pubSubOperationSequence.incrementAndGet())
+                    .start(() -> {
+                        Thread current = Thread.currentThread();
+                        ticket.thread = current;
+                        if (ticket.active.get()) {
+                            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(delayMillis));
+                        }
+                        ticket.thread = null;
+                        if (!ticket.active.compareAndSet(true, false)) return;
+                        scheduledPubSubRetries.decrementAndGet();
+                        dispatcher.retryDue(add, generation, ticket);
+                    });
+            return true;
+        } catch (RuntimeException | Error startFailure) {
+            if (ticket.active.compareAndSet(true, false)) scheduledPubSubRetries.decrementAndGet();
+            pubSubCleanupFailures.incrementAndGet();
+            log.error("[{}] unable to schedule pub/sub retry channel={} operation={}",
+                    this.qualifier, dispatcher.channel, add ? "add" : "remove", startFailure);
+            return false;
+        }
+    }
+
+    /**
+     * 业务作用：延迟退役已物理移除的 dispatcher，为短时到达的同频道新逻辑订阅保留稳定身份。
+     *
+     * @param dispatcher 候选退役 dispatcher
+     * @param generation 本次退役候选的 dispatcher 代次
+     * @return 延迟任务启动成功时返回 true；启动失败已记录并返回 false。
+     */
+    private boolean schedulePubSubDispatcherRetirement(ChannelDispatcher dispatcher, long generation) {
+        try {
+            Thread.ofVirtual().name("redis-pubsub-retire-" + qualifier + "-"
+                            + pubSubOperationSequence.incrementAndGet())
+                    .start(() -> {
+                        LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(PUBSUB_DISPATCHER_RETIRE_MILLIS));
+                        dispatcher.retirementDue(generation);
+                    });
+            return true;
+        } catch (RuntimeException | Error startFailure) {
+            pubSubCleanupFailures.incrementAndGet();
+            log.error("[{}] unable to schedule pub/sub dispatcher retirement channel={}",
+                    this.qualifier, dispatcher.channel, startFailure);
+            return false;
+        }
+    }
+
+    /**
+     * 业务作用：等待首次物理 add 确认，并恢复底层容器的原始失败语义。
+     *
+     * @param operation 要等待的 add 操作
+     * 返回: 无返回值；底层 RuntimeException 或 Error 按原类型向调用方传播。
+     */
+    private void awaitPubSubChannelOperation(CompletableFuture<Void> operation) {
+        try {
+            operation.join();
+        } catch (CompletionException wrapper) {
+            Throwable failure = wrapper.getCause();
+            if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+            if (failure instanceof Error fatalFailure) throw fatalFailure;
+            throw new IllegalStateException("Pub/Sub channel operation failed", failure);
+        }
+    }
+
+    /**
+     * 业务作用：在停机预算内等待常规 listener 清理收口，不让外部容器停顿转化为无界停机。
+     *
+     * @param budgetMillis 允许等待的总毫秒数
+     * 返回: 无返回值；预算耗尽时由后续生命周期门禁取消延迟任务，在途调用保留诊断坐标直至自然返回。
+     */
+    private void awaitPubSubListenerCleanup(long budgetMillis) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis);
+        while (!pendingPubSubCleanups.isEmpty()) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0L) return;
+            LockSupport.parkNanos(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(1L)));
+        }
+    }
+
+    /**
+     * 业务作用：结束当前代理的 Pub/Sub 清理生命周期，取消未到期退避并禁止在停机边界后创建物理后继操作。
+     *
+     * <p>参数说明: 无。
+     *
+     * 返回: 无返回值；未进入第三方容器的任务立即释放，迟到 add 对外部共享容器只允许一次精确终态撤销。
+     */
+    private void closePubSubListenerCleanup() {
+        listenerContainerLock.lock();
+        try {
+            for (ChannelDispatcher dispatcher : new ArrayList<>(channelDispatchers.values())) {
+                dispatcher.closeCleanupLifecycle();
+            }
+        } finally {
+            listenerContainerLock.unlock();
+        }
+    }
+
+    /** 物理 Pub/Sub dispatcher 当前允许的外部操作。 */
+    private enum PubSubPhysicalOperation {
+        NONE,
+        ADD,
+        REMOVE
+    }
+
+    /** dispatcher 当前物理附着结果的收敛状态。 */
+    private enum PubSubAttachmentState {
+        DETACHED,
+        ATTACHED,
+        UNKNOWN
+    }
+
+    /** 单次退避任务的可取消凭证，用于让停机和逻辑状态变化即时归还调度计数。 */
+    private static final class PubSubRetryTicket {
+        private final AtomicBoolean active = new AtomicBoolean(true);
+        private volatile Thread thread;
+    }
+
+    /** 单频道稳定 dispatcher，物理 listener 与逻辑 consumer 生命周期相互独立。 */
+    private static final class ChannelDispatcher {
+        private final RedisProxy owner;
+        private final RedisMessageListenerContainer container;
+        private final String channel;
+        private final Topic topic;
+        private final MessageListener listener;
+        private PubSubPhysicalOperation operation = PubSubPhysicalOperation.NONE;
+        private CompletableFuture<Void> addCompletion;
+        private PubSubAttachmentState attachmentState = PubSubAttachmentState.DETACHED;
+        private boolean retired;
+        private boolean retirementScheduled;
+        private long retirementGeneration;
+        private boolean retryScheduled;
+        private boolean retryAdd;
+        private long retryGeneration;
+        private PubSubRetryTicket retryTicket;
+        private boolean cleanupLifecycleClosed;
+        private boolean terminalDetachStarted;
+        private int addAttempts;
+        private int removeAttempts;
+
+        /**
+         * 业务作用：为频道创建稳定物理 dispatcher，后续逻辑订阅只更新代理内清单。
+         *
+         * <p>返回：创建尚未附着物理 listener 的稳定频道 dispatcher。
+         *
+         * @param owner 所属 Redis 代理
+         * @param container 承载物理 listener 的容器
+         * @param channel Redis 频道
+         */
+        private ChannelDispatcher(RedisProxy owner, RedisMessageListenerContainer container, String channel) {
+            this.owner = owner;
+            this.container = container;
+            this.channel = channel;
+            this.topic = ChannelTopic.of(channel);
+            this.listener = (message, pattern) -> owner.dispatchPubSubMessage(this, message.getBody());
+        }
+
+        /**
+         * 业务作用：确保频道已有可复用的物理 dispatcher；remove 在途时不等待回收完成。
+         *
+         * <p>参数说明: 无。
+         *
+         * @return 首次 add 或已在途 add 的完成状态；可直接复用时为已完成状态。
+         */
+        private synchronized CompletableFuture<Void> ensureAttached() {
+            if (retired) return CompletableFuture.failedFuture(
+                    new IllegalStateException("Pub/Sub dispatcher is retired: " + channel));
+            if (retirementScheduled) {
+                retirementScheduled = false;
+                retirementGeneration++;
+            }
+            if (operation == PubSubPhysicalOperation.REMOVE) {
+                owner.pubSubRemovalReuses.incrementAndGet();
+                return CompletableFuture.completedFuture(null);
+            }
+            if (operation == PubSubPhysicalOperation.ADD) {
+                return addCompletion;
+            }
+            if (retryScheduled) {
+                cancelRetryLocked();
+                return startAddLocked();
+            }
+            if (attachmentState == PubSubAttachmentState.ATTACHED) {
+                return CompletableFuture.completedFuture(null);
+            }
+            return startAddLocked();
+        }
+
+        /**
+         * 业务作用：在最后一个逻辑订阅离开时触发物理回收，其它逻辑订阅仍存在时不改变 dispatcher。
+         *
+         * <p>参数说明: 无。
+         *
+         * 返回: 无返回值；add/remove 已在途时由完成回调根据最新清单收敛。
+         */
+        private synchronized void logicalRegistrationRemoved() {
+            if (retired || owner.hasLogicalListeners(this)) return;
+            if (retryScheduled && retryAdd) {
+                cancelRetryLocked();
+            }
+            // 销毁期间仍在途的 add 可能在停机边界后才向共享容器发布 listener；
+            // 提前登记 pending，保证有限排干和停机诊断不会把这条外部副作用遗漏。
+            if (owner.destroyed.get() && operation == PubSubPhysicalOperation.ADD) {
+                owner.pendingPubSubCleanups.putIfAbsent(this, System.nanoTime());
+            }
+            if (operation == PubSubPhysicalOperation.NONE && !retryScheduled) startRemoveLocked();
+        }
+
+        /**
+         * 业务作用：开始本频道的单次物理 add，与 remove 共用操作状态保证不并发。
+         *
+         * <p>参数说明: 无。
+         *
+         * @return 本次 add 的完成状态。
+         */
+        private CompletableFuture<Void> startAddLocked() {
+            operation = PubSubPhysicalOperation.ADD;
+            addCompletion = new CompletableFuture<>();
+            owner.startPubSubPhysicalOperation(this, operation, addCompletion);
+            return addCompletion;
+        }
+
+        /**
+         * 业务作用：开始本频道的单次物理 remove，并在容器确认前保留 pending 诊断坐标。
+         *
+         * <p>参数说明: 无。
+         *
+         * 返回: 无返回值；每个 dispatcher 只能有一个 remove 在途。
+         */
+        private void startRemoveLocked() {
+            owner.pendingPubSubCleanups.putIfAbsent(this, System.nanoTime());
+            operation = PubSubPhysicalOperation.REMOVE;
+            owner.startPubSubPhysicalOperation(this, operation, null);
+        }
+
+        /**
+         * 业务作用：精确撤销 cleanup lifecycle 关闭后才完成的物理 add，避免共享容器长期持有已销毁代理。
+         *
+         * <p>参数说明: 无。
+         *
+         * 返回: 无返回值；相同 dispatcher 至多发起一次终态 remove，结果无论成功或失败都不进入退避链。
+         */
+        private void startTerminalRemoveLocked() {
+            if (terminalDetachStarted) return;
+            terminalDetachStarted = true;
+            owner.pendingPubSubCleanups.putIfAbsent(this, System.nanoTime());
+            operation = PubSubPhysicalOperation.REMOVE;
+            owner.startPubSubPhysicalOperation(this, operation, null);
+        }
+
+        /**
+         * 业务作用：合并外部 add/remove 结果与最新逻辑订阅目标，确保旧回收不能关闭新一代投递。
+         *
+         * @param completedOperation 已完成的物理操作
+         * @param completion add 调用方等待的完成状态
+         * @param failure 容器调用失败；成功时为 null
+         * 返回: 无返回值；运行期按逻辑订阅目标继续收敛，关闭后只允许迟到 add 的一次终态撤销。
+         */
+        private void physicalOperationCompleted(PubSubPhysicalOperation completedOperation,
+                                                CompletableFuture<Void> completion, Throwable failure) {
+            owner.listenerContainerLock.lock();
+            try {
+                synchronized (this) {
+                    operation = PubSubPhysicalOperation.NONE;
+                    if (cleanupLifecycleClosed) {
+                        completeAfterCleanupClosedLocked(completedOperation, completion, failure);
+                        return;
+                    }
+                    boolean hasLogicalListeners = owner.hasLogicalListeners(this) && !owner.destroyed.get();
+                    if (completedOperation == PubSubPhysicalOperation.ADD) {
+                        completeAddLocked(completion, failure, hasLogicalListeners);
+                    } else {
+                        completeRemoveLocked(failure, hasLogicalListeners);
+                    }
+                }
+            } finally {
+                owner.listenerContainerLock.unlock();
+            }
+        }
+
+        /**
+         * 业务作用：收敛单次 add 结果，首次订阅向调用方传递失败，内部重建则在逻辑订阅仍存在时退避再试。
+         *
+         * @param completion add 调用方等待的完成状态
+         * @param failure 容器 add 失败；成功时为 null
+         * @param hasLogicalListeners 当前是否仍需要物理 dispatcher
+         * 返回: 无返回值；异常时进入 UNKNOWN 并保留 pending，无逻辑需求时转入保守 remove 收口。
+         */
+        private void completeAddLocked(CompletableFuture<Void> completion, Throwable failure,
+                                       boolean hasLogicalListeners) {
+            if (failure == null) {
+                attachmentState = PubSubAttachmentState.ATTACHED;
+                addAttempts = 0;
+                completion.complete(null);
+                if (hasLogicalListeners) {
+                    owner.pendingPubSubCleanups.remove(this);
+                    removeAttempts = 0;
+                } else {
+                    startRemoveLocked();
+                }
+                return;
+            }
+            attachmentState = PubSubAttachmentState.UNKNOWN;
+            addAttempts++;
+            owner.pendingPubSubCleanups.putIfAbsent(this, System.nanoTime());
+            owner.pubSubCleanupFailures.incrementAndGet();
+            completion.completeExceptionally(failure);
+            if (addAttempts == 1 || (addAttempts & (addAttempts - 1)) == 0) {
+                log.warn("[{}] pub/sub dispatcher add result unknown channel={} attempts={}",
+                        owner.qualifier, channel, addAttempts, failure);
+            }
+            if (hasLogicalListeners) scheduleRetryLocked(true, addAttempts);
+            else startRemoveLocked();
+        }
+
+        /**
+         * 业务作用：收敛单次 remove 结果，新逻辑订阅已到达时取消后续回收或立即重建物理 dispatcher。
+         *
+         * @param failure 容器 remove 失败；成功时为 null
+         * @param hasLogicalListeners 当前是否已有新逻辑订阅
+         * 返回: 无返回值；成功时按逻辑目标重建或退役，异常时进入 UNKNOWN 并驱动 add/remove reconciliation。
+         */
+        private void completeRemoveLocked(Throwable failure, boolean hasLogicalListeners) {
+            if (failure == null) {
+                attachmentState = PubSubAttachmentState.DETACHED;
+                removeAttempts = 0;
+                if (hasLogicalListeners) {
+                    startAddLocked();
+                } else {
+                    owner.pendingPubSubCleanups.remove(this);
+                    retirementScheduled = true;
+                    long generation = ++retirementGeneration;
+                    if (!owner.schedulePubSubDispatcherRetirement(this, generation)) {
+                        retirementScheduled = false;
+                        retired = true;
+                        owner.channelDispatchers.remove(channel, this);
+                    }
+                }
+                return;
+            }
+            attachmentState = PubSubAttachmentState.UNKNOWN;
+            removeAttempts++;
+            owner.pubSubCleanupFailures.incrementAndGet();
+            if (removeAttempts == 1 || (removeAttempts & (removeAttempts - 1)) == 0) {
+                log.warn("[{}] pub/sub dispatcher remove result unknown channel={} attempts={}",
+                        owner.qualifier, channel, removeAttempts, failure);
+            }
+            if (hasLogicalListeners) {
+                startAddLocked();
+            } else {
+                scheduleRetryLocked(false, removeAttempts);
+            }
+        }
+
+        /**
+         * 业务作用：登记一次不占用物理操作线程的退避重试，相同 dispatcher 同时至多一个延迟任务。
+         *
+         * @param add 需重试 add 时为 true
+         * @param attempts 当前连续失败次数
+         * 返回: 无返回值；调度成功后由 retryDue 重新核对逻辑需求，清理生命周期关闭时直接释放本地坐标。
+         */
+        private void scheduleRetryLocked(boolean add, int attempts) {
+            if (cleanupLifecycleClosed) {
+                abandonCleanupLocked();
+                return;
+            }
+            retryScheduled = true;
+            retryAdd = add;
+            long generation = ++retryGeneration;
+            PubSubRetryTicket ticket = new PubSubRetryTicket();
+            retryTicket = ticket;
+            long retryMillis = Math.min(PUBSUB_CLEANUP_RETRY_MAX_MILLIS,
+                    PUBSUB_CLEANUP_RETRY_BASE_MILLIS * (1L << Math.min(attempts - 1, 4)));
+            if (!owner.schedulePubSubRetry(this, add, generation, retryMillis, ticket)) {
+                retryScheduled = false;
+                retryTicket = null;
+            }
+        }
+
+        /**
+         * 业务作用：取消当前 dispatcher 尚未到期的退避凭证，使逻辑交接和代理停机不会保留失效调度坐标。
+         *
+         * <p>参数说明: 无。
+         *
+         * 返回: 无返回值；有效凭证的全局调度计数只归还一次，已启动线程会被唤醒后退出。
+         */
+        private void cancelRetryLocked() {
+            retryScheduled = false;
+            retryGeneration++;
+            PubSubRetryTicket ticket = retryTicket;
+            retryTicket = null;
+            if (ticket == null || !ticket.active.compareAndSet(true, false)) return;
+            owner.scheduledPubSubRetries.decrementAndGet();
+            Thread retryThread = ticket.thread;
+            if (retryThread != null) retryThread.interrupt();
+        }
+
+        /**
+         * 业务作用：退避到期后按最新逻辑订阅状态决定重试、取消回收或转入物理清理。
+         *
+         * @param add 到期任务原计划重试 add 时为 true
+         * @param generation 到期任务创建时记录的 dispatcher 代次
+         * @param ticket 到期任务创建时绑定的可取消凭证
+         * 返回: 无返回值；已被新状态取消的过期任务不执行外部操作。
+         */
+        private synchronized void retryDue(boolean add, long generation, PubSubRetryTicket ticket) {
+            if (!retryScheduled || retryAdd != add || retryGeneration != generation
+                    || retryTicket != ticket || retired || cleanupLifecycleClosed) return;
+            retryScheduled = false;
+            retryTicket = null;
+            boolean hasLogicalListeners = owner.hasLogicalListeners(this) && !owner.destroyed.get();
+            if (add) {
+                if (hasLogicalListeners) startAddLocked();
+                else startRemoveLocked();
+            } else if (hasLogicalListeners) {
+                startAddLocked();
+            } else {
+                startRemoveLocked();
+            }
+        }
+
+        /**
+         * 业务作用：在代理停机预算结束时关闭 dispatcher 清理生命周期，形成不再访问外部容器的确定边界。
+         *
+         * <p>参数说明: 无。
+         *
+         * 返回: 无返回值；未到期退避立即取消；迟到 add 对共享容器完成一次终态撤销后再释放 dispatcher。
+         */
+        private synchronized void closeCleanupLifecycle() {
+            if (cleanupLifecycleClosed) return;
+            cleanupLifecycleClosed = true;
+            if (retryScheduled || retryTicket != null) cancelRetryLocked();
+            if (operation == PubSubPhysicalOperation.ADD) {
+                owner.pendingPubSubCleanups.putIfAbsent(this, System.nanoTime());
+            }
+            if (operation == PubSubPhysicalOperation.NONE) abandonCleanupLocked();
+        }
+
+        /**
+         * 业务作用：处理清理生命周期关闭后才返回的第三方容器调用，并补偿迟到 add 新产生的外部 listener。
+         *
+         * @param completedOperation 已完成的物理操作
+         * @param completion add 调用方等待的完成状态；remove 时为 null
+         * @param failure 第三方容器调用失败；成功时为 null
+         * 返回: 无返回值；等待方获得原始结果；迟到 add 对共享容器精确 remove 一次，其它结果直接终止。
+         */
+        private void completeAfterCleanupClosedLocked(PubSubPhysicalOperation completedOperation,
+                                                      CompletableFuture<Void> completion, Throwable failure) {
+            attachmentState = failure == null
+                    ? (completedOperation == PubSubPhysicalOperation.ADD
+                    ? PubSubAttachmentState.ATTACHED : PubSubAttachmentState.DETACHED)
+                    : PubSubAttachmentState.UNKNOWN;
+            if (completion != null) {
+                if (failure == null) completion.complete(null);
+                else completion.completeExceptionally(failure);
+            }
+            if (failure != null) {
+                owner.pubSubCleanupFailures.incrementAndGet();
+                log.warn("[{}] pub/sub dispatcher operation ended after cleanup lifecycle closed channel={} operation={}",
+                        owner.qualifier, channel, completedOperation.name().toLowerCase(Locale.ROOT), failure);
+            }
+            // 外部共享容器不会随当前代理一起停止；迟到 add 即使抛出异常也可能已经登记 listener，
+            // 因此只执行一次精确 remove。终态 remove 的结果不再驱动任何后继任务。
+            if (completedOperation == PubSubPhysicalOperation.ADD
+                    && !owner.ownsRedisMessageListenerContainer) {
+                startTerminalRemoveLocked();
+                return;
+            }
+            abandonCleanupLocked();
+        }
+
+        /**
+         * 业务作用：放弃已超过代理生命周期的物理状态确认并释放全部本地清理坐标。
+         *
+         * <p>参数说明: 无。
+         *
+         * 返回: 无返回值；dispatcher 从代理索引移除，外部注入容器的整体资源继续由其 owner 管理。
+         */
+        private void abandonCleanupLocked() {
+            if (retryScheduled || retryTicket != null) cancelRetryLocked();
+            retirementScheduled = false;
+            retirementGeneration++;
+            owner.pendingPubSubCleanups.remove(this);
+            retired = true;
+            owner.channelDispatchers.remove(channel, this);
+        }
+
+        /**
+         * 业务作用：判断 dispatcher 的物理附着结果是否仍未确认，供健康指标暴露需要 reconciliation 的频道数。
+         *
+         * <p>参数说明: 无。
+         *
+         * @return 最近一次 add/remove 异常导致物理结果未知时返回 true。
+         */
+        private synchronized boolean isAttachmentUnknown() {
+            return attachmentState == PubSubAttachmentState.UNKNOWN;
+        }
+
+        /**
+         * 业务作用：延迟窗口到期后退役仍无逻辑订阅且已物理移除的 dispatcher。
+         *
+         * @param generation 到期任务创建时记录的 dispatcher 代次
+         * 返回: 无返回值；新逻辑订阅、在途操作或重试坐标存在时保留 dispatcher。
+         */
+        private void retirementDue(long generation) {
+            owner.listenerContainerLock.lock();
+            try {
+                synchronized (this) {
+                    if (!retirementScheduled || retirementGeneration != generation || retired) return;
+                    retirementScheduled = false;
+                    if (owner.hasLogicalListeners(this) || operation != PubSubPhysicalOperation.NONE
+                            || attachmentState != PubSubAttachmentState.DETACHED || retryScheduled) return;
+                    retired = true;
+                    owner.channelDispatchers.remove(channel, this);
+                }
+            } finally {
+                owner.listenerContainerLock.unlock();
+            }
+        }
+    }
+
+    /** 单次频道 listener 的所有权句柄。 */
+    static final class ListenerRegistration implements AutoCloseable {
+        private final RedisProxy owner;
+        private final ChannelDispatcher dispatcher;
+        private final String channel;
+        private final Consumer<Object> consumer;
+        private final AtomicBoolean active = new AtomicBoolean(true);
+        private final AtomicBoolean removalRequested = new AtomicBoolean();
+
+        /**
+         * 业务作用：保存单次 listener 的完整注册身份，供精确撤销使用。
+         *
+         * <p>返回：创建可幂等关闭且只对应本次逻辑订阅的所有权句柄。
+         *
+         * @param owner 创建本注册的 Redis 代理
+         * @param dispatcher 承载本次逻辑订阅的频道 dispatcher
+         * @param channel listener 所属频道
+         * @param consumer 业务消息 consumer
+         */
+        private ListenerRegistration(RedisProxy owner, ChannelDispatcher dispatcher, String channel,
+                                     Consumer<Object> consumer) {
+            this.owner = owner;
+            this.dispatcher = dispatcher;
+            this.channel = channel;
+            this.consumer = consumer;
+        }
+
+        /**
+         * 业务作用：幂等撤销本次 listener 的本地投递权威，并把物理清理交给独立任务。
+         *
+         * <p>参数说明: 无。
+         *
+         * 返回: 无返回值；返回时不再向业务 consumer 投递新消息，不等待外部容器。
+         */
+        @Override
+        public void close() {
+            active.set(false);
+            if (!removalRequested.compareAndSet(false, true)) return;
+            owner.detachListenerRegistration(this);
+        }
     }
 
     /**
@@ -7173,6 +8078,23 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean {
         Objects.requireNonNull(stream);
         Objects.requireNonNull(group);
         return redisTemplate.opsForStream().pending(stream, group);
+    }
+
+    /**
+     * 业务作用：读取指定消费组成员的一页 PEL 明细，供接管方按消息真实 idle 计算下一次安全扫描时间。
+     *
+     * @param stream Stream 键
+     * @param consumer 消费组与成员身份
+     * @param count 最大返回条数
+     * @return 按消息 ID 排序的待处理明细；没有记录时返回空集合。
+     */
+    public PendingMessages xPending(String stream, org.springframework.data.redis.connection.stream.Consumer consumer,
+                                    long count) {
+        Objects.requireNonNull(stream);
+        Objects.requireNonNull(consumer);
+        if (count < 1) throw new IllegalArgumentException("pending count must be greater than zero");
+        return redisTemplate.opsForStream().pending(
+                stream, consumer, org.springframework.data.domain.Range.unbounded(), count);
     }
 
     /**

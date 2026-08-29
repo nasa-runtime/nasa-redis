@@ -1,24 +1,61 @@
 # nasa-redis
 
+> 名称声明：本项目是独立开源项目，与美国国家航空航天局不存在隶属、赞助、背书或官方项目关系；
+> 详见 [NOTICE](NOTICE)。
+
 面向 JDK 21 的 Redis 基础设施库。核心能力是基于 Redis Cluster 的无中心分布式任务调度：
 通过 `@RedisJob` 声明 Cron、fixed rate、fixed delay 或手工任务，以持久 Run、租约、fencing token、
 Stream 派发和 `XAUTOCLAIM` 完成故障恢复；根任务还可以按实际具备某个 Worker 能力的节点冻结快照，
 向全体目标一对一 Fanout 分片，并对通知回执、重发、重分配、取消和聚合终态负责。
 
+另一项核心能力是 [RedisPartition](REDIS-PARTITION.md)：按稳定业务键把消息路由到固定 Redis Stream 分区，
+以每分区独占锁、Redis 服务端时间成员心跳、通知加周期再平衡、`XAUTOCLAIM` 和 ACK fencing，保证集群中
+同一分区任一时刻只有一个有效消费 owner；节点扩缩容、进程退出或租约失效后由其它实例接管未确认消息。
+
 组件同时提供 `RedisProxy` 命令代理及面向余额、额度等资金字段的 nonce 幂等计数，默认在 7 天窗口内保证
-同一业务事件最多改变一次计数；此外还包括轻量分布式锁、Stream 分区消费、RediSearch 查询 DSL、
-显式批量 Pipeline、雪花 ID 与集群缓存失效通知。
+同一业务事件最多改变一次计数；此外还包括轻量分布式锁、RediSearch 查询 DSL、显式批量 Pipeline、
+雪花 ID 与集群缓存失效通知。
 
 ```xml
 <dependency>
     <groupId>io.github.nasa-runtime</groupId>
     <artifactId>nasa-redis</artifactId>
-    <version>2.0.0</version>
+    <version>2.0.1</version>
 </dependency>
 ```
 
 要求 JDK 21+、Maven 3.6.3+。RedisJob 默认使用 Redis 7+ 的 Sharded Pub/Sub；选择
 `BROADCAST` 降级模式时最低要求 Redis 6.2，并需要评估普通 Pub/Sub 在 Cluster 总线上的放大量。
+
+## 核心价值与运行架构
+
+nasa-redis 把 Redis Cluster 的原子脚本、服务端时间、Stream、Pub/Sub 和稳定键空间组合成应用内控制面，
+让业务在不部署独立调度中心或分区协调服务的前提下获得可判定的执行权、可接管的待处理工作与按数据源隔离
+的运行时。它负责控制权收敛和 Redis 内状态顺序，不替业务推导容量、保证外部系统事务或生成业务幂等键。
+
+```text
+Spring 应用实例
+├─ @EnableRedis ─────▶ RedisProxy（命令、Pipeline、Search、nonce、锁）
+├─ @EnableRedisJob ──▶ 按 qualifier 隔离的 Scheduler
+│                      定义/Run/租约 ─▶ Dispatch Stream ─▶ attempt fencing
+└─ RedisPartition ───▶ 稳定业务键 ─▶ Stream 分区 ─▶ 独占 owner ─▶ ACK fencing
+
+Redis Cluster
+├─ Redis TIME：租约、心跳与过期判断的统一时间依据
+├─ 同 slot Lua：在一次原子提交中复验权威并发布持久状态
+├─ Stream + PEL：承载至少一次交付、重试与失联接管
+└─ Pub/Sub：只发送唤醒通知；丢失后由持久索引和周期扫描收敛
+```
+
+控制面遵守“先持久提交、后发送通知”和“每次副作用前复验执行权”的顺序。RedisJob 的旧 attempt 无法续期或
+提交终态，RedisPartition 的旧 owner 无法确认新 epoch 下的消息；Redis 结局不明、角色变化或配置冲突时，
+运行时关闭对应入口并等待权威状态收敛。对外部数据库、支付接口等 Redis 之外的副作用，调用方仍须使用稳定
+业务键实现幂等，并根据至少一次交付语义处理重复调用。
+
+组件明确不提供跨 Redis slot 事务、外部系统 exactly-once、自动容量证明、业务消息模式推断或旧键布局在线
+迁移。运维侧应结合 RedisJob 的 Run/lease/Fanout 指标与 RedisPartition 的 owner epoch、PEL、接管和积压
+指标设置告警；具体指标、健康条件和失败语义分别见 [REDIS-JOB.md](REDIS-JOB.md) 与
+[REDIS-PARTITION.md](REDIS-PARTITION.md)。
 
 RedisJob 是显式、按数据源启用的运行时：`@EnableRedis` 只建立 RedisProxy 等基础能力；业务还必须添加
 `@EnableRedisJob` 并设置 `nasa.redis.job.enabled=true`。每个 `@RedisJob` 都必须声明 `qualifier`，编程式
@@ -106,6 +143,10 @@ RedisJob 不选举应用主节点，也不依赖数据库调度中心。多个�
 - **同名任务默认集群串行**：`SERIAL_QUEUE` 在 Redis 中按任务身份占用唯一执行槽；fixed rate 的后续 Run 可以持久排队，但不会在前一 attempt 仍运行时提交第二个业务 Handler。
 - **至少一次恢复**：派发消息、可见性索引、租约索引和 `XAUTOCLAIM` 共同覆盖进程退出与响应丢失，因此 Handler 必须幂等。
 - **定义冲突不按启动顺序裁决**：同名任务的修订号与规范摘要持久化；相同修订号但不同定义会进入冲突并停止触发。
+- **执行器心跳不会越权扩租**：每条逻辑心跳把请求 ID、状态、在途数与已确认 `heartbeatRevision` 绑定；响应丢失只重发原载荷，状态迁移会在旧请求取得结局后使用新 ID 完成发布，在途数变化由下一周期采样，过期但尚未回收的记录不能重新续期。
+- **权威不明时准入关闭**：启动和 `activate()` 只在 Redis 确认 `ACTIVE` 后才开放 Fanout 与普通 Dispatcher；心跳或开放步骤的结果不确定时，两个本地入口立即关闭并以 `DRAINING` 为收敛目标，后续心跳不会自行重开。
+- **已授予执行权必须收敛**：Redis 已返回 `STARTED` / `ADOPTED` 后，本地 Handler 执行器即使拒绝提交或抛出 `Error`，当前回调也会同步接管完成出口；在途、容量和去重账目只由执行路径的 `finally` 统一释放。
+- **能力变更失败即撤销 source**：动态能力登记、过期后的全量能力重建或删除后的能力撤销一旦结局不明，当前 source 永久关闭准入并进入全量 Registry 注销；调用方需重建运行时，不能在可能仍为 `ACTIVE` 的半登记成员上继续服务。
 - **Fanout 只选择兼容节点**：目标必须登记同一 Worker、`contractRevision`、`schemaId` 和 `codec`，没有该能力的 Java、Go 或 Rust 节点不会收到分片。
 - **稳定分片幂等键**：`executionKey` 在通知重发、执行重试和 assignment 重建期间保持不变；每次重建都会递增 `assignmentEpoch`，包括换节点和原稳定节点出现新启动或心跳证据后的恢复。
 - **跨语言 JSON 不携带 JVM 类型信息**：Job 使用独立 Jackson 映射器，强制关闭 Default Typing，并拒绝 `@class` / `@type` 字段。
@@ -160,6 +201,30 @@ source 建立运行时；编程式任务在首次调用 `RedisJobSchedulers.sche
 `drain()` / `activate()` 是单个 `RedisJobScheduler` 的控制入口，不是管理器的全数据源广播操作。
 管理器同时承载静态门面的生命周期权威：一个 JVM 同一时刻只允许一套活动管理器，第二个并行应用上下文会
 在初始化时被拒绝；容器关闭后静态入口立即失效，不能持有旧 Scheduler 跨上下文继续使用。
+`stop()` / `close()` 提交不可逆关闭后，同一实例新发起的 `start()`、`register()`、`drain()` 和 `activate()`
+都会在定义持久化、本地接线或 ACTIVE 发布前拒绝；已经进入 Redis 往返的控制调用可以取得原请求结局，但返回后
+必须复验终态，不再接线 Handler、登记能力或开放本地准入。并发的重复停机会等待同一次首次停机结果；Spring 完成回调只在
+Handler 退出且所有权资源完成最终收口后执行，不能让容器先销毁迟到任务仍依赖的 Redis 连接。普通与 Fanout 派发共享 pre-start
+在途屏障；Redis 已授予 attempt 的迟到回包先登记为 Handler
+在途再进入排空，避免 `awaitIdle` 在两份账目之间观察到零。pre-start 或 Handler 未在共享截止内排空时，有界 `stop()` 立即发布稳定失败并暂时保留
+派发控制、续租器与 `DRAINING` Registry 成员，不会继续注销而留下孤儿 `RUNNING`。唯一 final-cleanup continuation 继续等待权威工作归零，随后关闭
+普通与 Fanout 派发、监视任务、续租器并注销成员；continuation 无法启动时由当前停机线程接管，不能遗失唯一收口权。
+最终资源边界没有第二个超时时限，也不会把线程中断解释为资源已经结束：尚未开始的扫描、超时和续租调度在执行器关闭时取消，
+已经开始的回调必须实际退出后才能注销 Registry 并发布最终完成。这个边界保证资源安全而不保证强制终止；Handler 必须协作结束，
+否则 callback/`close()` 可以超过 `max-run-duration-ms` 持续等待。最终失败单独记录，不改写首次停机结果。
+`SmartLifecycle` callback 和作为 Spring destroy method 的 `close()` 都等待最终收口，防止 lifecycle phase 超时后下层 Redis 连接被提前销毁；
+`close()` 完成等待后仍交还首次稳定失败。安全排空完成后的单个资源关闭失败仍会尝试其它关闭步骤并返回汇总结果；Stream container、Pub/Sub listener/连接和 Registry 注销都会保留未决坐标并继续重试，只有容器非运行、订阅已确认撤销且成员确认不存在后才发布 final。完整停机后
+必须由新应用上下文建立新 Scheduler。Spring 实际托管的 `RedisJobSchedulers` 管理器遵守同一回调边界：任一 source
+在首次期限内未排空时，管理器先发布稳定停机失败，再异步等待所有 source 的最终收口。管理器从构造时起永久追踪每个 Scheduler；运行期启动失败的动态 source 即使已退出公开路由，也必须进入同一 final 快照。只有底层 listener、执行器、续租器和
+Registry 都结束后才执行完成回调；管理器 `close()` 同样在全部 source 最终收口后才允许 Spring 销毁其 RedisProxy 依赖。
+回调属于当前调用方，其异常不改写各 source 已发布给其它等待者的资源停机结果。
+管理器先在生命周期锁外发布单调终态并封闭当前全部
+source 的本地 Dispatcher/Fanout 准入，再取得稳定 Scheduler 快照；即使顺序启动中的后一个 source 阻塞 Redis，
+已经开放的 source 也会立即关门。随后按 source 并行发布
+`DRAINING`、排空 pre-start 与已持权 Handler 并释放资源。因此慢 source 不会让其它 source 继续领取，在途 Handler 查询公开静态入口时
+也能立即观测停机终态，而不会与管理器排空形成反向等待。该本地关门权威不取得 Scheduler monitor，也不等待 Redis；
+先前进入的启动、登记或激活调用退出后，资源阶段才继续注销。管理器对首次收口的 source 快照、完成信号和失败结果保持稳定，
+即使 `close()` 已清空公开 source 路由，后续 `stop()` / `close()` 仍等待并交还同一资源结果，不能把仍存活的底层资源报告为成功。
 
 ```java
 @SpringBootApplication
@@ -307,6 +372,9 @@ Map<String, Long> metrics = scheduler.metrics().snapshot();
 `requestId` 是手工触发的幂等键。`pause` 停止新触发与尚未 start 的积压，不撤销已经取得的 attempt；
 取消是协作式的。调度器启动后到首次成功心跳之间 `health()` 可能短暂返回 `DEGRADED`，最长为一个
 `heartbeat-ms` 周期；接入 readiness 时应保留相应启动宽限，并把 `DRAINING` 与 `DOWN` 分开处理。
+启动时没有任务定义的 Scheduler 保持 `DRAINING`，第一个动态定义完成 Registry 登记和 ACTIVE 确认后
+才开放本地派发入口。首次动态登记与 `drain()` / `activate()` 按同一生命周期序列执行；`drain()` 成功
+返回后，尚未完成的登记不能再凭旧开门资格恢复本地准入。
 
 #### 多数据源
 
@@ -408,36 +476,42 @@ try {
 }
 ```
 
-`getLock` 返回的锁实例来自对象池，**`unlock()` 之后即被回收，不可再次 `lock()`**——同一个临界区要重入请在 `unlock()` 前重复 `lock()`。锁不实现 `AutoCloseable`，不能用 try-with-resources。
+`getLock` 返回永久绑定当前 Redis 数据源与业务 key 的稳定 `Lock`。完整 `unlock()` 后可以继续用同一引用
+再次 `lock()`，也可以由多个线程按标准 `Lock` 语义竞争；重入仍要求同一线程成对释放。非 owner 调用
+`unlock()` 会抛出 `IllegalMonitorStateException`，不会停止真实 owner 的看门狗或破坏其本地状态。
+锁不实现 `AutoCloseable`，不能用 try-with-resources。
 
 - 加锁、解锁、续期各一个 Lua 脚本，在 Redis 端原子执行；
 - **可重入**：用 Redis Hash 记录（key = 锁名，field = 持有者标识，value = 重入次数）；
 - **看门狗续期**：持锁期间由 `TimingWheel` 定时延长 TTL，避免业务没做完锁先过期；
 - **持有者标识 = JVM 实例 ID + 线程 ID**，跨节点与跨线程都唯一；
-- 锁实例走对象池回收，高并发下不产生锁对象垃圾。
+- 未取得锁的线程共享释放频道订阅，收到解锁通知后立即重试，并以剩余 TTL 作为通知丢失时的等待上限；
+- 看门狗任务名包含 Redis 数据源、锁入口会话、完整 key、公开句柄和 holder，多数据源同名锁不会覆盖续期任务。
 
 ### Stream 分区消费 —— 独占分区与故障接管
 
-N 个分区 stream 共享一组消费者组，每个分区由分布式锁独占：抢到锁的节点执行 `XAUTOCLAIM` + `XREADGROUP` 消费该分区。节点增减时分区自动重新分配。
+RedisPartition 把稳定业务键映射到 N 条 Redis Stream，每条 Stream 由一个分布式锁独占。当前 owner 先用
+`XAUTOCLAIM` 接管已达到空闲阈值的 PEL，再用 `XREADGROUP` 读取新消息；处理成功且 ACK 前复验锁权威。
+同键在分区数和命名空间不变时落入同一分区，不同分区可以并行。该能力提供至少一次交付与分区内串行入口，
+不替外部数据库、HTTP 或其它系统提供 exactly-once，业务回调必须幂等。
 
 ```yaml
 nasa:
   redis:
     properties:
-      primary:                          # 分区配置挂在数据源的 stream 节点下
+      primary:
         stream:
           partition:
-            enabled: true               # 总开关，不开则整套分区消费不启动
-            default-group: SINGLE-CONSUME
-            count: 64                   # 默认共享组的分区数
-            rebalance-ms: 10000
-            min-idle-ms: 30000
-            holds-check-interval-ms: 5000   # holds 自检最小间隔，限流以免 NOBLOCK 空轮询打爆 EVAL
+            enabled: true
             groups:
-              contract:settlement:      # → stream = SINGLE-CONSUME:contract:settlement:0..63
+              settlement:
                 count: 64
+                topics: [contract:settlement, spot:settlement]
                 batch-size: 200
 ```
+
+除 `enabled: true` 和实际使用的隔离组 `count` 外，其它字段都可以省略并采用内置默认值。默认共享组无需声明
+`groups`；完整配置、默认值、参数约束和滚动变更边界见 [REDIS-PARTITION.md](REDIS-PARTITION.md)。
 
 消费侧实现 `RedisEventBatchListener`（或 Single 形态）并把 `mode()` 标成 `ConsumeMode.PARTITION`，注册为 Bean 即可——分区 stream 与消费组由 `RedisProxy` 在初始化阶段按 listener 声明的 topic 自动建好，业务侧不需要显式调 `init` / `isolate`：
 
@@ -450,26 +524,14 @@ public class SettlementListener implements RedisEventBatchListener<Order> {
     @Override public void onEvent(List<Order> orders) { ... }   // 同分区串行
 }
 
-// 发布：分区键决定落到哪个分区，同键必然同分区、同节点、同线程串行
-RedisPartition.load(redisProxy).publish("contract:settlement", "open-position", uid, order);
+// 发布：分区数与命名空间不变时，同一个 uid 始终落入同一分区
+redisProxy.partition("contract:settlement", "open-position", uid, order);
 ```
 
-`XAUTOCLAIM` 保证节点宕机后其未 ACK 的消息会被其它节点接管，**因此消费逻辑必须幂等**。
-
-再平衡按 `分区数 / 存活节点数` 计算每节点的持有上限，存活节点数由各节点在 `{stream前缀}:nodes`
-这个 ZSET 上心跳续约得出，死节点在三个再平衡周期内被自动剔除。
-
-**同机多实例必须隔离节点标识**。节点标识来自 `ME.sequence()`，它把 16 位标识持久化在
-`logging.file.path`（未配置时为 `logs/<nasa.application.name>`）下的 `sequence` 文件里。
-同一台机器上的多个实例若共用该目录，会读到同一个标识，存活节点数因而恒为 1，
-表现为**第一个起来的实例抢光全部分区、其余实例空转**。同机部署多实例时给每个实例配独立目录：
-
-```bash
-java -Dnasa.sequence.dir=/data/app-1/seq -jar app.jar
-# 或各实例配不同的 logging.file.path
-```
-
-一机一实例（容器、独立主机）的部署不受此影响。
+节点身份由应用名、节点序号和每次运行生成的 UUID 组成，同机多进程与同一 JVM 的多个应用上下文不会合并成
+一个成员。每个分区组独立使用 Redis `TIME` 维护成员 ZSET，并按 `ceil(分区数 / 存活节点数)` 限制单节点持有量；
+上线、释放和优雅下线通知用于立即唤醒再平衡，周期任务负责在 Pub/Sub 通知不可达时继续收敛。进程突然退出时，
+成员通常在三个再平衡周期后被剔除，但真正接管仍必须等待原分区锁租期失效。
 
 ### 普通 Stream 消费与保留期
 
@@ -595,8 +657,11 @@ mvn -B -ntp clean verify
 ## 相关文档
 
 - RedisJob 的完整状态机、配置与运维边界见 [REDIS-JOB.md](REDIS-JOB.md)。
+- RedisPartition 的路由、集群收敛、配置、交付语义与运维边界见 [REDIS-PARTITION.md](REDIS-PARTITION.md)。
 - 贡献方式见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 - 安全问题报告方式见 [SECURITY.md](SECURITY.md)。
+- 公开归档与 registry 交付要求见 [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md)。
+- 项目名称及独立性声明见 [NOTICE](NOTICE)。
 
 ## 许可证
 

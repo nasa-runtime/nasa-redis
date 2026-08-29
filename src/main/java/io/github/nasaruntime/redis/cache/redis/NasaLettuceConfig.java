@@ -413,9 +413,10 @@ public class NasaLettuceConfig {
      *             enabled: true           # 分区消费总开关
      *             default-group: SINGLE-CONSUME  # 命名空间前缀, 也是默认共享组的 group 名
      *             count: 64               # 默认共享组的分区数
-     *             rebalance-ms: 10000
+     *             rebalance-ms: 3000
      *             min-idle-ms: 30000
-     *             holds-check-batches: 10
+     *             holds-check-interval-ms: 5000
+     *             drain-timeout-ms: 5000
      *             groups:                 # 隔离组配置, key 用业务逻辑短名 (不要带 default-group 前缀)
      *               contract:settlement:  # → 实际 stream = SINGLE-CONSUME:contract:settlement:0..63
      *                 count: 64
@@ -446,7 +447,7 @@ public class NasaLettuceConfig {
         /* 默认共享组的分区数. 业务调 RedisPartition.init() 不传 count 时用这个 */
         private int count = 64;
         /* 再平衡周期 ms (按 fair = count / aliveNodes 重新均摊持有的分区数) */
-        private long rebalanceMs = 10_000;
+        private long rebalanceMs = 3_000;
         /* XAUTOCLAIM 接管 pending 的最小 idle 时间 ms, 与 LettuceDistributedLock 的 leaseTime 对齐, 默认 30s */
         private long minIdleMs = 30_000;
         /* holds() 自检最小间隔 ms (防长 GC / 业务长跑后锁丢失). 默认 5s, 远小于 lease=30s */

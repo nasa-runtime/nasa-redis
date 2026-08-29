@@ -12,12 +12,12 @@ public enum ConsumeMode {
 
     /**
      * 仅走 RedisProxy.subscribe — 普通流共享 group, 多 consumer 并行 (高吞吐)。
-     * 默认模式, 与改造前行为完全一致。
+     * 默认模式，不建立 RedisPartition 分区认领运行时。
      */
     PROXY,
 
     /**
-     * 仅走 RedisPartition — per-partition 串行, 集群级同 partition 单节点 (强一致)。
+     * 仅走 RedisPartition — per-partition 串行，集群中同一分区只有一个有效消费 owner。
      * <p>
      * 业务侧 publish 时必须用 {@link RedisPartition#publish(String, String, long, Object)}
      * (或 String partition 重载), 而不是 RedisProxy.publish/xAdd 直发 stream key。

@@ -6,6 +6,7 @@ import org.springframework.context.SmartLifecycle;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
@@ -13,7 +14,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -45,8 +46,11 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     private final RedisJobFanoutCoordinator fanoutCoordinator;
     private final RedisJobFanoutMonitor fanoutMonitor;
     private final RedisJobLeaseRenewer leaseRenewer;
+    private final RedisJobPreStartBarrier preStartBarrier;
     private final RedisJobDispatcher dispatcher;
     private final RedisJobFanoutDispatcher fanoutDispatcher;
+    private final RedisJobAdmissionController admission;
+    private final ContinuationStarter finalCleanupStarter;
     private final ScheduledExecutorService monitors;
     private final AtomicLongArray fanoutIndexEpochs;
     private final RedisJobMetrics metrics = new RedisJobMetrics();
@@ -57,18 +61,45 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicBoolean draining = new AtomicBoolean();
+    private final AtomicBoolean awaitingInitialRegistration = new AtomicBoolean();
     private final AtomicBoolean layoutConfirmed = new AtomicBoolean();
+    private final CountDownLatch stopPrepared = new CountDownLatch(1);
+    private final AtomicBoolean shutdownStarted = new AtomicBoolean();
+    private final CountDownLatch stopCompleted = new CountDownLatch(1);
+    private final AtomicBoolean finalCleanupStarted = new AtomicBoolean();
+    private final CountDownLatch finalCleanupCompleted = new CountDownLatch(1);
     private final AtomicLong lastHeartbeatAt = new AtomicLong();
     private final AtomicLong lastScheduleScanAt = new AtomicLong();
+    private volatile Throwable stopPreparationFailure;
+    private volatile Throwable stopFailure;
+    private volatile Throwable finalCleanupFailure;
 
     /**
      * 业务作用：按指定 RedisProxy 建立完整调度运行时，但在 Spring 生命周期 start 前不领取任务。
+     *
+     * <p>返回：创建完成依赖装配但尚未领取任务的调度运行时。
      *
      * @param redisProxy Redis 命令代理
      * @param properties Job 配置
      */
     public RedisJobScheduler(RedisProxy redisProxy, RedisJobProperties properties) {
+        this(redisProxy, properties, RedisJobScheduler::startVirtualContinuation);
+    }
+
+    /**
+     * 业务作用：建立可替换 continuation 调度策略的完整运行时，使线程资源不可用时仍能由停机调用方接管所有权。
+     *
+     * <p>返回：创建绑定指定 continuation 策略、尚未开放准入的调度运行时。
+     *
+     * @param redisProxy         Redis 命令代理
+     * @param properties         Job 配置
+     * @param finalCleanupStarter final-cleanup continuation 启动策略
+     */
+    RedisJobScheduler(RedisProxy redisProxy, RedisJobProperties properties,
+                      ContinuationStarter finalCleanupStarter) {
         this.properties = Objects.requireNonNull(properties, "properties must not be null").validate();
+        this.finalCleanupStarter = Objects.requireNonNull(
+                finalCleanupStarter, "finalCleanupStarter must not be null");
         this.visibleScanUpperBoundMs = this.properties.getMaxScanIntervalMs();
         // source id 必须来自调用方实际选中的 RedisProxy，而不是另一份可漂移的配置字段；这样键前缀、
         // 物理连接和上下文声明天然绑定同一来源，也不存在遗漏配置后回退 primary 的路径。
@@ -85,11 +116,13 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
         this.fanoutCoordinator = new RedisJobFanoutCoordinator(
                 properties, keys, scripts, registry, jsonCodec, fanoutMonitor::requestCancel);
         this.leaseRenewer = new RedisJobLeaseRenewer(properties, keys, scripts, registry.executorId());
+        this.preStartBarrier = new RedisJobPreStartBarrier();
         this.dispatcher = new RedisJobDispatcher(selected, properties, keys, repository, jsonCodec,
-                fanoutCoordinator, registry, leaseRenewer, metrics);
+                fanoutCoordinator, registry, leaseRenewer, metrics, preStartBarrier);
         this.fanoutDispatcher = new RedisJobFanoutDispatcher(selected, properties, keys, scripts, registry,
-                jsonCodec, fanoutMonitor::onReceiptSignal, leaseRenewer, metrics);
-        this.monitors = Executors.newScheduledThreadPool(4,
+                jsonCodec, fanoutMonitor::onReceiptSignal, leaseRenewer, metrics, preStartBarrier);
+        this.admission = new RedisJobAdmissionController(dispatcher, fanoutDispatcher, registry, draining);
+        this.monitors = RedisJobShutdownSupport.scheduledExecutor(4,
                 Thread.ofPlatform().daemon().name("redis-job-monitor-", 0).factory());
         this.fanoutIndexEpochs = new AtomicLongArray(keys.fanoutBucketCount());
         this.repository.setVisibleWakeup(this::wakeVisible);
@@ -98,18 +131,36 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     }
 
     /**
+     * 业务作用：使用虚拟线程承载迟到权威工作的最终资源收口，不占用平台线程池容量。
+     *
+     * @param threadName 线程名
+     * @param task       final-cleanup 任务
+     * @return 无返回值；线程无法建立或启动时抛出原异常，由当前停机调用方接管。
+     */
+    private static void startVirtualContinuation(String threadName, Runnable task) {
+        Thread.ofVirtual().name(threadName).start(task);
+    }
+
+    /**
      * 业务作用：登记任务定义与 Handler；相同修订号的本地冲突在写 Redis 前立即拒绝。
+     *
+     * <p>登记与 start、drain、activate 共用 Scheduler 生命周期锁，保证空定义判断、首次开门资格和
+     * 显式关门按调用完成顺序线性化。
+     *
+     * <p>返回：无返回值；Scheduler 已关闭、定义冲突或 Redis 拒绝登记时抛出异常；能力登记结局不明时
+     * 当前 source 永久关门并进入统一注销收口，调用方需重建运行时。
      *
      * @param definition 任务定义
      * @param handler    Handler
-     *                   返回：无返回值；定义冲突或 Redis 拒绝登记时抛出异常。
      */
-    public void register(RedisJobDefinition definition, RedisJobHandler handler) {
+    public synchronized void register(RedisJobDefinition definition, RedisJobHandler handler) {
+        requireOpen();
         Objects.requireNonNull(definition, "definition must not be null");
         Objects.requireNonNull(handler, "handler must not be null");
         // 布局门禁必须早于任何定义写入: 分片数或桶数不一致的节点若先写了定义,
         // 同一任务就形成两份定义与两套调度时刻, 之后只能人工对账
         confirmLayout();
+        requireOpen();
         RedisJobDefinition current = definitions.get(definition.name());
         if (current != null && current.definitionRevision() == definition.definitionRevision()
                 && !current.definitionDigest().equals(definition.definitionDigest())) {
@@ -117,7 +168,10 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
         }
         if (current != null && current.definitionRevision() > definition.definitionRevision()) return;
         long nextFireAt = initialNextFireAt(definition);
+        requireOpen();
         String code = repository.register(definition, nextFireAt);
+        // Redis 往返期间停机可独立发布；返回后必须先复验终态，不能再接线 Handler 或恢复本地准入。
+        requireOpen();
         if (!"OK".equals(code) && !"ADOPTED".equals(code)) {
             throw new IllegalStateException("RedisJob definition rejected: " + code);
         }
@@ -128,7 +182,25 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
         fanoutMonitor.register(definition);
         dispatcher.register(definition, handler);
         if (definition.trigger() == RedisJobTrigger.FANOUT_ONLY) fanoutDispatcher.register(definition, handler);
-        if (running.get()) registry.register(definition);
+        if (running.get()) {
+            boolean openAfterRegister = awaitingInitialRegistration.get();
+            try {
+                requireOpen();
+                registry.register(definition);
+                requireOpen();
+                if (openAfterRegister) {
+                    // 首次动态定义只有在能力登记与本地开门全部完成后才消费等待资格；异常时保留资格，
+                    // 后续登记仍可重试，而 drain() 与本段共用生命周期锁，不会在返回后被旧资格重新开门。
+                    admission.open();
+                    requireOpen();
+                    awaitingInitialRegistration.set(false);
+                }
+            } catch (RuntimeException | Error failure) {
+                failClosedAdmission(failure);
+                terminateAfterAuthorityFailure(failure);
+                throw failure;
+            }
+        }
     }
 
     /**
@@ -184,9 +256,9 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
      *
      * @param jobName  任务名
      * @param revision 删除修订号
-     *                 返回：无返回值；修订号落后或任务不存在时抛出异常。
+     *                 返回：无返回值；修订号落后或任务不存在时抛出异常；能力撤销未确认时永久关闭当前 source。
      */
-    public void delete(String jobName, long revision) {
+    public synchronized void delete(String jobName, long revision) {
         RedisJobDefinition definition = requireDefinition(jobName);
         if (revision < definition.definitionRevision()) {
             throw new IllegalArgumentException("delete revision must not be smaller than current definition revision");
@@ -208,7 +280,54 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
         fanoutDispatcher.unregister(definition, fanoutStillUsed);
         fanoutCoordinator.unregister(definition, fanoutStillUsed);
         if (definition.trigger() == RedisJobTrigger.FANOUT_ONLY && !fanoutStillUsed) {
-            registry.removeCapability(definition.workerName());
+            try {
+                // Handler 已从本地路由移除后必须取得 Redis 撤权确认；结局不明时整个 source 转入停机，
+                // DRAINING 与全量注销共同阻止没有 Handler 的能力继续进入新快照。
+                registry.removeCapability(definition.workerName());
+            } catch (RuntimeException | Error failure) {
+                failClosedAdmission(failure);
+                terminateAfterAuthorityFailure(failure);
+                throw failure;
+            }
+        }
+    }
+
+    /**
+     * 业务作用：在注册表写入或撤权结局不明时永久封闭 source，并复用停机序列完成全量注销补偿。
+     *
+     * @param cause 原始控制面失败，用于附加停机阶段证据
+     * @return 无返回值；停机失败附加到原异常，原调用方仍收到首个控制面失败。
+     */
+    private void terminateAfterAuthorityFailure(Throwable cause) {
+        prepareStop();
+        try {
+            stop();
+        } catch (RuntimeException | Error shutdownFailure) {
+            cause.addSuppressed(shutdownFailure);
+        }
+    }
+
+    /**
+     * 业务作用：监视线程发现能力重建结局不明时提交永久关门，并把可能阻塞的资源收口移交独立线程。
+     *
+     * @param cause 能力重建失败，用于保留停机编排证据
+     * @return 无返回值；线程无法建立时由当前线程接管同一停机序列。
+     */
+    private void terminateAfterAuthorityFailureAsync(Throwable cause) {
+        prepareStop();
+        Runnable cleanup = () -> {
+            try {
+                stop();
+            } catch (RuntimeException | Error shutdownFailure) {
+                cause.addSuppressed(shutdownFailure);
+                log.error("RedisJob authority withdrawal cleanup failed: source={}", keys.qualifier(), shutdownFailure);
+            }
+        };
+        try {
+            Thread.ofVirtual().name("redis-job-authority-withdrawal-" + keys.qualifier()).start(cleanup);
+        } catch (RuntimeException | Error startFailure) {
+            cause.addSuppressed(startFailure);
+            cleanup.run();
         }
     }
 
@@ -416,24 +535,66 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     }
 
     /**
+     * 业务作用：在任何登记或生命周期副作用前拒绝已永久关闭的 Scheduler。
+     *
+     * <p>参数说明: 无。
+     *
+     * <p>返回：Scheduler 仍可用时无返回值；已关闭时抛出稳定异常。
+     */
+    private void requireOpen() {
+        // closed 在生命周期锁内单调发布；旧引用必须在持久写和本地接线前停止。
+        if (closed.get()) throw new IllegalStateException("RedisJobScheduler is closed");
+    }
+
+    /**
+     * 业务作用：确认 Scheduler 正在运行，防止无心跳和注册表维护的实例开放本地准入。
+     *
+     * <p>参数说明: 无。
+     *
+     * <p>返回：Scheduler 可接受显式激活时无返回值；已关闭或未运行时抛出稳定异常。
+     */
+    private void requireRunning() {
+        requireOpen();
+        if (!running.get()) throw new IllegalStateException("RedisJobScheduler is not running");
+    }
+
+    /**
      * 业务作用：启动 Fanout 通知门禁、能力登记、普通派发和所有持久索引监视器。
+     *
+     * <p>启动期间独占 Scheduler 生命周期锁，避免动态登记落在空定义判断与等待标记发布之间。
      *
      * <p>参数说明: 无。
      * <p>
      * 返回：无返回值。
      */
     @Override
-    public void start() {
-        if (closed.get()) throw new IllegalStateException("RedisJobScheduler is closed");
-        // 没有任何注解任务的节点也要过门禁: 它仍会登记执行器能力并参与 Fanout 快照
+    public synchronized void start() {
+        requireOpen();
+        // 没有任何定义的节点也要确认布局，但在首个 Handler 完成能力登记前不得领取任务。
         confirmLayout();
+        requireOpen();
         if (!running.compareAndSet(false, true)) return;
         try {
-            draining.set(false);
+            // 能力登记与 ACTIVE 心跳都是启动重路，完整确认前两类本地准入必须保持关闭。
+            admission.prepare();
             metrics.gauge("redis_job_executor_capacity", properties.getExecutorCapacity());
             fanoutDispatcher.start();
-            definitions.values().forEach(registry::register);
+            requireOpen();
+            for (RedisJobDefinition definition : definitions.values()) {
+                requireOpen();
+                registry.register(definition);
+                // 单次能力登记的 Redis 回包不能覆盖并发提交的永久关闭。
+                requireOpen();
+            }
             dispatcher.start();
+            requireOpen();
+            if (definitions.isEmpty()) {
+                awaitingInitialRegistration.set(true);
+            } else {
+                admission.open();
+                requireOpen();
+            }
+            requireOpen();
             monitors.scheduleWithFixedDelay(this::safeHeartbeat, properties.getHeartbeatMs(),
                     properties.getHeartbeatMs(), TimeUnit.MILLISECONDS);
             monitors.schedule(this::scheduleScanCycle, 0L, TimeUnit.MILLISECONDS);
@@ -455,10 +616,15 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
             // 保留 running=true 会让健康检查报告正在运行，而能力登记、Dispatcher 或监视循环其实只起了一部分，
             // 该节点既不领任务也不会被外部发现异常。
             running.set(false);
-            try {
-                stop();
-            } catch (RuntimeException | Error ignored) {
-                // 回滚期间的停机失败不能顶替真正的启动失败原因
+            awaitingInitialRegistration.set(false);
+            // 并发停机已经取得唯一资源 owner 时，由该 owner 等待本方法退出后继续收口；
+            // 当前线程不能在持有 Scheduler monitor 时反向等待同一个完成信号。
+            if (!closed.get()) {
+                try {
+                    stop();
+                } catch (RuntimeException | Error ignored) {
+                    // 回滚期间的停机失败不能顶替真正的启动失败原因
+                }
             }
             throw error;
         }
@@ -906,13 +1072,37 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     }
 
     /**
-     * 业务作用：隔离心跳异常，保留后续周期恢复机会。 返回：无返回值。
+     * 业务作用：执行周期心跳；权威结果不确定时立即关闭本地准入并转入 DRAINING。
+     *
+     * <p>参数说明: 无。
+     * <p>
+     * 返回：无返回值；异常由监视线程记录，任务准入保持关闭。
      */
     private void safeHeartbeat() {
-        safely("heartbeat", () -> {
+        // 空定义 Scheduler 没有可登记权威，保持 DRAINING 等待首个 Handler，不把预期的 NOT_FOUND 当成运行异常。
+        if (!running.get() || awaitingInitialRegistration.get()) return;
+        try {
             heartbeat();
             lastHeartbeatAt.set(System.currentTimeMillis());
-        });
+        } catch (Throwable failure) {
+            failClosedAdmission(failure);
+            log.error("RedisJob heartbeat authority became uncertain; task admission is closed", failure);
+        }
+    }
+
+    /**
+     * 业务作用：心跳或重登记结局不明时尽力封闭所有新任务入口。
+     *
+     * <p>返回：无返回值；关门失败作为 suppressed 证据附加到原异常。
+     *
+     * @param cause 原始权威失败
+     */
+    private void failClosedAdmission(Throwable cause) {
+        try {
+            admission.close();
+        } catch (RuntimeException | Error closingFailure) {
+            cause.addSuppressed(closingFailure);
+        }
     }
 
     /**
@@ -1120,7 +1310,22 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
             registry.heartbeat();
         } catch (IllegalStateException error) {
             if (error.getMessage() == null || !error.getMessage().contains("registration expired")) throw error;
-            definitions.values().forEach(registry::register);
+            List<RedisJobDefinition> currentDefinitions = definitions.values().stream()
+                    .sorted(Comparator.comparing(RedisJobDefinition::name))
+                    .toList();
+            if (currentDefinitions.isEmpty()) {
+                throw new IllegalStateException("RedisJob executor registration expired without definitions", error);
+            }
+            // 按稳定顺序重建全量能力后再执行一次轻心跳，只有最终 revision 取得连续确认
+            // 才能把本周期视为恢复成功；任一回包不明都会由上层立即关闭本地准入。
+            try {
+                currentDefinitions.forEach(registry::register);
+                registry.heartbeat();
+            } catch (RuntimeException | Error registrationFailure) {
+                // 重建可能已写入部分 ACTIVE 能力；本地仅关门不足以撤销该外部事实，必须进入全量注销序列。
+                terminateAfterAuthorityFailureAsync(registrationFailure);
+                throw registrationFailure;
+            }
         }
     }
 
@@ -1131,11 +1336,11 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
      * <p>
      * 返回：无返回值。
      */
-    public void drain() {
-        draining.set(true);
-        dispatcher.drain();
-        fanoutDispatcher.drain();
-        registry.drain();
+    public synchronized void drain() {
+        requireOpen();
+        // 先撤销首次开门资格，再在同一生命周期临界区关门；成功返回后旧登记不能重新发布 ACTIVE。
+        awaitingInitialRegistration.set(false);
+        admission.close();
     }
 
     /**
@@ -1145,11 +1350,10 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
      * <p>
      * 返回：无返回值。
      */
-    public void activate() {
-        fanoutDispatcher.activate();
-        registry.activate();
-        dispatcher.activate();
-        draining.set(false);
+    public synchronized void activate() {
+        requireRunning();
+        admission.open();
+        awaitingInitialRegistration.set(false);
     }
 
     /**
@@ -1216,57 +1420,355 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     }
 
     /**
-     * 业务作用：先停止新任务与通知，再关闭监视器和执行资源。
+     * 业务作用：提交不可逆停机终态并关闭本 source 的全部新任务准入。
+     *
+     * <p>管理器会先对全部 source 调用本方法，再并行发布 DRAINING 并执行长时间资源收口。
+     * 本阶段不做 Redis 往返，避免某个 source 网络超时时其它 source 仍保持本地准入。关门失败会保留到
+     * 共享停机结果，不阻断其它 source 提交关门。若另一调用方已提交终态，本方法立即返回，
+     * 资源收口调用会等待该关门步骤完成。
+     *
+     * <p>参数说明: 无。
+     *
+     * <p>返回：当前调用成功提交关门，或已有调用方先行提交后返回；不在此处等待 Handler 排空。
+     */
+    void prepareStop() {
+        if (!closed.compareAndSet(false, true)) return;
+        Throwable failure = null;
+        try {
+            awaitingInitialRegistration.set(false);
+            // 先封闭两类回调的 Redis pre-start 入口；已越过边界的回调必须交接到 Handler 在途账目后才能退出。
+            preStartBarrier.closeAdmission();
+            try {
+                // 不可逆准入权威独立于 Scheduler monitor；即使 register/start/activate 正阻塞在 Redis，
+                // 管理器也能立即关闭本 source，后到的开门动作会在落地前复验同一终态。
+                admission.terminate();
+            } catch (Throwable closingFailure) {
+                failure = closingFailure;
+            } finally {
+                running.set(false);
+            }
+        } finally {
+            // 关门结果必须先发布再通知资源收口执行者，否则会丢失准入失败证据。
+            stopPreparationFailure = failure;
+            stopPrepared.countDown();
+        }
+    }
+
+    /**
+     * 业务作用：先提交停机关门，再尽力关闭监视器、执行资源和注册成员。
      *
      * <p>参数说明: 无。
      * <p>
-     * 返回：无返回值。
+     * 返回：先前进入的生命周期控制调用退出且全部停机步骤均已尝试后返回；任一步失败时抛出带后续失败证据的首个异常。
      */
     @Override
     public void stop() {
-        if (!closed.compareAndSet(false, true)) return;
-        draining.set(true);
-        dispatcher.drain();
-        fanoutDispatcher.drain();
-        try {
-            registry.drain();
-        } catch (RuntimeException error) {
-            log.warn("RedisJob executor could not publish draining state before shutdown", error);
+        prepareStop();
+        RedisJobShutdownSupport.await(stopPrepared);
+        if (!shutdownStarted.compareAndSet(false, true)) {
+            RedisJobShutdownSupport.await(stopCompleted);
+            RedisJobShutdownSupport.rethrow(stopFailure);
+            return;
         }
-        running.set(false);
-        monitors.shutdown();
-        dispatcher.close();
-        fanoutDispatcher.close();
-        // 已持权 Handler 在等待窗口内继续续期并提交结果，避免正常停机制造无谓的租约恢复。
-        if (!registry.awaitIdle(properties.getMaxRunDurationMs())) {
-            log.warn("RedisJob shutdown deadline reached with active handlers");
-        }
-        leaseRenewer.close();
+
+        Throwable failure = stopPreparationFailure;
+        long shutdownDeadline = RedisJobShutdownSupport.deadlineAfterMillis(properties.getMaxRunDurationMs());
         try {
-            registry.unregister();
-        } catch (RuntimeException error) {
-            log.warn("RedisJob executor could not remove registry membership during shutdown", error);
+            synchronized (this) {
+                // 全部 source 已由独立准入权威关门；此处才等待先前进入的 register/start/activate 退出，
+                // 防止其 Redis 回包晚于 Registry 注销或执行资源释放，同时不会延后其它 source 的本地关门。
+            }
+            // 全部 source 的本地入口已关闭，现在才并行发布服务端 DRAINING，
+            // 某个 Redis 连接超时不会延后其它 source 的关门或排空。
+            failure = RedisJobShutdownSupport.attempt(failure, admission::close);
+            failure = RedisJobShutdownSupport.attempt(failure, monitors::shutdown);
+            // 已越过本地门禁的回调要么退出，要么先登记进 Handler 在途账目；零计数之间不能出现未记账 attempt。
+            boolean preStartsDrained = preStartBarrier.awaitIdle(shutdownDeadline);
+            if (!preStartsDrained) {
+                failure = RedisJobShutdownSupport.attempt(failure, () -> {
+                    throw new IllegalStateException(
+                            "RedisJob pre-start callbacks did not drain before shutdown deadline");
+                });
+            }
+            // Handler 排空前保留派发控制执行器与续租器；已授予 attempt 的任务仍需要它们建立超时门禁并提交终态。
+            boolean handlersDrained = preStartsDrained && registry.awaitIdle(
+                    RedisJobShutdownSupport.remainingMillis(shutdownDeadline));
+            if (!handlersDrained) {
+                failure = RedisJobShutdownSupport.attempt(failure, () -> {
+                    throw new IllegalStateException("RedisJob active handlers did not drain before shutdown deadline");
+                });
+            }
+            if (preStartsDrained && handlersDrained) {
+                failure = closeOwnershipResources(failure, shutdownDeadline);
+                if (ownershipResourcesClosed()) {
+                    finalCleanupStarted.set(true);
+                    finalCleanupFailure = failure;
+                    finalCleanupCompleted.countDown();
+                } else {
+                    // 首次资源预算耗尽时不能注销成员或发布 final；continuation 继续等待执行器实际终止。
+                    startFinalCleanupContinuation();
+                }
+            } else {
+                // 尚有可能取得或持有 attempt 时必须保留派发控制、续租器与 DRAINING 成员，不能为追求资源关闭而制造孤儿 RUNNING。
+                failure = RedisJobShutdownSupport.attempt(failure, () -> {
+                    throw new IllegalStateException(
+                            "RedisJob ownership resources remain active because shutdown drain is incomplete");
+                });
+                startFinalCleanupContinuation();
+            }
+        } finally {
+            // 首次期限内允许执行的安全步骤均已尝试后发布稳定结果；并发 close 等待该结果，
+            // Spring 回调另行等待 final cleanup，不能把首次结果误当成依赖已经可以释放。
+            stopFailure = failure;
+            stopCompleted.countDown();
+        }
+        RedisJobShutdownSupport.rethrow(failure);
+    }
+
+    /**
+     * 业务作用：在首次停机期限耗尽后建立唯一后台 continuation，待权威工作退出后按安全顺序释放所有权资源。
+     *
+     * <p>参数说明: 无。
+     *
+     * <p>返回：continuation 已存在或成功启动后返回；启动失败时由当前线程完成最终收口后返回。
+     */
+    private void startFinalCleanupContinuation() {
+        if (!finalCleanupStarted.compareAndSet(false, true)) return;
+        try {
+            finalCleanupStarter.start(
+                    "redis-job-final-cleanup-" + keys.qualifier(),
+                    () -> finishRetainedResources(null));
+        } catch (Throwable startFailure) {
+            // 唯一启动权已经取得，无法交给独立线程时必须由当前停机调用方接管；回滚标志会让多个调用方争抢同一资源。
+            finishRetainedResources(startFailure);
         }
     }
 
     /**
-     * 业务作用：执行同步停机后通知 Spring 生命周期回调。
+     * 业务作用：等待迟到 pre-start 与 Handler 全部退出，再关闭派发、监视、续租并注销 DRAINING 成员。
+     *
+     * @param orchestrationFailure continuation 无法启动时的编排失败，可为 null
+     * <p>返回：无返回值；最终收口失败写入独立结果并记录 source，不改写已经发布的首次停机失败。
+     */
+    private void finishRetainedResources(Throwable orchestrationFailure) {
+        Throwable failure;
+        try (RedisJobShutdownSupport.InterruptDeferral ignored = RedisJobShutdownSupport.deferInterrupts()) {
+            List<Throwable> failures = new ArrayList<>();
+            if (orchestrationFailure != null) failures.add(orchestrationFailure);
+            try {
+                preStartBarrier.awaitIdle();
+                registry.awaitIdle();
+                // final cleanup 是 Spring 依赖可以销毁的强边界；已经进入该阶段后必须等执行器实际终止。
+                Throwable cleanupFailure = null;
+                while (!ownershipResourcesClosed()) {
+                    Throwable current = closeOwnershipResources(null, Long.MAX_VALUE);
+                    if (cleanupFailure == null && current != null) cleanupFailure = current;
+                    if (!ownershipResourcesClosed()) awaitCleanupRetry();
+                }
+                if (cleanupFailure != null) failures.add(cleanupFailure);
+            } catch (Throwable cleanupFailure) {
+                failures.add(cleanupFailure);
+            } finally {
+                failure = RedisJobShutdownSupport.aggregate(
+                        "RedisJob final ownership cleanup failed", failures);
+                finalCleanupFailure = failure;
+                finalCleanupCompleted.countDown();
+            }
+            if (failure == null) {
+                log.info("RedisJob retained ownership resources were closed: source={}", keys.qualifier());
+            } else {
+                log.error("RedisJob retained ownership resource cleanup failed: source={}",
+                        keys.qualifier(), failure);
+            }
+        }
+    }
+
+    /**
+     * 业务作用：在 pre-start 与 Handler 均已归零后，按派发、监视、续租、Registry 的依赖顺序释放所有权资源。
+     *
+     * @param failure      先前停机步骤的失败，可为 null
+     * @param deadlineNanos 派发执行器终止使用的绝对单调时钟截止
+     * @return 最早失败及其后续 suppressed 证据；全部资源关闭时返回原 failure。
+     */
+    private Throwable closeOwnershipResources(Throwable failure, long deadlineNanos) {
+        try (RedisJobShutdownSupport.InterruptDeferral ignored = RedisJobShutdownSupport.deferInterrupts()) {
+            failure = RedisJobShutdownSupport.attempt(failure, () -> dispatcher.close(deadlineNanos));
+            failure = RedisJobShutdownSupport.attempt(failure, () -> fanoutDispatcher.close(deadlineNanos));
+            failure = RedisJobShutdownSupport.attempt(failure, monitors::shutdown);
+            failure = RedisJobShutdownSupport.attempt(failure, () -> RedisJobShutdownSupport.awaitTermination(
+                    monitors, deadlineNanos, "RedisJob monitor executor"));
+            failure = RedisJobShutdownSupport.attempt(failure, () -> leaseRenewer.close(deadlineNanos));
+            if (!localOwnershipResourcesClosed()) {
+                return RedisJobShutdownSupport.attempt(failure, () -> {
+                    throw new IllegalStateException(
+                            "RedisJob local ownership resources remain active after shutdown deadline");
+                });
+            }
+            // 所有可能访问 Redis 的本地执行器都已终止，此后才允许撤销服务端成员资格。
+            return RedisJobShutdownSupport.attempt(failure, registry::unregister);
+        }
+    }
+
+    /**
+     * 业务作用：确认所有可能在停机后继续接收回调或访问 Redis 的本地资源均已实际关闭。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return Stream 容器、Pub/Sub 与普通、Fanout、监视、续租执行器全部关闭时为 true。
+     */
+    private boolean localOwnershipResourcesClosed() {
+        return dispatcher.resourcesClosed()
+                && fanoutDispatcher.resourcesClosed()
+                && monitors.isTerminated()
+                && leaseRenewer.isTerminated();
+    }
+
+    /**
+     * 业务作用：复验本地回调资源与服务端成员资格都已结束，作为 Spring 依赖可释放的最终边界。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 本地资源关闭且 Registry 注销得到确定确认时为 true。
+     */
+    private boolean ownershipResourcesClosed() {
+        return localOwnershipResourcesClosed() && registry.isWithdrawn();
+    }
+
+    /**
+     * 业务作用：最终收口遇到暂态外部失败时有界退避，避免 Redis 或 listener 不可用期间形成忙循环。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 退避结束后返回；中断延迟到最外层资源边界再恢复。
+     */
+    private void awaitCleanupRetry() {
+        long delayMs = Math.max(10L, Math.min(properties.getHeartbeatMs(), 250L));
+        try {
+            TimeUnit.MILLISECONDS.sleep(delayMs);
+        } catch (InterruptedException interrupted) {
+            RedisJobShutdownSupport.captureInterrupt();
+        }
+    }
+
+    /**
+     * 业务作用：等待本 source 的所有权资源完成最终收口，供实际托管生命周期的管理器建立依赖释放边界。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 最终收口成功时返回 null；派发、监视、续租或注销仍失败时返回独立失败结果。
+     */
+    Throwable awaitFinalCleanup() {
+        RedisJobShutdownSupport.await(finalCleanupCompleted);
+        return finalCleanupFailure;
+    }
+
+    /**
+     * 业务作用：判断本 source 是否已经结束最终资源收口，避免生命周期回调为已完成状态建立等待线程。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 全部所有权执行器已经终止且 Registry 注销已经尝试时为 true。
+     */
+    boolean isFinalCleanupComplete() {
+        return finalCleanupCompleted.getCount() == 0L;
+    }
+
+    /**
+     * 业务作用：等待本 source 的最终所有权资源完成收口后通知 Spring 生命周期回调。
+     *
+     * <p>首次排空期限耗尽时，本方法异步等待迟到 Handler 退出，避免 Spring 在续租器和 Registry
+     * 仍承担完成权威时先销毁 Redis 依赖。首次停机失败仍由同步 {@link #stop()} 稳定发布；异步回调路径
+     * 无法把异常交还原调用栈，因此只记录失败并确保回调恰好执行一次。
      *
      * @param callback 停机完成回调
-     *                 返回：无返回值。
+     * 返回: 最终收口已结束时同步执行回调；仍在收口时建立等待任务后返回。
      */
     @Override
     public void stop(Runnable callback) {
-        stop();
-        callback.run();
+        Objects.requireNonNull(callback, "callback must not be null");
+        Throwable failure = null;
+        try {
+            stop();
+        } catch (Throwable stoppingFailure) {
+            failure = stoppingFailure;
+        }
+        if (isFinalCleanupComplete()) {
+            // 已完成路径保留同步调用语义；回调局部失败不得写入所有等待者共享的停机结果。
+            RedisJobShutdownSupport.completeCallback(failure, callback);
+            return;
+        }
+        Throwable stoppingFailure = failure;
+        Runnable completion = () -> {
+            Throwable cleanupFailure = awaitFinalCleanup();
+            Throwable combined = callbackFailure(stoppingFailure, cleanupFailure);
+            try {
+                RedisJobShutdownSupport.completeCallback(combined, callback);
+            } catch (Throwable lifecycleFailure) {
+                // 异步 SmartLifecycle 调用没有异常返回通道；记录完整证据后仍保持首次停机结果不可改写。
+                log.error("RedisJob asynchronous lifecycle completion failed: source={}",
+                        keys.qualifier(), lifecycleFailure);
+            }
+        };
+        try {
+            // Spring 以回调作为同阶段依赖可继续释放的边界，必须晚于 Handler、派发、续租和 Registry。
+            Thread.ofVirtual().name("redis-job-lifecycle-completion-" + keys.qualifier()).start(completion);
+        } catch (Throwable threadFailure) {
+            // 无法建立等待任务时宁可阻塞当前生命周期线程，也不能提前回调并让依赖在权威资源之前销毁。
+            Throwable cleanupFailure = awaitFinalCleanup();
+            Throwable combined = callbackFailure(stoppingFailure, cleanupFailure);
+            combined = callbackFailure(combined, threadFailure);
+            RedisJobShutdownSupport.completeCallback(combined, callback);
+        }
     }
 
     /**
-     * 业务作用：兼容显式资源关闭并复用生命周期停机顺序。 返回：无返回值。
+     * 业务作用：为单次生命周期回调合并首次停机与独立最终收口结果，不改写任一共享异常对象。
+     *
+     * @param stoppingFailure 首次停机失败，可为 null
+     * @param cleanupFailure  最终所有权资源收口失败，可为 null
+     * @return 两阶段均成功时返回 null；否则返回原失败或当前调用新建的汇总结果。
+     */
+    private static Throwable callbackFailure(Throwable stoppingFailure, Throwable cleanupFailure) {
+        if (stoppingFailure == null) return cleanupFailure;
+        if (cleanupFailure == null || cleanupFailure == stoppingFailure) return stoppingFailure;
+        return RedisJobShutdownSupport.aggregate(
+                "RedisJob shutdown and final ownership cleanup failed",
+                List.of(stoppingFailure, cleanupFailure));
+    }
+
+    /**
+     * 业务作用：作为最终销毁边界等待本 source 的所有权资源实际完成收口。
+     *
+     * <p>参数说明: 无。
+     *
+     * <p>返回：final cleanup 结束后返回；首次停机或最终收口失败时抛出不改写共享结果的汇总异常。
      */
     @Override
     public void close() {
-        stop();
+        Throwable failure = null;
+        try {
+            stop();
+        } catch (Throwable stoppingFailure) {
+            failure = stoppingFailure;
+        }
+        // AutoCloseable 是资源实际不可再使用的边界；不能像有界 stop 一样在迟到 Handler 仍持权时提前返回。
+        Throwable cleanupFailure = awaitFinalCleanup();
+        RedisJobShutdownSupport.rethrow(callbackFailure(failure, cleanupFailure));
+    }
+
+    /**
+     * 业务作用：抽象 final-cleanup 的任务启动边界，使启动失败能够在唯一所有权尚未遗失时同步接管。
+     */
+    @FunctionalInterface
+    interface ContinuationStarter {
+        /**
+         * 业务作用：启动一个承担最终资源收口的独立任务。
+         *
+         * @param threadName 稳定线程名
+         * @param task       最终资源收口任务
+         * @return 无返回值；无法启动时抛出异常，调用方必须同步接管任务。
+         */
+        void start(String threadName, Runnable task);
     }
 
     /**

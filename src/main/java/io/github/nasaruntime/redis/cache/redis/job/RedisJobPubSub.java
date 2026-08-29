@@ -11,6 +11,7 @@ import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 
 import java.util.Collection;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.BiConsumer;
@@ -43,7 +44,7 @@ final class RedisJobPubSub implements AutoCloseable {
      * @param listener 通知处理器，依次接收频道和信封
      *                 返回：无返回值；任一 Sharded 订阅失败时拒绝启动。
      */
-    void start(Collection<String> channels, BiConsumer<String, String> listener) {
+    synchronized void start(Collection<String> channels, BiConsumer<String, String> listener) {
         this.channels = List.copyOf(channels);
         if (mode == RedisJobPubSubMode.BROADCAST) {
             this.channels.forEach(channel -> redisProxy.subscribe(channel,
@@ -101,20 +102,50 @@ final class RedisJobPubSub implements AutoCloseable {
     }
 
     /**
-     * 业务作用：取消全部通知订阅并关闭 Job 独占的 Sharded Pub/Sub 连接。
+     * 业务作用：尽力取消全部通知订阅并关闭 Job 独占的 Sharded Pub/Sub 连接。
      *
      * <p>参数说明: 无。
      * <p>
-     * 返回：无返回值。
+     * 返回：全部频道均已尝试退订后返回；失败时抛出带后续失败证据的首个异常。
      */
     @Override
-    public void close() {
+    public synchronized void close() {
+        Throwable failure = null;
         if (mode == RedisJobPubSubMode.BROADCAST) {
-            channels.forEach(redisProxy::unsubscribe);
+            List<String> remaining = new ArrayList<>();
+            for (String channel : channels) {
+                try {
+                    redisProxy.unsubscribe(channel);
+                } catch (RuntimeException | Error error) {
+                    remaining.add(channel);
+                    failure = RedisJobShutdownSupport.attempt(failure, () -> {
+                        throw error;
+                    });
+                }
+            }
+            // 每个频道只有在底层 listener 已确认移除后才从清单消失；失败频道保留给重复 close。
+            channels = List.copyOf(remaining);
         } else if (shardedConnection != null) {
-            shardedConnection.close();
-            shardedConnection = null;
+            StatefulRedisPubSubConnection<String, String> connection = shardedConnection;
+            try {
+                connection.close();
+                shardedConnection = null;
+                channels = List.of();
+            } catch (RuntimeException | Error error) {
+                failure = error;
+            }
         }
-        channels = List.of();
+        RedisJobShutdownSupport.rethrow(failure);
+    }
+
+    /**
+     * 业务作用：确认全部通知频道已经退订且独占连接已经关闭，作为 Registry 注销前的资源证据。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 广播模式没有待退订频道，或 Sharded 模式连接已确认关闭时为 true。
+     */
+    synchronized boolean isClosed() {
+        return channels.isEmpty() && shardedConnection == null;
     }
 }

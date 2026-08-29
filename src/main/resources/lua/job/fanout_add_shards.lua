@@ -11,7 +11,7 @@ if redis.call('HGET', KEYS[1], 'state') ~= 'CREATING' then return {'STATE_MISMAT
 if redis.call('HGET', KEYS[1], 'snapshotId') ~= ARGV[1] then return {'CONFLICT'} end
 local count = tonumber(ARGV[2])
 local added = 0
--- 前四个参数属于批次头部，单个 shard 的字段从第五个参数开始读取。
+-- 头部新增两个字段后, 每批 shard 的字段游标随之后移
 local cursor = 5
 for index = 1, count do
     local shardKey = KEYS[index + 1]

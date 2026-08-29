@@ -64,6 +64,20 @@ public interface PollLifecycle {
     }
 
     /**
+     * 业务作用：消费一次外部发出的立即重试信号，让托管任务在资源释放通知到达后跳过固定退避。
+     * <p>
+     * 该信号只改变下一次初始化尝试的时机，不代表资源已经可用；初始化仍必须执行原有的
+     * 分布式锁或权威校验。默认不支持该能力，普通 Stream 订阅保持固定退避行为。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 存在尚未消费的立即重试信号时返回 true，并原子清除该信号。
+     */
+    default boolean consumeImmediateRetry() {
+        return false;
+    }
+
+    /**
      * 业务作用：doLoop 内每次拉取消息 (readFunction.apply) 之前调用。适合做"我是否还应该继续消费"的自检。
      * <p>
      * 调用频率: 每个 poll 周期一次 (BLOCK 拉取前), 自检逻辑应该足够轻 — 重的检测请按批次计数自行降频。

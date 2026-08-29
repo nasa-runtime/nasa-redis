@@ -21,6 +21,7 @@ import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.connection.stream.Record;
 import org.springframework.data.redis.stream.StreamMessageListenerContainer;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -41,15 +42,13 @@ import java.util.function.Function;
  *
  * <h2>架构特性</h2>
  * <ul>
- *   <li><b>消费走 RedisProxy 现有 stream container</b>: 复用 {@link io.github.nasaruntime.redis.cache.redis.stream.BatchStreamMessageListenerContainer}
- *       + {@link io.github.nasaruntime.redis.cache.redis.stream.PollLifecycle} 钩子嵌入 tryLock / holds / unlock, 与项目其他 stream 消费共用同一套
- *       配置 (pollTimeout / batchSize) 和同一个 executor (业务方注入虚拟线程池就走虚拟线程,
- *       不注入就走 Spring 默认平台线程)。框架不替业务决定线程池模型。</li>
- *   <li><b>分区认领</b>: 节点启动 + 定时再平衡, 都用非阻塞 tryLock 扫所有分区</li>
- *   <li><b>崩溃恢复</b>: 锁 lease 30s 自动过期 + 新持锁者用 XAUTOCLAIM 接管 pending</li>
- *   <li><b>长 GC 防御</b>: 每 N ms holds() 自检 (默认 5s, 远小于 lease 30s),
- *       锁丢则 cancel subscription 停止消费</li>
- *   <li><b>topic 路由</b>: 默认所有 topic 共享分区组, 高频/慢 topic 可隔离独立组</li>
+ *   <li><b>消费容器</b>：每个分区组使用独立的 {@link BatchStreamMessageListenerContainer}，
+ *       复用对应 {@link RedisProxy} 的连接工厂、序列化方式与业务执行基础设施，并允许单组覆盖
+ *       pollTimeout 和 batchSize。</li>
+ *   <li><b>分区认领</b>：启动与周期再平衡都以非阻塞 tryLock 认领分区，通知通道只负责缩短收敛延迟。</li>
+ *   <li><b>崩溃恢复</b>：原 owner 的锁租期失效后，新 owner 用 XAUTOCLAIM 接管达到空闲阈值的 PEL。</li>
+ *   <li><b>失权门禁</b>：周期 holds 自检与 ACK 前复验共同阻止旧 owner 确认新 owner 应接管的消息。</li>
+ *   <li><b>topic 路由</b>：默认所有 topic 共享分区组，高吞吐或慢 topic 可以隔离到独立组。</li>
  * </ul>
  *
  * <h3>使用方式 (yml 驱动 + listener 声明式, 业务侧零样板)</h3>
@@ -72,7 +71,7 @@ import java.util.function.Function;
  *     public void onEvent(List<TestOrder> orders) { ... }              // 同 uid 同分区串行
  * }
  *
- * // 3. 业务发布 — 同 uid 同分区同节点同线程串行处理
+ * // 3. 业务发布 — 分区数与命名空间不变时，同 uid 路由到同一分区的单一持权处理路径
  * RedisPartition.load().publish("contract:settlement", "open-position", uid, TestOrder);
  * }</pre>
  *
@@ -81,7 +80,7 @@ import java.util.function.Function;
  *   <li>默认共享组 stream: {@code SINGLE-CONSUME:0..63} (前缀来自 yml {@code partition.defaultGroup})</li>
  *   <li>隔离组 stream: {@code SINGLE-CONSUME:contract:settlement:0..63} (拼 defaultGroup + 逻辑名)</li>
  *   <li>consumer group 名 = stream 前缀 (默认组 = SINGLE-CONSUME, 隔离组 = SINGLE-CONSUME:contract:settlement)</li>
- *   <li>分区锁 key = {@code DISTRIBUTED-LOCK:{stream前缀}:lock:{partition}}</li>
+ *   <li>分区锁业务 key = {@code {stream前缀}:lock:{partition}}，最终 Redis key 还会加分布式锁配置前缀</li>
  * </ul>
  *
  * <h3>配置 (yml)</h3>
@@ -97,12 +96,14 @@ import java.util.function.Function;
  *             enabled: true
  *             default-group: SINGLE-CONSUME    # 命名空间前缀, 也是默认组的 group 名
  *             count: 64                         # 默认组分区数
- *             rebalance-ms: 10000
+ *             rebalance-ms: 3000
  *             min-idle-ms: 30000
  *             holds-check-interval-ms: 5000     # holds 自检最小间隔, 时间限流防止 NOBLOCK 空轮询打爆 EVAL
+ *             drain-timeout-ms: 5000
  *             groups:                           # 隔离组配置 (key 用业务逻辑短名)
- *               contract:settlement:            # → stream = SINGLE-CONSUME:contract:settlement:0..63
+ *               settlement:                     # → stream = SINGLE-CONSUME:settlement:0..63
  *                 count: 64
+ *                 topics: [contract:settlement, spot:settlement]
  *                 batch-size: 200
  * </pre>
  *
@@ -110,7 +111,7 @@ import java.util.function.Function;
  * @see RedisProxy
  * @see PollLifecycle
  */
-@SuppressWarnings("unused")
+@SuppressWarnings("all")
 @Slf4j
 public class RedisPartition {
 
@@ -131,8 +132,44 @@ public class RedisPartition {
     /**
      * dispatch 热路径 computeIfAbsent 用的工厂常量, 提到字段避免每批次 new lambda
      */
-    private static final Function<String, RecycleLinkedList<Object>> DATA_BUCKET = k -> RecycleLinkedList.of();
-    private static final Function<String, RecycleLinkedList<String>> ID_BUCKET = k -> RecycleLinkedList.of();
+    private static final Function<TopicEventKey, RecycleLinkedList<Object>> DATA_BUCKET = k -> RecycleLinkedList.of();
+    private static final Function<TopicEventKey, RecycleLinkedList<String>> ID_BUCKET = k -> RecycleLinkedList.of();
+
+    /**
+     * 首个节点原子写入分区协议，后续节点只能读取并复验。
+     */
+    private static final String PARTITION_CONTRACT_LUA = """
+            local current = redis.call('get', KEYS[1])
+            if not current then
+                redis.call('set', KEYS[1], ARGV[1])
+                return ARGV[1]
+            end
+            return current
+            """;
+
+    /**
+     * 使用 Redis 服务端时钟续约并清理节点，消除不同主机墙上时钟偏差对公平份额的影响。
+     */
+    private static final String PARTITION_HEARTBEAT_LUA = """
+            local now = redis.call('time')
+            local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+            redis.call('zadd', KEYS[1], now_ms + tonumber(ARGV[1]), ARGV[2])
+            redis.call('zremrangebyscore', KEYS[1], '-inf', now_ms)
+            return redis.call('zcard', KEYS[1])
+            """;
+
+    /**
+     * 优雅下线必须在发布 offline 之前同步移除成员，接管节点才能立即计算出新的公平份额。
+     */
+    private static final String PARTITION_UNREGISTER_LUA = "return redis.call('zrem', KEYS[1], ARGV[1])";
+
+    /**
+     * 业务作用：以两个独立字段表达消息路由身份，避免 topic 或 event 自身包含分隔符时映射到同一监听器。
+     *
+     * @param topic 消息主题
+     * @param event 事件名称
+     */
+    private record TopicEventKey(String topic, String event) {}
 
     /**
      * recoverPending 异步提交的 Consumer 策略, 无状态全局共享, 配合 {@link ActionRecycler} 零 GC 派发.
@@ -151,6 +188,12 @@ public class RedisPartition {
     private static final String KEY_TRACE_IDS_BY_TE = "traceIdsByTE";
 
     private static final Map<RedisProxy, RedisPartition> CACHE = new ConcurrentHashMap<>();
+    private static final Graceful.Shutdown SHUTDOWN_ALL = RedisPartition::shutdownAll;
+
+    static {
+        // 只登记一个进程级入口，避免每次重建 Spring 上下文都把实例方法引用永久留在停机链中。
+        Graceful.registry(Integer.MAX_VALUE - 10000, SHUTDOWN_ALL);
+    }
 
     /**
      * 业务作用：获取/创建一个 RedisProxy 对应的 RedisPartition (按 RedisProxy 单例)
@@ -159,6 +202,7 @@ public class RedisPartition {
      * @return 见上述说明。
      */
     public static RedisPartition load(RedisProxy redisProxy) {
+        if (redisProxy == null) return null;
         return CACHE.computeIfAbsent(redisProxy, RedisPartition::new);
     }
 
@@ -180,7 +224,31 @@ public class RedisPartition {
      * @return 该实例的分区消费入口；未登记时为 null。
      */
     public static RedisPartition load(String qualifier) {
-        return load(RedisProxy.load(qualifier));
+        RedisProxy redisProxy = RedisProxy.load(qualifier);
+        return redisProxy == null ? null : load(redisProxy);
+    }
+
+    /**
+     * 业务作用：销毁一个命令代理关联的分区消费入口，并解除静态登记，供 Spring 上下文安全重建。
+     * 分区必须在命令代理和业务执行器仍可用时排干，否则关闭中的消费者会继续投递业务任务。
+     *
+     * @param redisProxy 即将销毁的命令代理
+     *                   返回: 无返回值；没有关联实例时保持幂等。
+     */
+    static void destroy(RedisProxy redisProxy) {
+        RedisPartition partition = CACHE.remove(redisProxy);
+        if (partition != null) partition.shutdown();
+    }
+
+    /**
+     * 业务作用：在 JVM 优雅停机阶段关闭当时仍存活的全部分区消费入口。
+     *
+     * <p>参数说明: 无。
+     * <p>
+     * 返回: 无返回值；每个实例独立保证关闭幂等。
+     */
+    private static void shutdownAll() {
+        for (RedisPartition partition : List.copyOf(CACHE.values())) partition.shutdown();
     }
 
     private final RedisProxy redisProxy;
@@ -226,6 +294,7 @@ public class RedisPartition {
      * 业务作用：绑定分区消费入口与其命令代理。
      *
      * @param redisProxy 承载分区命令的命令代理
+     *                   返回: 构造出的代理级分区入口；分布式锁尚未登记时拒绝构造。
      */
     private RedisPartition(RedisProxy redisProxy) {
         this.redisProxy = redisProxy;
@@ -237,11 +306,10 @@ public class RedisPartition {
                     "LettuceDistributedLock not initialized for RedisProxy[" + redisProxy.getQualifier()
                             + "], make sure NasaLettuceConfig has registered it");
         }
-        this.nodeId = ContextUtils.getPropertySafe("spring.application.name", "RedisPartition") + "/" + ME.sequence();
-        // 优雅停机优先级 800: 早于 RedisProxy 自身 disposable(900) 执行,
-        // 让我们有机会在 RedisProxy 还可用时 cancel 所有 subscription + 解锁
-        // 必须在连接池关闭前关闭
-        Graceful.registry(Integer.MAX_VALUE - 10000, this::shutdown);
+        // 每个运行时实例都使用新的会话标识。ME.sequence() 可能被同一主机上的多个进程共享，
+        // 单独使用会让 ZSET 把多个消费者误判成一个节点，进而计算出错误的 fair 值。
+        this.nodeId = ContextUtils.getPropertySafe("spring.application.name", "RedisPartition")
+                + "/" + ME.sequence() + "/" + UUID.randomUUID();
     }
 
     // ==================== 公开 API ====================
@@ -299,8 +367,9 @@ public class RedisPartition {
         if (StringUtils.isBlank(groupName)) {
             throw new IllegalArgumentException("isolate groupName must not be blank (use init() for default group)");
         }
+        // 先复验或创建分区组，再发布 topic 路由；count 冲突时不能留下指向错误组的半完成映射。
+        this.initGroup(groupName, count);
         topicToGroupName.put(topic, groupName);
-        if (!groups.containsKey(groupName)) this.initGroup(groupName, count);
         return this;
     }
 
@@ -312,22 +381,32 @@ public class RedisPartition {
      *
      * @param groupName 见上述说明
      * @param count     数量上限
+     * @return 当前分区入口；已初始化或分区功能关闭时保持幂等。
      */
     private RedisPartition initGroup(String groupName, int count) {
         initLock.lock();
         try {
             if (count <= 0) throw new IllegalArgumentException("count must be > 0, got " + count);
-            if (groups.containsKey(groupName)) return this;
+            PartitionGroup existing = groups.get(groupName);
+            if (existing != null) {
+                if (existing.count != count) {
+                    throw new IllegalStateException("partition group count mismatch for ["
+                            + (groupName.isEmpty() ? "<default>" : groupName)
+                            + "]: initialized=" + existing.count + ", requested=" + count);
+                }
+                return this;
+            }
             if (!redisProxy.getStream().getPartition().isEnabled()) {
                 log.info("[{}] partition disabled by config, init({}, {}) skipped",
                         redisProxy.getQualifier(), groupName.isEmpty() ? "<default>" : groupName, count);
                 return this;
             }
             PartitionGroup group = new PartitionGroup(groupName, count);
-            groups.put(groupName, group);
             // 仅 prepare (创建 stream/group/container, 不 tryClaim) — 避免 listener 还没 register 完
             // 就启 task 拉消息找不到 listener 而丢消息。tryClaim 由后续 startAllGroups() 统一启动。
             group.prepare();
+            // 只有远端协议复验和本地资源准备都成功后才发布本地组，失败配置不能留下半初始化入口。
+            groups.put(groupName, group);
             return this;
         } finally {
             initLock.unlock();
@@ -340,7 +419,7 @@ public class RedisPartition {
      * 调用时机: 必须在所有 {@link #registerListener} 完成之后, 否则 task 拉到的消息找不到
      * listener 会被 ack 丢弃。
      * <p>
-     * 框架在 {@link RedisProxy#before()} 末尾自动调用 (autoPreparePartitions → loadStreamSubscribe 扫描 → 本方法),
+     * 框架在 {@link RedisProxy#initialize()} 末尾自动调用 (autoPreparePartitions → loadStreamSubscribe 扫描 → 本方法),
      * 业务方一般不需要手动调; 但如果业务方手动 init/isolate + register, 必须自己调本方法启动消费。
      */
     public void startAllGroups() {
@@ -396,8 +475,7 @@ public class RedisPartition {
                         "partition group [" + (groupName.isEmpty() ? "<default>" : groupName) + "] not initialized, "
                                 + "configure yml stream.partition.groups before registerListener");
             }
-            // key = topic + "/" + event 让 dispatch 端按 (topic, event) 精准路由
-            String key = topic + "/" + event;
+            TopicEventKey key = new TopicEventKey(topic, event);
             StreamSubscribe<?, ?> prev = group.listenersByTopicEvent.put(key, listener);
             if (prev != null) {
                 log.warn("[{}] partition listener overridden topic={} event={} prev={} new={}",
@@ -414,9 +492,9 @@ public class RedisPartition {
     /**
      * 业务作用：按字符串分区键把事件持久写入对应分区 Stream，事件名默认使用 topic。
      *
-     * @param topic 主题名
+     * @param topic     主题名
      * @param partition 参与稳定分区计算的业务键；null 时使用轮转分区
-     * @param data 业务数据
+     * @param data      业务数据
      * @return Redis Stream 消息 ID。
      */
     public String publish(String topic, String partition, Object data) {
@@ -426,9 +504,9 @@ public class RedisPartition {
     /**
      * 业务作用：按长整型分区键把事件持久写入对应分区 Stream，事件名默认使用 topic。
      *
-     * @param topic 主题名
+     * @param topic     主题名
      * @param partition 参与稳定分区计算的业务键
-     * @param data 业务数据
+     * @param data      业务数据
      * @return Redis Stream 消息 ID。
      */
     public String publish(String topic, long partition, Object data) {
@@ -438,10 +516,10 @@ public class RedisPartition {
     /**
      * 业务作用：按字符串分区键把指定事件持久写入对应分区 Stream。
      *
-     * @param topic 主题名
-     * @param event 事件名
+     * @param topic     主题名
+     * @param event     事件名
      * @param partition 参与稳定分区计算的业务键；null 时使用轮转分区
-     * @param data 业务数据
+     * @param data      业务数据
      * @return Redis Stream 消息 ID。
      */
     public String publish(String topic, String event, String partition, Object data) {
@@ -451,10 +529,10 @@ public class RedisPartition {
     /**
      * 业务作用：按长整型分区键把指定事件持久写入对应分区 Stream。
      *
-     * @param topic 主题名
-     * @param event 事件名
+     * @param topic     主题名
+     * @param event     事件名
      * @param partition 参与稳定分区计算的业务键
-     * @param data 业务数据
+     * @param data      业务数据
      * @return Redis Stream 消息 ID。
      */
     public String publish(String topic, String event, long partition, Object data) {
@@ -464,13 +542,13 @@ public class RedisPartition {
     /**
      * 业务作用：内部统一 publish 入口。
      * <p>
-     * 关键不变量: <b>同一 partition 永远落到同一分区</b>。该分区由集群中唯一节点持锁消费,
-     * 同 partition 的消息在该节点的虚拟线程内串行处理, 业务层不需要 Lua 原子读+算+写。
+     * 关键不变量: <b>分区数、key 类型和值及 topic 组映射不变时，同一 partition 落到同一分区</b>。
+     * 该分区由集群中唯一节点持锁消费，同 partition 的消息进入单一持权处理路径。
      *
      * @param hashAbs    已经屏蔽符号位的 hash (用于 % count 取模)
-     * @param topic 主题名
-     * @param event 事件名
-     * @param data  业务数据
+     * @param topic      主题名
+     * @param event      事件名
+     * @param data       业务数据
      * @param roundRobin true → 忽略 hashAbs, 用本组 round-robin 均摊到各分区
      * @return 见上述说明。
      */
@@ -530,7 +608,7 @@ public class RedisPartition {
     /**
      * 业务作用：同步 pipeline 分区发布 (partition = long)
      *
-     * @param event 事件名, 透传到 listener
+     * @param event        事件名, 透传到 listener
      * @param actuator     见上述说明
      * @param topic        主题名
      * @param partitionKey 分区键，决定落到哪个分区
@@ -588,7 +666,7 @@ public class RedisPartition {
     /**
      * 业务作用：异步 pipeline 分区发布 (partition = long)
      *
-     * @param event 事件名, 透传到 listener
+     * @param event        事件名, 透传到 listener
      * @param actuator     见上述说明
      * @param topic        主题名
      * @param partitionKey 分区键，决定落到哪个分区
@@ -628,7 +706,7 @@ public class RedisPartition {
      * @param hashAbs    见上述说明
      * @param roundRobin 见上述说明
      * @param data       业务数据
-     * @param async true → xAddAsync (fire-and-forget), false → xAdd (等 future)
+     * @param async      true → xAddAsync (fire-and-forget), false → xAdd (等 future)
      */
     private void doPipeline(LettucePipeline.Actuator actuator, String topic, String event,
                             int hashAbs, boolean roundRobin, Object data, boolean async) {
@@ -660,7 +738,7 @@ public class RedisPartition {
      *
      * @param hashAbs    已屏蔽符号位的 hash (用于 % count 取模)
      * @param roundRobin true → 忽略 hashAbs, 用本组 round-robin 计数均摊
-     * @param topic 主题名
+     * @param topic      主题名
      * @return 目标分区 stream key, 如 "SINGLE-CONSUME:order:detail-batch:17"
      */
     private String resolveStream(String topic, int hashAbs, boolean roundRobin) {
@@ -715,16 +793,20 @@ public class RedisPartition {
 
     /**
      * 业务作用：优雅停机: cancel 所有 subscription + 等消费线程退出 + 释放分区锁。
-     * 由 {@link Graceful} 自动注册, 一般不需要手动调用。
+     * 由进程级 {@link Graceful} 入口或 RedisProxy 生命周期调用，一般不需要业务侧手动执行。
+     *
+     * <p>参数说明: 无。
+     * <p>
+     * 返回: 无返回值；重复调用保持幂等。
      */
     public void shutdown() {
         shutdownLock.lock();
         try {
             if (!running) return;
-            // running=false 提前: 让 tryClaim (line 915) / wake handler (line 860) / rebalance (line 944) 立即守门,
+            // running=false 提前: 让 tryClaim、wake handler 与 rebalance 立即守门，
             // 防止 shutdown 期间 wake 异步触发的 rebalance 创建新 claim 进 container.pending 死掉.
             // 注意: Claim.beforePoll 已去掉 "!running" 短路, 不会因本字段误绕过 drain;
-            // drain 路径靠 active/lockLost/stopTime + checkAliveHoldsOnly 单独驱动.
+            // drain 路径靠 active/lockLost/stopNanos + checkAliveHoldsOnly 单独驱动.
             running = false;
             for (PartitionGroup g : groups.values()) {
                 try {
@@ -736,6 +818,7 @@ public class RedisPartition {
             }
             groups.clear();
         } finally {
+            CACHE.remove(redisProxy, this);
             shutdownLock.unlock();
         }
     }
@@ -743,13 +826,21 @@ public class RedisPartition {
     /**
      * 业务作用：按消费组返回当前节点持有的分区索引，供运行监控与故障诊断使用；默认组使用 "&lt;default&gt;"。
      *
+     * <p>参数说明: 无。
+     *
      * @return 见上述说明。
      */
     public Map<String, List<Integer>> claimedPartitions() {
         Map<String, List<Integer>> r = new LinkedHashMap<>();
         for (Map.Entry<String, PartitionGroup> e : groups.entrySet()) {
             String key = e.getKey().isEmpty() ? "<default>" : e.getKey();
-            r.put(key, new ArrayList<>(e.getValue().claims.keySet()));
+            List<Integer> held = new ArrayList<>();
+            for (Map.Entry<Integer, Claim> claim : e.getValue().claims.entrySet()) {
+                Claim value = claim.getValue();
+                if (value.lock != null && !value.lockLost) held.add(claim.getKey());
+            }
+            held.sort(Integer::compareTo);
+            r.put(key, held);
         }
         return r;
     }
@@ -819,19 +910,18 @@ public class RedisPartition {
          * 同一 container 内的所有 task 共用。N 个分区组 = N 个 container, 每组按自己的
          * batchSize/pollTimeout 跑。
          * <p>
-         * <b>资源开销</b>: 每个 container 是个轻量壳子 (~1-2KB), 共享 RedisProxy 的 executor /
-         * connectionFactory / serializer, 不引入额外线程/连接。N 组 64 分区下 container 自身
-         * 内存增量 ≈ 100KB, 对 JVM 完全无感。
+         * 每组容器共享 RedisProxy 装配的 connectionFactory、serializer 与执行基础设施；
+         * 具体线程和连接占用由底层容器、连接工厂与业务执行器配置共同决定。
          */
         final BatchStreamMessageListenerContainer<String, MapRecord<String, Object, Object>> container;
 
         /**
-         * (topic, event) → listener。key = {@code topic + "/" + event}, 与 publish 端对称。
+         * (topic, event) → listener。两个字段保持独立，不能用可出现在业务值中的字符拼接。
          * <p>
          * 由 {@link #registerListener(StreamSubscribe)} 写入, dispatch 端按 (topic, event) 路由调用。
          * 同一 (topic, event) 只能注册一个 listener, 重复注册时旧的被覆盖并打 warn。
          */
-        final Map<String, StreamSubscribe<?, ?>> listenersByTopicEvent = new ConcurrentHashMap<>();
+        final Map<TopicEventKey, StreamSubscribe<?, ?>> listenersByTopicEvent = new ConcurrentHashMap<>();
         /**
          * 已认领的分区: 索引 → claim. 占位语义: 防止同 partition 重复 tryClaim.
          * <p>
@@ -887,17 +977,17 @@ public class RedisPartition {
         /**
          * 本轮 rebalance release set(N) 的时间戳, 给"卡死保险阀"用.
          * <p>
-         * 如果某轮 release 因边界 race (例如 rebalance step 与独立 lockLost 微秒级撞上) 造成
+         * 如果某轮 release 因边界竞争 (例如 rebalance step 与独立 lockLost 同时发生) 造成
          * pendingReleaseCount 永远不归零, 后续 rebalance 会被 {@code pendingReleaseCount.get() > 0}
-         * 永久挡住. 加保险阀: 若 elapsed > drainTimeoutMs * 2 (默认 10s), 强制 reset 0 让 release 路径自愈.
+         * 永久挡住。超过排干时限与再平衡调度余量后，强制重置计数，让 release 路径自行恢复。
          * <p>
          * volatile: rebalance (TimingWheel 线程) 写, 后续 rebalance 读, 跨线程可见.
          */
-        volatile long releaseStartTime;
+        volatile long releaseStartNanos;
 
         /**
          * 跨节点 wake-up 通道. 任一节点释放 partition 后 pub 一个空消息, 其它节点收到后立即 rebalance,
-         * 不必等下个周期 (默认 10s) 才收敛. 自己也会收到自己的 pub, handler 里会重复跑一次 rebalance,
+         * 不必等下个周期 (默认 3s) 才收敛. 自己也会收到自己的 pub, handler 里会重复跑一次 rebalance,
          * 因为已经平衡过 (claims.size=fair) 这次会是空跑, 可接受.
          */
         final String wakeChannel;
@@ -920,6 +1010,7 @@ public class RedisPartition {
          *
          * @param groupName 分区组名
          * @param count     分区数
+         *                  返回: 构造出的分区组；配置非法时拒绝创建任何消费任务。
          */
         PartitionGroup(String groupName, int count) {
             this.groupName = groupName;
@@ -930,7 +1021,7 @@ public class RedisPartition {
             NasaLettuceConfig.Partition pc = sc.getPartition();
             // defaultGroup 是所有分区组的命名空间前缀, 必须非空 — yml 写 null 或空串会让所有 stream/lock key 退化成奇怪形态
             String defaultGroup = pc.getDefaultGroup();
-            if (defaultGroup == null || defaultGroup.isEmpty()) {
+            if (defaultGroup == null || defaultGroup.isBlank()) {
                 throw new IllegalStateException(
                         "yml stream.partition.default-group must be a non-empty string "
                                 + "(it is the namespace prefix for all partition stream/lock keys, default 'SINGLE-CONSUME')");
@@ -946,6 +1037,17 @@ public class RedisPartition {
             this.drainTimeoutMs = (gc != null && gc.getDrainTimeoutMs() != null) ? gc.getDrainTimeoutMs() : pc.getDrainTimeoutMs();
             this.batchSize = (gc != null && gc.getBatchSize() != null) ? gc.getBatchSize() : sc.getBatchSize();
             this.pollTimeout = (gc != null && gc.getPollTimeout() != null) ? gc.getPollTimeout() : sc.getPollTimeout();
+            if (rebalancePeriodMs < 1 || rebalancePeriodMs > Long.MAX_VALUE / 3) {
+                throw new IllegalStateException("stream.partition rebalance-ms must be between 1 and "
+                        + (Long.MAX_VALUE / 3) + ": " + rebalancePeriodMs);
+            }
+            if (minIdleMs < 0) {
+                throw new IllegalStateException("stream.partition min-idle-ms must not be negative: " + minIdleMs);
+            }
+            if (holdsCheckIntervalMs < 1 || drainTimeoutMs < 1 || batchSize < 1 || pollTimeout < 1) {
+                throw new IllegalStateException("stream.partition holds-check-interval-ms, drain-timeout-ms, "
+                        + "batch-size and poll-timeout must be greater than zero");
+            }
             // 创建本组独立 container. 参数仅 pollTimeout/batchSize 不同, 其他 (executor/serializer/connectionFactory)
             // 全部复用 RedisProxy. 工厂方法 createListenerContainer 由 RedisProxy 负责装配, 与 subscribe 路径
             // 的 dedicated container 共用同一个工厂。
@@ -960,8 +1062,14 @@ public class RedisPartition {
          * listener 全部 register 完成后统一调用。
          * <p>
          * 调用时机: 业务方 / 框架 init/isolate 阶段, 早于 listener 扫描注册。
+         *
+         * <p>参数说明: 无。
+         * <p>
+         * 返回: 无返回值；合同不一致或本地资源准备失败时抛出异常且不发布本地分区组。
          */
         void prepare() {
+            // 分区数、锁命名空间与散列规则共同决定消息和所有权映射；集群节点不一致时必须在消费前拒绝启动。
+            this.validatePartitionContract();
             // step 1: 准备每个分区 stream 的运行时元数据
             // - xGroupCreate: 给每个 stream 建消费者组. 多节点同时启动时, 第二个会因
             //   "BUSYGROUP" 抛异常, RedisProxy.xGroupCreate 内部已 containGroup 预检过滤, catch 兜底
@@ -990,16 +1098,59 @@ public class RedisPartition {
         }
 
         /**
+         * 业务作用：在 Redis 中建立并复验分区映射协议，阻止同一 stream 命名空间下的节点使用不同分区数或锁域。
+         * 租期和接管空闲时间属于运行调优参数，不写入硬协议，以便集群滚动调整而不改变消息映射与互斥身份。
+         *
+         * <p>参数说明: 无。
+         * <p>
+         * 返回: 无返回值；首次启动持久写入协议，后续配置不一致时抛出异常且不启动本组消费。
+         */
+        private void validatePartitionContract() {
+            String lockPrefix = Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(distributedLock.keyPrefix().getBytes(StandardCharsets.UTF_8));
+            String expected = "schema=1;count=" + count
+                    + ";lock-prefix-b64=" + lockPrefix
+                    + ";hash=java-hash-sign-mask-mod";
+            String key = streamPrefix + ":partition-contract";
+            String actual = redisProxy.evalDirectConnection(
+                    PARTITION_CONTRACT_LUA, String.class, new String[]{key}, expected);
+            if (!expected.equals(actual)) {
+                throw new IllegalStateException("partition contract mismatch for " + streamPrefix
+                        + ": expected [" + expected + "] but Redis contains [" + actual + "]");
+            }
+        }
+
+        /**
+         * 业务作用：以 Redis 服务端时间续约当前节点并清理过期成员，返回本组一致可见的存活节点数。
+         *
+         * <p>参数说明: 无。
+         *
+         * @return 清理过期成员后的节点数量，最小按一处理以保持分区份额可计算。
+         */
+        private int heartbeat() {
+            Long alive = redisProxy.evalDirectConnection(
+                    PARTITION_HEARTBEAT_LUA,
+                    Long.class,
+                    new String[]{streamPrefix + ":nodes"},
+                    3 * rebalancePeriodMs,
+                    nodeId);
+            return Math.max(1, alive == null ? 1 : alive.intValue());
+        }
+
+        /**
          * 业务作用：启动消费阶段: 贪心 tryClaim 各分区 + 注册周期 rebalance 任务。
          * <p>
          * 必须在 listener 全部 register 完成后调用, 否则 task 拉到消息找不到 listener 会被丢弃。
+         *
+         * <p>参数说明: 无。
+         * <p>
+         * 返回: 无返回值；启动心跳、通知通道、初始认领和周期再平衡，单次通知失败由周期任务兜底。
          */
         void startConsuming() {
             // step 3: 立即 ZADD 自己进 alive 注册, 让其它节点的下一次 rebalance 立刻看到我.
-            // 不能等到第一次 rebalance 才注册 — 那要等 rebalancePeriodMs (默认 10s), 中间窗口我在线但隐身.
+            // 不能等到第一次 rebalance 才注册 — 那要等 rebalancePeriodMs (默认 3s), 中间窗口我在线但隐身.
             try {
-                long now = System.currentTimeMillis();
-                redisProxy.zAdd(streamPrefix + ":nodes", now + 3 * rebalancePeriodMs, nodeId);
+                this.heartbeat();
             } catch (Exception e) {
                 log.warn("[{}] partition initial heartbeat failed group={} streamPrefix={}",
                         redisProxy.getQualifier(), groupName.isEmpty() ? "<default>" : groupName, streamPrefix, e);
@@ -1010,9 +1161,8 @@ public class RedisPartition {
                 redisProxy.subscribe(wakeChannel, (msg) -> {
                     if (!running) return;
                     String body = msg == null ? "" : msg.toString();
-                    // 所有消息格式: {type}:{payload}:{nodeId}, 末段是发送者, 跳过自己发的
-                    int lastColon = body.lastIndexOf(':');
-                    if (lastColon > 0 && nodeId.equals(body.substring(lastColon + 1))) return;
+                    // nodeId 的应用名部分允许包含冒号，不能只截取最后一段比较；按完整后缀识别自己发出的通知。
+                    if (body.endsWith(":" + nodeId)) return;
                     // 打印上线/下线通知 (release 不打, 频率高靠状态摘要体现)
                     if (body.startsWith("online:")) {
                         log.info("[{}] 收到分区节点上线通知: {} streamPrefix={}", redisProxy.getQualifier(), body, streamPrefix);
@@ -1104,6 +1254,10 @@ public class RedisPartition {
          * score=过期时间戳 (now + 3*period, 容忍 1-2 次心跳丢失). 本方法每次跑都 ZADD 自己续约 +
          * ZREMRANGEBYSCORE 清过期节点 + ZCARD 数活节点. 完全不依赖外部 cluster 开关.
          * 死节点 (kill -9 / 网络分区) 在 3*rebalancePeriodMs 内自动剔除.
+         *
+         * <p>参数说明: 无。
+         * <p>
+         * 返回: 无返回值；单轮 Redis 异常只记录并由后续周期重试。
          */
         void rebalance() {
             if (!running) return;
@@ -1112,13 +1266,7 @@ public class RedisPartition {
                 String q = redisProxy.getQualifier();
 
                 // === step 1: 心跳续约 + 估算存活节点 ===
-                String nodesKey = streamPrefix + ":nodes";
-                long now = System.currentTimeMillis();
-                long expireAt = now + 3 * rebalancePeriodMs;   // 3x 周期作 TTL, 容忍丢 1-2 次心跳
-                redisProxy.zAdd(nodesKey, expireAt, nodeId);
-                redisProxy.zRemRangeByScore(nodesKey, Double.NEGATIVE_INFINITY, now);   // 清过期
-                int alive = (int) redisProxy.zCard(nodesKey);
-                if (alive < 1) alive = 1;
+                int alive = this.heartbeat();
 
                 // 向上取整: 64 分区 3 节点 → fair=22, 允许部分节点多持 1 个, 避免余数分区成孤儿
                 int fair = Math.max(1, (count + alive - 1) / alive);
@@ -1137,13 +1285,15 @@ public class RedisPartition {
                 //
                 // 卡死保险阀: 边界 race (rebalance step 与独立 lockLost 微秒级撞上) 可能让 pendingReleaseCount
                 // 永远卡 > 0, 后续 release 被永久挡住. 若 elapsed > stuckThreshold 强制 reset 0 自愈.
-                // threshold 取 drainTimeoutMs + rebalancePeriodMs/2 (默认 5s+5s=10s, 略大于 drainTimeoutMs 留 buffer,
-                // 但比 rebalancePeriodMs 紧, 让下一次 rebalance 就能触发 reset 不用等下下次).
+                // threshold 取 drainTimeoutMs + rebalancePeriodMs/2（默认 5s+1.5s=6.5s），
+                // 略大于 drainTimeoutMs 留出调度余量，并让后续周期能尽快解除释放门禁。
                 int pending = pendingReleaseCount.get();
                 if (my > fair && pending > 0) {
-                    long elapsed = now - releaseStartTime;
+                    long releaseStarted = releaseStartNanos;
+                    long elapsed = releaseStarted <= 0 ? 0
+                            : TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - releaseStarted);
                     long stuckThreshold = drainTimeoutMs + rebalancePeriodMs / 2;
-                    if (releaseStartTime > 0 && elapsed > stuckThreshold) {
+                    if (releaseStarted > 0 && elapsed > stuckThreshold) {
                         log.warn("[{}] 再平衡 release 卡死保险阀触发: streamPrefix={} pendingReleaseCount={} elapsed={}ms threshold={}ms, 强制 reset",
                                 q, streamPrefix, pending, elapsed, stuckThreshold);
                         // increment generation 让旧 batch 的 Claim 迟到 afterExit 不再 decrement 当前 count (跨 batch 污染防御).
@@ -1175,9 +1325,9 @@ public class RedisPartition {
                     }
                     int released = toStop.size();
                     // 记录 release 起点, 给卡死保险阀算 elapsed.
-                    // 注意写入顺序: releaseStartTime 在 pendingReleaseCount.set 之前,
-                    // 否则后续 rebalance 可能读到 pendingReleaseCount>0 但 releaseStartTime=0, elapsed 错乱.
-                    releaseStartTime = now;
+                    // 注意写入顺序: releaseStartNanos 在 pendingReleaseCount.set 之前,
+                    // 否则后续 rebalance 可能读到 pendingReleaseCount>0 但 releaseStartNanos=0, elapsed 错乱.
+                    releaseStartNanos = System.nanoTime();
                     // 新一轮 generation: 旧 batch 的 Claim 迟到 afterExit 不再 decrement 本 batch 计数 (防跨 batch 污染).
                     int gen = releaseGeneration.incrementAndGet();
                     pendingReleaseCount.set(released);
@@ -1187,6 +1337,8 @@ public class RedisPartition {
                         c.releaseCounted = true;
                     }
                     for (Claim c : toStop) c.markStop();
+                    // 立即让 runner 观察 stop 门禁并开始排干，避免空闲分区继续等到下一次 pollTimeout。
+                    container.wakeManagedRunners();
                     log.info("[{}] 再平衡释放: streamPrefix={} 释放 {} 个 (持有 {} → 目标 {}, 节点数 {})",
                             q, streamPrefix, released, my, fair, alive);
                 }
@@ -1196,12 +1348,16 @@ public class RedisPartition {
                 // (zombie 占位不算真锁, 用 claims.size 会导致 zombie 过多时提前 break, 丢失分区)
                 // containsKey 防同分区重复 claim (已有真锁或 zombie 的不重复尝试)
                 int claimed = 0;
+                boolean retrySignaled = false;
                 if (my < fair) {
                     for (int i = 0; i < count && running; i++) {
                         if (realLockCount.get() >= fair) break;
-                        if (!claims.containsKey(i)) {
+                        Claim existing = claims.get(i);
+                        if (existing == null) {
                             this.tryClaim(i);
                             claimed++;
+                        } else if (existing.lock == null && existing.requestImmediateRetry()) {
+                            retrySignaled = true;
                         }
                     }
                     if (claimed > 0) {
@@ -1209,6 +1365,9 @@ public class RedisPartition {
                                 q, streamPrefix, claimed, my, fair, alive);
                     }
                 }
+                // 释放事件已经证明集群状态发生变化，唤醒失败占位立即重做锁校验；
+                // 若锁尚未真正可用，原有固定退避仍会继续限制后续请求频率。
+                if (retrySignaled) container.wakeManagedRunners();
                 // === step 4: wake 通知由 afterExit 在锁真正释放后发出, 不在这里提前发 ===
                 // (markStop 到 unlock 之间有延迟, 提前通知会导致对方 tryLock 失败白跑)
 
@@ -1241,19 +1400,25 @@ public class RedisPartition {
          * </ol>
          * <p>
          * latch 超时仍未清完 → log.warn + 走 lease (30s) 兜底, 不再死等.
+         *
+         * <p>参数说明: 无。
+         *
+         * <p>返回：已停止再平衡与订阅并完成本轮有界排空后返回；超时任务交由锁租约阻止旧节点继续持权。
          */
         void shutdown() {
             if (rebalanceTimerName != null) TimingWheel.cancel(rebalanceTimerName);
             // step 0a: 优雅退出 alive 注册表, 让其它节点立即看到我下线 (不必等 3*period TTL 过期)
             try {
-                redisProxy.zRem(streamPrefix + ":nodes", nodeId);
-            } catch (Exception ignored) {
-            }
+                redisProxy.evalDirectConnection(
+                        PARTITION_UNREGISTER_LUA,
+                        Long.class,
+                        new String[]{streamPrefix + ":nodes"},
+                        nodeId);
+            } catch (Exception ignored) {}
             // step 0b: 取消 wake-up 订阅
             try {
                 redisProxy.unsubscribe(wakeChannel);
-            } catch (Exception ignored) {
-            }
+            } catch (Exception ignored) {}
             // step 1: 快照 live task 集合 (与 claims map 解耦): 用 liveClaims 是为了把已脱离 claims 但仍 live
             // 的 rebalance release task 也纳入 latch, 否则 shutdown 可能提前 await 完成而旧 task 仍在 drain.
             List<Claim> liveSnapshot = new ArrayList<>(liveClaims);
@@ -1306,8 +1471,7 @@ public class RedisPartition {
             // 让其它节点 ms 级感知 + 抢锁, 不必等 10s 周期.
             try {
                 redisProxy.pub(wakeChannel, "offline:" + nodeId);
-            } catch (Exception ignored) {
-            }
+            } catch (Exception ignored) {}
             log.info("[{}] 分区组停机完成: streamPrefix={} 已释放全部分区, 通知其他节点接管", redisProxy.getQualifier(), streamPrefix);
         }
     }
@@ -1353,20 +1517,20 @@ public class RedisPartition {
          */
         volatile String lockHolder;
         /**
-         * 上次 holds() 自检时间 ms. 与 group.holdsCheckIntervalMs 配合做时间限流,
+         * 上次 holds() 自检的单调时钟快照。与 group.holdsCheckIntervalMs 配合做时间限流,
          * 防止 NOBLOCK 模式下空轮询每秒打几千次 holds() EVAL。
          */
-        long lastHoldsCheckTime;
+        long lastHoldsCheckNanos;
         /**
          * rebalance/shutdown 设 false → runner 主循环 {@link #isStopRequested} 命中 → 进入 drain
          * (持锁等在途业务跑完/超时) → 移除 task。锁丢失另走立即 exit, 不经 drain。
          */
         volatile boolean active = true;
         /**
-         * markStop() 时间戳 ms, 给 drainTimedOut 用. volatile 防 32-bit JVM 撕裂 + 防后续重构把 markStop 内
-         * "先写 stopTime 再写 active" 的顺序搞反.
+         * markStop() 的单调时钟快照, 给 drainTimedOut 用. volatile 防 32-bit JVM 撕裂 + 防后续重构把 markStop 内
+         * "先写 stopNanos 再写 active" 的顺序搞反.
          */
-        volatile long stopTime;
+        volatile long stopNanos;
 
         /**
          * 异步 recoverPending 期间 = true, runner 通过 {@link #isPollReady} 看到后跳过 batch poll,
@@ -1404,9 +1568,18 @@ public class RedisPartition {
          *   <li>recoverPending 内 maxLoops 耗尽但 cursor 未到 "0-0"</li>
          * </ul>
          * 这些路径在 finally 兜底设 true (只在 active &amp;&amp; running &amp;&amp; !lockLost 时), 主循环 beforePoll 检测后 retry.
-         * 主消费 XREADGROUP &gt; 不读旧 PEL, 必须靠 recoverPending 反复 retry 接管.
+         * 本次游标正常结束后还会按外部 consumer PEL 的真实 idle 登记定时补扫；主消费 XREADGROUP &gt;
+         * 不读其它 consumer 的 PEL, 必须由这两类重试完成接管.
          */
         volatile boolean recoverPendingNeeded = false;
+        /**
+         * 外部 consumer 的 PEL 尚未达到 minIdle 时，从该单调时钟快照起等待精确剩余时长。
+         */
+        volatile long recoverPendingFollowUpStartNanos;
+        /**
+         * 与 recoverPendingFollowUpStartNanos 配对的等待时长。
+         */
+        volatile long recoverPendingFollowUpDelayNanos;
         /**
          * 标记本 Claim 是否被本次 shutdown 纳入 latch 计数. shutdown 内对 liveClaims snapshot 设 true 后才 markStop.
          * afterExit finally 内仅当 shutdownCounted=true 时 countDown, 防止已脱离 latch 范围的 task (例如
@@ -1419,6 +1592,10 @@ public class RedisPartition {
          * 单调一次性: 设置 true 后不再 reset (Claim 生命周期内 shutdown 只发生一次).
          */
         final AtomicBoolean shutdownCountedDown = new AtomicBoolean(false);
+        /**
+         * 资源释放事件对应的一次性重试信号。多个并发事件合并为一个状态位，避免形成无界任务队列。
+         */
+        final AtomicBoolean immediateRetryRequested = new AtomicBoolean(false);
 
         /**
          * 业务作用：描述本节点对一个分区的占用：所属组、分区号与其锁键。
@@ -1460,13 +1637,41 @@ public class RedisPartition {
          * 列表移除 → afterExit 解锁。期间锁保持持有, 避免在途消息被其它节点重复消费。
          * 锁真丢失 (holdsStatus==0 → lockLost=true) 时跳过 drain 走立即 exit。
          * <p>
-         * 写入顺序: 先 stopTime (drainTimedOut 读取依赖) 再 active=false (drain 入口标志).
-         * active 是 volatile, 根据 JMM happens-before, 后续 reader 读到 active=false 之后再读 stopTime
-         * 一定能看到这里写入的值. 同时 stopTime 自身也是 volatile, 防 32-bit JVM 撕裂.
+         * 写入顺序: 先 stopNanos (drainTimedOut 读取依赖) 再 active=false (drain 入口标志).
+         * active 是 volatile, 根据 JMM happens-before, 后续 reader 读到 active=false 之后再读 stopNanos
+         * 一定能看到这里写入的值. 同时 stopNanos 自身也是 volatile, 防 32-bit JVM 撕裂.
+         *
+         * <p>参数说明: 无。
+         * <p>
+         * 返回: 无返回值；后续轮询只能排干或退出，不能再拉取新消息。
          */
         void markStop() {
-            stopTime = System.currentTimeMillis();
+            stopNanos = System.nanoTime();
             active = false;
+        }
+
+        /**
+         * 业务作用：为尚未取得分区锁的占位登记一次立即重试请求。
+         * 请求只会唤醒权威锁校验，不会直接改变持有状态；停止中的 Claim 拒绝新请求。
+         *
+         * <p>参数说明: 无。
+         *
+         * @return 本次是否把信号从无切换为有。
+         */
+        boolean requestImmediateRetry() {
+            return active && lock == null && immediateRetryRequested.compareAndSet(false, true);
+        }
+
+        /**
+         * 业务作用：由 ManagedRunner 原子消费立即重试请求，确保一个释放事件至多触发一次额外锁校验。
+         *
+         * <p>参数说明: 无。
+         *
+         * @return 存在未消费请求时返回 true。
+         */
+        @Override
+        public boolean consumeImmediateRetry() {
+            return immediateRetryRequested.getAndSet(false);
         }
 
         /**
@@ -1497,7 +1702,7 @@ public class RedisPartition {
          * <p>
          * 流程:
          * <ol>
-         *   <li>tryLock 拿锁. 失败 → 返回 false, runner 设 lastRetryTime, 每 RETRY_INTERVAL_MS 重试</li>
+         *   <li>tryLock 拿锁. 失败 → 返回 false, runner 记录单调时钟并按 RETRY_INTERVAL_MS 重试</li>
          *   <li>拿到锁 → 设 {@link #recovering}=true 让 {@link #isPollReady} 返回 false, runner 暂不
          *       发起 batch poll. 把 recoverPending 异步提交到 businessExecutor — 否则崩溃恢复期
          *       PEL 几千条 XAUTOCLAIM 多页拉取会饿死 runner 内其他 partition (动辄几秒甚至几十秒不调度)</li>
@@ -1508,33 +1713,33 @@ public class RedisPartition {
          * <b>串行性保证</b>: recovering=true 期间 runner 不进 batch list → 没有新 XREADGROUP 批次
          * 进 dispatch; recoverPending 在 businessExecutor 内串行 dispatch pending →
          * 同 partition 内 listener 调用严格串行, 不会出现 "新消息 dispatch 与 pending dispatch 并发" 竞态。
+         *
+         * <p>参数说明: 无。
+         *
+         * @return 取得分区锁并提交 pending 恢复时为 true；公平门禁、锁竞争或初始化失败时为 false。
          */
         @Override
         public boolean beforeStart() {
             // 本组真锁数已达 fair 上限, 不再抢新锁, 防止与 rebalance 释放对冲
-            if (group.realLockCount.get() >= group.currentFair) {
-                return false;
-            }
+            if (group.realLockCount.get() >= group.currentFair) return false;
             try {
                 Lock l = distributedLock.getLock(lockKey);
                 boolean acquired;
                 try {
                     acquired = l.tryLock();
                 } catch (Throwable t) {
-                    // tryLock 抛异常: Lock 已从 ObjectPool 借出, 必须 recycle 回池防止泄漏
-                    if (l instanceof ObjectPool.Recycler<?> r) r.recycle();
                     log.error("[{}] partition tryLock threw streamPrefix={} partition={}",
                             redisProxy.getQualifier(), group.streamPrefix, partition, t);
                     return false;
                 }
-                if (!acquired) {
-                    if (l instanceof ObjectPool.Recycler<?> r) r.recycle();
-                    return false;
-                }
+                if (!acquired) return false;
+
                 this.lock = l;
                 // 记录 runner 线程当下的 holder, 给 businessExecutor 后续 ACK fencing 用.
                 // 必须在 runner 线程内执行 (initManaged 已保证), 否则 holder 含的 threadId 错位.
                 this.lockHolder = LettuceDistributedLock.currentHolder();
+                this.recoverPendingFollowUpStartNanos = 0;
+                this.recoverPendingFollowUpDelayNanos = 0;
                 int locked = group.realLockCount.incrementAndGet();
                 log.info("[{}] 分区锁定: streamPrefix={} partition={} 持有={}/{}", redisProxy.getQualifier(), group.streamPrefix, partition, locked, group.count);
                 // 异步 recoverPending: 不阻塞 runner 线程, 期间 runner 用 checkAlive 维持 holds 自检。
@@ -1559,8 +1764,10 @@ public class RedisPartition {
          * 两条路径都需要 markStop 检测 + holds 自检, 共用本方法。
          * <p>
          * <b>时间限流</b>: NOBLOCK 批量模式下空 stream 每个 cycle 都可能进 beforePoll,
-         * 用 lastHoldsCheckTime + holdsCheckIntervalMs (默认 5s) 限流真实 holds() EVAL,
+         * 用 lastHoldsCheckNanos + holdsCheckIntervalMs (默认 5s) 限流真实 holds() EVAL,
          * 防止打爆 redis pipeline。lease=30s, 5s 间隔留 6 次重试机会, 足够安全。
+         *
+         * <p>参数说明: 无。
          *
          * @return 见上述说明。
          */
@@ -1579,13 +1786,21 @@ public class RedisPartition {
             // recover retry: rejected / 网络异常导致 recoverPending 未完整跑完时, 在 holds 自检之前重试 submit.
             // 不能让 PEL 卡到下次 rebalance/重启 — 主消费 XREADGROUP > 不读旧 consumer 的 PEL.
             // 只在 recovering=false 时 retry (recovering=true 表示上次 submit 还在跑).
-            if (recoverPendingNeeded && !recovering) {
+            long followUpStart = recoverPendingFollowUpStartNanos;
+            boolean followUpDue = followUpStart != 0
+                    && System.nanoTime() - followUpStart >= recoverPendingFollowUpDelayNanos;
+            if ((recoverPendingNeeded || followUpDue) && !recovering) {
+                if (followUpDue) {
+                    recoverPendingFollowUpStartNanos = 0;
+                    recoverPendingFollowUpDelayNanos = 0;
+                }
                 this.submitRecoverPending();
             }
             // 时间限流: 距上次 holds 不到 holdsCheckIntervalMs → 跳过本次, 与正常 poll 同进度
-            long now = System.currentTimeMillis();
-            if (now - lastHoldsCheckTime < group.holdsCheckIntervalMs) return true;
-            lastHoldsCheckTime = now;
+            long nowNanos = System.nanoTime();
+            long intervalNanos = TimeUnit.MILLISECONDS.toNanos(group.holdsCheckIntervalMs);
+            if (lastHoldsCheckNanos != 0 && nowNanos - lastHoldsCheckNanos < intervalNanos) return true;
+            lastHoldsCheckNanos = nowNanos;
             // 三态: null = Redis 瞬时异常, 不当锁丢 (否则一次抖动就误判丢锁停消费), 当作仍持有, 下个周期重判; 1 = 持有
             Long holdsSt = distributedLock.holdsStatus(lockKey, lockHolder);
             if (holdsSt == null || holdsSt == 1L) return true;
@@ -1618,12 +1833,13 @@ public class RedisPartition {
          * 三件事 (try-finally 保证 latch.countDown 一定走):
          * <ul>
          *   <li>从 claims 移除自己 (rebalance/shutdown 通常已经移过, putIfAbsent 比较移除幂等兜底)</li>
-         *   <li>unlock (除非锁已丢失). 内部完全释放后自动 recycle RedisLock 回池</li>
+         *   <li>unlock (除非锁已丢失)，完整释放后结束本轮稳定 Lock 所有权</li>
          *   <li>group.shutdownLatch 非 null 时 countDown — 给 PartitionGroup.shutdown 的封顶 await
          *       发信号. rebalance 释放路径 latch=null, 跳过</li>
          * </ul>
          *
          * @param normal 见上述说明
+         *               返回: 无返回值；所有退出分支都会完成本地引用、释放计数与停机闩锁收口。
          */
         @Override
         public void afterExit(boolean normal) {
@@ -1632,8 +1848,7 @@ public class RedisPartition {
                 // 从未持锁 → 没什么好释放的, 直接走 finally countDown
                 if (lock == null) return;
                 int remaining = group.realLockCount.decrementAndGet();
-                // 锁已丢失 → 跳 unlock (锁不归我, Redis 端发 UNLOCK_LUA 也没意义), 但 RedisLock 本地资源仍要释放
-                // (released + stopWatchdog + recycle), 否则池泄漏 + watchdog 挂.
+                // 锁已丢失 → 跳 unlock (锁不归我, Redis 端发 UNLOCK_LUA 也没意义)，但本地续租权威仍要撤销。
                 // release 计数收尾交给 finally 统一处理, 不在这里 early return 跳过.
                 if (lockLost) {
                     this.disposeLocalLock();
@@ -1642,22 +1857,28 @@ public class RedisPartition {
                 try {
                     lock.unlock();
                     log.info("[{}] 分区释放: streamPrefix={} partition={} 持有={}/{}", redisProxy.getQualifier(), group.streamPrefix, partition, remaining, group.count);
-                } catch (IllegalMonitorStateException ims) {
-                    // unlock 内 UNLOCK_LUA 返回 null → 锁实际不在自己手里 (可能已被新 owner 抢).
-                    // 不打"释放成功", 但仍要本地 dispose 防 RedisLock 泄漏.
-                    log.warn("[{}] 分区 unlock 非法持有 (锁已不在自己手里) streamPrefix={} partition={}",
+                } catch (LettuceDistributedLock.OwnershipLostException lost) {
+                    // 本地 holder 仍是取得锁的 runner，但 Redis 已不再承认这次所有权。
+                    // RedisLock 在抛出该异常前已经停止 watchdog 并结束本地所有权，不能再次改变同一状态。
+                    // 这是租期或接管语义，不归因于业务代码跨线程调用，消息留在 PEL 由当前 owner 接续。
+                    log.warn("[{}] 分区释放时所有权已丢失 streamPrefix={} partition={}，跳过 Redis 解锁并等待当前 owner 接管",
                             redisProxy.getQualifier(), group.streamPrefix, partition);
+                } catch (IllegalMonitorStateException wrongThread) {
+                    // beforeStart 与 afterExit 按约束应在同一 runner 线程；走到这里表示本地线程身份不变量被破坏。
+                    log.error("[{}] 分区释放线程与加锁线程不一致 streamPrefix={} partition={} expectedHolder={} actualHolder={}",
+                            redisProxy.getQualifier(), group.streamPrefix, partition,
+                            lockHolder, LettuceDistributedLock.currentHolder());
                     this.disposeLocalLock();
                 } catch (Exception e) {
-                    // unlock 失败 (Redis 网络异常等): 锁可能仍在 Redis 端, 但本地资源必须释放, 否则池泄漏.
-                    // 锁靠 leaseTime (30s) 自然过期, 别节点接管时延变长.
+                    // owner 的 unlock 遇到 Redis 网络异常时，RedisLock 已停止 watchdog 并结束本地所有权；
+                    // Redis 端所有权结局未知，依靠 leaseTime 自然过期。
                     log.error("[{}] 分区 unlock 失败 streamPrefix={} partition={}", redisProxy.getQualifier(), group.streamPrefix, partition, e);
-                    this.disposeLocalLock();
                 }
             } finally {
-                // 1) 清 lockHolder: 残留的 businessExecutor lambda 读到 null 让 fencedOk 短路 false,
-                //    不会再用旧 holder 发 stale XACK. 与 lock 字段同生命周期.
+                // 1) 同时清除 holder 与 Lock 引用。残留的 businessExecutor lambda 读到 null 后 fencing 失败，
+                //    不会再用旧 holder 发 stale XACK；Claim 也不能继续引用已结束的 acquisition。
                 this.lockHolder = null;
+                this.lock = null;
                 // 2) liveClaims 维护: 不论何种退出路径都要从 live 集合移除, 让 shutdown live 计数准确.
                 group.liveClaims.remove(this);
                 // 3) shutdown latch countDown: 仅当本 Claim 被本次 shutdown 纳入计数 (shutdownCounted=true) 时才递减.
@@ -1713,7 +1934,7 @@ public class RedisPartition {
          *   <li>active=true → 未 markStop, 不算 drain timeout</li>
          *   <li>lock==null → zombie, 不走 drain 路径</li>
          *   <li>lockLost=true → 走立即 exit 路径, 不算 drain timeout</li>
-         *   <li>stopTime &lt;= 0 → markStop 写入顺序异常, 防御性 return false</li>
+         *   <li>stopNanos &lt;= 0 → markStop 写入顺序异常, 防御性 return false</li>
          * </ol>
          * 最终: 当前时间距 markStop 已超 {@code group.drainTimeoutMs} 即视为超时, 调用方走强制 exit.
          * <p>
@@ -1721,7 +1942,7 @@ public class RedisPartition {
          * BatchStreamPollTask + Claim 跨字段, 由 ManagedRunner 主循环的 {@code !task.complete || !task.isPollReady()}
          * 分支天然守门 — drain 完成时根本不会进这个分支调本方法, 本方法内不重复 guard.
          *
-         * @param now 见上述说明
+         * @param now runner 的本轮毫秒时间戳；本实现使用单调时钟计算耗时，不依赖该墙上时钟值
          * @return 见上述说明。
          */
         @Override
@@ -1729,9 +1950,9 @@ public class RedisPartition {
             if (active) return false;
             if (lock == null) return false;
             if (lockLost) return false;
-            long st = stopTime;
+            long st = stopNanos;
             if (st <= 0) return false;
-            return now - st >= group.drainTimeoutMs;
+            return System.nanoTime() - st >= TimeUnit.MILLISECONDS.toNanos(group.drainTimeoutMs);
         }
 
         /**
@@ -1739,8 +1960,10 @@ public class RedisPartition {
          * 让 drain 路径不被"主动 stop"或"全局 running=false"立即终止. 锁真丢失时设 {@code lockLost=true} +
          * return false, 与 beforePoll 同 lockLost 设置行为, 主循环看到 lockLost=true 走立即 exit 分支.
          * <p>
-         * 时间限流复用 {@link #lastHoldsCheckTime} + {@link PartitionGroup#holdsCheckIntervalMs},
+         * 时间限流复用 {@link #lastHoldsCheckNanos} + {@link PartitionGroup#holdsCheckIntervalMs},
          * 与 beforePoll 共享一个限流时钟, 避免 drain 期间 holds EVAL 翻倍.
+         *
+         * <p>参数说明: 无。
          *
          * @return 见上述说明。
          */
@@ -1748,9 +1971,10 @@ public class RedisPartition {
         public boolean checkAliveHoldsOnly() {
             if (lock == null) return true;
             if (lockLost) return false;
-            long now = System.currentTimeMillis();
-            if (now - lastHoldsCheckTime < group.holdsCheckIntervalMs) return true;
-            lastHoldsCheckTime = now;
+            long nowNanos = System.nanoTime();
+            long intervalNanos = TimeUnit.MILLISECONDS.toNanos(group.holdsCheckIntervalMs);
+            if (lastHoldsCheckNanos != 0 && nowNanos - lastHoldsCheckNanos < intervalNanos) return true;
+            lastHoldsCheckNanos = nowNanos;
             // 三态: null = Redis 异常 (瞬时抖动), 不能当锁丢提前解锁 — 当作仍持有继续 drain, 由 drainTimedOut 封顶兜底.
             // 0 = 真锁丢 (key 不在/被新 owner 抢), 设 lockLost 走立即 exit. 1 = 持有.
             Long st = distributedLock.holdsStatus(lockKey, lockHolder);
@@ -1770,6 +1994,7 @@ public class RedisPartition {
          * 时 deserializer 行为有变, raw 跳 checkcast 容错。
          *
          * @param batch 见上述说明
+         *              返回: 无返回值；成功处理的消息被确认，失败消息保留在 PEL，非法消息按丢弃策略确认。
          */
         @Override
         public void onMessage(RecycleLinkedList<MapRecord<String, Object, Object>> batch) {
@@ -1802,14 +2027,18 @@ public class RedisPartition {
          * pending 消息也至少 idle 30s, 可以接管, 不会抢正在被合法 owner 处理的消息。
          * <p>
          * 多页拉取, cursor 返回 "0-0" 或不变就退出。兜底循环上限 count*2 防边界 case 死循环。
+         *
+         * <p>参数说明: 无。
+         *
+         * <p>返回：游标正常排空或出现失权、连接异常时结束本轮；未完整收敛会登记后续补扫。
          */
         void recoverPending() {
             String start = "0-0";
             int loops = 0;
             int maxLoops = Math.max(group.count * 2, 100);
-            // fullyDrained 跟踪是否真正扫到 cursor "0-0" (PEL 已接管完). 任何中途退出 (xAutoClaim 抛 / maxLoops 耗尽 / fence 网络异常)
-            // 都不算 fully drained, finally 兜底设 recoverPendingNeeded=true 触发 beforePoll 重试,
-            // 避免旧 PEL 卡到下次 rebalance/重启 (XREADGROUP > 不读旧 PEL).
+            // fullyDrained 只表示本次 XAUTOCLAIM 游标正常走到 "0-0"，不表示所有 PEL 都已达到 minIdle。
+            // 任何中途退出都登记立即重试；游标正常结束则按外部 consumer PEL 的真实 idle 登记延迟补扫，
+            // 避免尚未满足 minIdle 的记录卡到下一次 rebalance 或重启。
             boolean fullyDrained = false;
             try {
                 // lockLost 加入循环条件: 防止 runner 已设 lockLost 但本 lambda 还在 queue 排队, 后续仍 XAUTOCLAIM
@@ -1885,12 +2114,12 @@ public class RedisPartition {
                         }
                         String next = claimed.getId();
                         if (next == null || "0-0".equals(next)) {
-                            // cursor 到 "0-0" 或 null → PEL 真扫完
+                            // 游标正常结束；仍未达到 minIdle 的外部 consumer PEL 由 finally 登记延迟补扫。
                             fullyDrained = true;
                             return;
                         }
                         if (next.equals(start)) {
-                            // 游标不前进 — 防死循环的兜底, 但不代表 PEL 真扫完.
+                            // 游标不前进 — 防死循环的兜底, 也不代表本次扫描正常结束.
                             // 可能 Redis 客户端异常游标 / cluster 切换等. 不标 fullyDrained, 让 finally 设 retry 让下轮接管.
                             log.warn("[{}] partition recoverPending cursor stuck (next == start), will retry streamPrefix={} partition={} cursor={}",
                                     redisProxy.getQualifier(), group.streamPrefix, partition, next);
@@ -1898,7 +2127,7 @@ public class RedisPartition {
                         }
                         start = next;
                     } catch (Exception e) {
-                        // XAUTOCLAIM 抛异常 (Redis 网络/超时等): 不算 fully drained, finally 兜底 set retry.
+                        // XAUTOCLAIM 抛异常 (Redis 网络/超时等): 本次扫描未正常结束, finally 兜底登记重试.
                         // 旧 PEL 在 XREADGROUP > 路径下读不到, 必须靠后续 recoverPending retry 接管.
                         log.error("[{}] xautoclaim failed, will retry streamPrefix={} partition={}",
                                 redisProxy.getQualifier(), group.streamPrefix, partition, e);
@@ -1917,7 +2146,48 @@ public class RedisPartition {
                                 redisProxy.getQualifier(), group.streamPrefix, partition, loops);
                     }
                 }
+                if (fullyDrained) this.scheduleForeignPendingFollowUpIfNeeded();
             }
+        }
+
+        /**
+         * 业务作用：扫描结束后检查其它 consumer 遗留的 PEL，并按其真实 idle 登记下一次安全接管时间。
+         * 已被当前 consumer 接管但业务处理失败的记录不会进入该调度，因此不会形成同 owner 无限重试。
+         *
+         * <p>参数说明: 无。
+         * <p>
+         * 返回: 无返回值；不存在外部 PEL 时取消补扫，查询异常时按最多一秒退避后重新检查。
+         */
+        private void scheduleForeignPendingFollowUpIfNeeded() {
+            if (!active || !running || lockLost) return;
+            long delayMs = -1;
+            try {
+                PendingMessagesSummary summary = redisProxy.xPending(stream, group.streamPrefix);
+                if (summary != null) {
+                    for (Map.Entry<String, Long> entry : summary.getPendingMessagesPerConsumer().entrySet()) {
+                        if (entry.getValue() == null || entry.getValue() <= 0 || nodeId.equals(entry.getKey()))
+                            continue;
+                        org.springframework.data.redis.connection.stream.Consumer foreignConsumer =
+                                org.springframework.data.redis.connection.stream.Consumer.from(group.streamPrefix, entry.getKey());
+                        PendingMessages pending = redisProxy.xPending(stream, foreignConsumer, 1);
+                        if (pending == null || pending.isEmpty()) continue;
+                        long idleMs = pending.get(0).getElapsedTimeSinceLastDelivery().toMillis();
+                        long remainingMs = Math.max(1L, group.minIdleMs - idleMs);
+                        if (delayMs < 0 || remainingMs < delayMs) delayMs = remainingMs;
+                    }
+                }
+            } catch (Exception e) {
+                delayMs = Math.max(1L, Math.min(1_000L, group.minIdleMs));
+                log.warn("[{}] partition pending detail failed, schedule guarded follow-up streamPrefix={} partition={}",
+                        redisProxy.getQualifier(), group.streamPrefix, partition, e);
+            }
+            if (delayMs < 0) {
+                recoverPendingFollowUpStartNanos = 0;
+                recoverPendingFollowUpDelayNanos = 0;
+                return;
+            }
+            recoverPendingFollowUpDelayNanos = TimeUnit.MILLISECONDS.toNanos(delayMs);
+            recoverPendingFollowUpStartNanos = System.nanoTime();
         }
 
         /**
@@ -1979,20 +2249,22 @@ public class RedisPartition {
          * 把这些 idle &gt; minIdleMs (默认 30s) 的消息接管过来重新投递。同节点持续持锁期间这些消息
          * 不会自动重试。业务方必须保证 handler 幂等, 极端长生命周期失败建议自行落库 + 死信队列处理。
          *
+         * <p>返回：无返回值；成功分桶交付的消息会确认，处理失败的消息保留在 PEL。
+         *
          * @param batch 见上述说明
          */
         @SuppressWarnings({"rawtypes", "unchecked"})
         void dispatch(RecycleLinkedList batch) {
             // 与 PROXY 路径对齐: 设置当前 redisProxy, 让 listener 内部可通过 RedisProxyHolder.getRedisProxy() 拿到
             RedisProxyHolder.setRedisProxy(redisProxy);
-            // 按 (topic, event) 分桶: key = topic + "/" + event
-            RecycleLinkedMap<String, RecycleLinkedList<Object>> dataByTE = RecycleLinkedMap.of();
-            RecycleLinkedMap<String, RecycleLinkedList<String>> idsByTE = RecycleLinkedMap.of();
+            // topic 与 event 必须作为两个字段参与判等，分隔符拼接会让不同业务路由互相覆盖。
+            RecycleLinkedMap<TopicEventKey, RecycleLinkedList<Object>> dataByTE = RecycleLinkedMap.of();
+            RecycleLinkedMap<TopicEventKey, RecycleLinkedList<String>> idsByTE = RecycleLinkedMap.of();
             // 反序列化失败 / 找不到 listener → 直接 ACK 丢弃, 防止 pending 堆积
             RecycleLinkedList<String> dropIds = null;
 
             // traceId 必须按 (topic, event) 隔离聚合，避免无关事件共享日志上下文并造成错误归因。
-            RecycleLinkedMap<String, HashSet<String>> traceIdsByTE = null;
+            RecycleLinkedMap<TopicEventKey, HashSet<String>> traceIdsByTE = null;
             // PooledEvtData 路径 Jackson 经 RecycleModule 路由把 passthrough 池借出 RecycleLinkedMap;
             // listener 执行完后必须显式归还, 否则池借出不还稳态后退化到每次 new.
             // 这里聚合所有池借的 passthrough 实例, finally 统一 recycle (rawMap 路径产生的 LinkedHashMap 跳过).
@@ -2045,16 +2317,20 @@ public class RedisPartition {
                         dropIds = drop(dropIds, id);
                         continue;
                     }
+                    // 池化 passthrough 一经取出便纳入统一回收范围，后续毒消息和无监听器分支也不能遗漏。
+                    if (passthrough instanceof RecycleLinkedMap rlm) {
+                        if (ptToRecycle == null) ptToRecycle = RecycleLinkedList.of();
+                        ptToRecycle.add(rlm);
+                    }
                     // 毒消息: topic/event 空白或 data 缺失 (recoverPending / 历史 / 外部写入可能产生) — 不投业务 listener, 直接 ACK 丢弃.
                     // publish 入口虽已禁 null data, 但 recover/历史消息绕过入口校验.
                     if (StringUtils.isBlank(pmTopic) || StringUtils.isBlank(pmEvent) || pmData == null) {
                         log.warn("[{}] partition poison message (blank topic/event or null data) stream={} id={} topic={} event={}",
                                 redisProxy.getQualifier(), stream, id, pmTopic, pmEvent);
-                        if (passthrough instanceof RecycleLinkedMap rlm) rlm.recycle();
                         dropIds = drop(dropIds, id);
                         continue;
                     }
-                    String teKey = pmTopic + "/" + pmEvent;
+                    TopicEventKey teKey = new TopicEventKey(pmTopic, pmEvent);
                     if (log.isDebugEnabled()) {
                         log.debug("[partition-dispatch] stream={} topic={} event={} id={} data={}",
                                 stream, pmTopic, pmEvent, id, ObjMprUtils.toString(pmData));
@@ -2071,13 +2347,6 @@ public class RedisPartition {
                     if (passthrough == null) continue;
                     // 用 pmData 对象引用做 key 存 passthrough, single 路径下逐条按 item 反查
                     RedisProxyHolder.set(pmData, passthrough);
-                    // 仅 PooledEvtData 路径产生的 RecycleLinkedMap 才入待归还队列;
-                    // rawMap 路径的 LinkedHashMap (activateDefaultTyping=false) 由 GC 处理
-                    if (passthrough instanceof RecycleLinkedMap rlm) {
-                        if (ptToRecycle == null) ptToRecycle = RecycleLinkedList.of();
-                        ptToRecycle.add(rlm);
-                    }
-
                     String traceId = MapUtils.getString(passthrough, AnyHolder.TRACE_ID);
                     if (traceId == null) continue;
                     // 按 teKey 累积本桶 traceId, batch 路径整桶 onEvent 时拿来一行染色
@@ -2095,9 +2364,9 @@ public class RedisPartition {
 
             } finally {
                 if (dropIds != null) dropIds.recycle();
-                dataByTE.forEach(RecycleLinkedList.RECY_BICON);
+                dataByTE.forEach((key, values) -> values.recycle());
                 dataByTE.recycle();
-                idsByTE.forEach(RecycleLinkedList.RECY_BICON);
+                idsByTE.forEach((key, values) -> values.recycle());
                 idsByTE.recycle();
                 // listener 已执行完, 池借的 passthrough / traceIdsByTE 不再被引用, 归还到池
                 // (AnyHolder.clear 只 recycle 外层 RecycleLinkedMap, 内层 LinkedHashMap 的 value 不会级联)
@@ -2125,17 +2394,18 @@ public class RedisPartition {
          * @param dataByTE 见上述说明
          * @param idsByTE  见上述说明
          * @param dropIds  见上述说明
+         *                 返回: 无返回值；各路由桶按 listener 类型提交，只有通过 fencing 且处理成功的记录才确认。
          */
         @SuppressWarnings({"rawtypes", "unchecked"})
-        private void flush(RecycleLinkedMap<String, RecycleLinkedList<Object>> dataByTE,
-                           RecycleLinkedMap<String, RecycleLinkedList<String>> idsByTE,
+        private void flush(RecycleLinkedMap<TopicEventKey, RecycleLinkedList<Object>> dataByTE,
+                           RecycleLinkedMap<TopicEventKey, RecycleLinkedList<String>> idsByTE,
                            RecycleLinkedList<String> dropIds) {
             // 毒消息整批 ACK (即使 ack 失败也不致命, 下次 XAUTOCLAIM 还会拿到, dispatch 会再判定为毒消息丢弃)
             if (dropIds != null) this.ackSafe(dropIds, "drop");
             boolean activateDefaultTyping = redisProxy.isActivateDefaultTyping();
             // 逐 (topic, event) 调对应 listener
-            for (Map.Entry<String, RecycleLinkedList<Object>> e : dataByTE.entrySet()) {
-                String teKey = e.getKey();
+            for (Map.Entry<TopicEventKey, RecycleLinkedList<Object>> e : dataByTE.entrySet()) {
+                TopicEventKey teKey = e.getKey();
                 RecycleLinkedList<Object> data = e.getValue();
                 RecycleLinkedList<String> ids = idsByTE.get(teKey);
                 StreamSubscribe listener = group.listenersByTopicEvent.get(teKey);
@@ -2176,7 +2446,7 @@ public class RedisPartition {
                 // single listener: 逐条处理 + 逐条 ACK, 某条失败不影响后续, 防单条毒消息卡死整批
                 if (listener instanceof RedisEventBatchListener bl) {
                     // 批量处理: 取本 (topic, event) 桶累积的 traceIds 染色批日志, 一行能定位本桶所有上游 trace
-                    RecycleLinkedMap<String, HashSet<String>> traceIdsByTE = RedisProxyHolder.get(KEY_TRACE_IDS_BY_TE);
+                    RecycleLinkedMap<TopicEventKey, HashSet<String>> traceIdsByTE = RedisProxyHolder.get(KEY_TRACE_IDS_BY_TE);
                     HashSet<String> teTraceIds = traceIdsByTE == null ? null : traceIdsByTE.get(teKey);
                     String traceIds = teTraceIds == null ? null : String.join(",", teTraceIds);
                     // 精确设当前 teKey 的 trace: 有则设, 无则清 — 否则会继承上一个 teKey 的 trace (同批内串链路)
@@ -2197,7 +2467,7 @@ public class RedisPartition {
                                 , AnyHolder.getTraceId(), stream, teKey, ids.size(), listener.getClass().getSimpleName());
                     }
                     // fence + ack + 条件 XDEL 共用一次 fence 结果, fence 失败两边都跳, 留 PEL.
-                    this.ackSafe(ids, listener.autoDelete(), teKey);
+                    this.ackSafe(ids, listener.autoDelete(), teKey.toString());
                     continue;
                 }
                 // single listener: 逐条处理 + 逐条 ACK, 某条失败不影响后续, 防单条毒消息卡死整批
@@ -2226,7 +2496,7 @@ public class RedisPartition {
                                 , AnyHolder.getTraceId(), stream, teKey, itemId, listener.getClass().getSimpleName());
                     }
                     // fence + ack + 条件 XDEL 共用一次 fence 结果.
-                    this.ackSafe(itemId, listener.autoDelete(), teKey);
+                    this.ackSafe(itemId, listener.autoDelete(), teKey.toString());
                 }
             }
         }
@@ -2261,13 +2531,13 @@ public class RedisPartition {
          * 内 recoverPending 自身负责在网络异常 / xAutoClaim 失败 / maxLoops 耗尽时设 recoverPendingNeeded=true.
          * <p>
          * <b>catch Throwable 而非 RejectedExecutionException</b>: 调用本方法时锁已经被 beforeStart 成功获取
-         * (lock / lockHolder 已设, realLockCount 已 incrementAndGet, RedisLock 已借出池). 一旦 executor.execute
+         * (lock / lockHolder 已设, realLockCount 已 incrementAndGet). 一旦 executor.execute
          * 抛<b>任何</b>异常 (包装 executor / 任务装饰器 / 关闭态适配器 / native-image 实现可能抛非 Rejected 的 Throwable),
          * 异常如果冒泡到 beforeStart 外层 catch return false, ManagedRunner 把 false 当 zombie retry, 不调 afterExit,
-         * 持锁状态完整保留 → 下一轮 retry 再进 beforeStart, 同线程 holder 重入 tryLock 成功 + this.lock 覆盖旧引用,
-         * 旧 RedisLock 永远找不回 (池槽位泄漏). 必须在本方法内部 catch 干净, 不让异常逃出.
+         * 持锁状态完整保留 → 下一轮 retry 再进 beforeStart, 同线程 holder 会重入并覆盖当前 Lock 引用，
+         * 本地持有深度与退出时的单次 unlock 不再对称。必须在本方法内部处理提交异常，不让它逃出.
          * <p>
-         * catch Throwable 后: 回收 ar 防池泄漏 + 保留 recoverPendingNeeded=true 让 beforePoll 周期重试 +
+         * catch Throwable 后: 回收 ar + 保留 recoverPendingNeeded=true 让 beforePoll 周期重试 +
          * 清 recovering=false 让主消费恢复拉新消息. 锁仍在本节点, 旧 PEL 等下次 retry 接管.
          * <p>
          * 用 {@link ActionRecycler} 池化 lambda 实例, 与 RedisProxy 内其它 executor.execute 路径风格统一.
@@ -2309,9 +2579,13 @@ public class RedisPartition {
         }
 
         /**
-         * 业务作用：本地释放 RedisLock 实例 (不发 Redis 命令). 用于 unlock 路径之外的退出:
-         * lockLost / unlock 异常 / unlock 非法持有 这三种场景必须本地释放本 Claim 持有的 RedisLock,
-         * 否则池槽位泄漏 + watchdog 挂.
+         * 业务作用：在未进入 owner 解锁流程时结束 RedisLock 当前 acquisition，不发送 Redis 命令。
+         * 用于已确认 lockLost 或检测到本地线程身份不变量被破坏的退出路径；RedisLock 自身抛出的
+         * owner 失权与网络异常已经完成本地处置，调用方不得再次回收。
+         *
+         * <p>参数说明: 无。
+         * <p>
+         * 返回: 无返回值；底层处置异常只记录诊断，不阻断 Claim 的最终收口。
          */
         private void disposeLocalLock() {
             Lock l = this.lock;
