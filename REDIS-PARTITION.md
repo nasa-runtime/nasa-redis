@@ -453,7 +453,7 @@ nasa:
 | `max-in-flight-retries` | `256` | 已取得执行权的精确或整批 PEL 重试上限 |
 | `max-blocked-keys-per-claim` | `4096` | ordered key 阻断上限，达到后暂停来源 |
 | `max-deferred-ids-per-key` | `1024` | 单 key deferred 坐标上限 |
-| `max-route-blocked-records` | `8192` | 路由或恢复证据不明确时可保留的整批坐标上限 |
+| `max-route-blocked-records` | `8192` | 路由、恢复证据不明确或恢复容量暂满时可保留的整批坐标上限 |
 | `max-pending-unordered-retries` | `8192` | null-key 失败坐标上限 |
 | `max-proxy-ledger-records` | `8192` | BOTH 当前 consumer epoch 多 field record 账本上限 |
 | `max-proxy-fields-per-record` | `64` | 单个普通 Stream record 的 event field 上限 |
@@ -464,7 +464,23 @@ nasa:
 
 `max-in-flight-records`、Task/commit/blocked/deferred/retry/ledger 上限都必须覆盖任一有效 batch-size，
 `max-route-blocked-records` 还必须不小于 `max-in-flight-records`。非法组合在 container 开放前拒绝。容量暂缺
-只暂停新读取，不允许半批提交或驱逐已经登记的 ACK UNKNOWN、gate、ledger 和 PEL 恢复状态。
+只暂停新读取，不驱逐已经登记的 ACK UNKNOWN、gate、ledger 和 PEL 恢复状态。Task/确认配额一次取得，ordered
+gate 按整批预留；账本或门禁容量拒绝发生在首个 Task 提交前，本批暂存的账本与门禁会撤销。
+
+### 容量暂满后的自动恢复
+
+`PARTITION` 与 `BOTH` 的 unordered 重试表、ordered gate、单 key deferred 或 BOTH ledger 暂满时，只阻断
+对应来源的新读取，保留当前 holder/consumer epoch 和已有重试、确认的执行权。尚未接续的批次转入有界整批恢复，
+保存原 Redis 顺序的 PEL 坐标并继续持有读取前取得的 raw record 配额，不另建无界等待列表。
+
+如果 listener 已失败而精确重试表暂满，未登记的坐标仍由原批次负责，完成在途 Task 与确认交接后再保留整批。
+退避期间归还本批 Task 与未转交的确认配额，使已有重试和 ACK 可以继续释放容量。整批恢复沿用
+`retry-initial-delay-ms` / `retry-max-delay-ms`，每次重读 PEL 与正文并复验来源权威；已确认记录跳过，BOTH 已成功
+field 沿用当前 epoch 证据。该批接续到执行、精确重试或确认责任后自动开放新读取，不依赖重启、节点迁移或额外唤醒。
+
+容量保护期间 `route_blocked_batches`、`route_blocked_records` 和 raw 容量用量可见，readiness 暂不可用；受阻责任
+收敛后清除对应保护状态，其它健康条件仍须满足。持续业务失败或 ACK UNKNOWN 会继续保留责任，不保证固定恢复时限。
+单批需求超过总上限、无法安全保留恢复责任、主动停止或明确失权时关闭来源，未完成的 PEL 留给后续合法 owner。
 
 ### 隔离组字段
 
@@ -621,7 +637,8 @@ taskType 预留的完整就绪，再用 Lua 原子复验并登记合同；任何
 两类消费来源都按 Stream/group/consumer/record ID 和来源代次协调本地执行权；已有执行或确认责任的记录
 交给原驱动力，取得执行权的历史记录再次查询 PEL，已经缺席的记录不再调用 listener。
 PEL 查询及实际 holder 复验不确定时保留完整页和恢复容量，证据明确前不发布本页 Task，也不开放后继读取。
-停止、失权或恢复容量不足时关闭来源，未完成的 PEL 留给后续合法 owner。
+恢复容量暂满时保留整批并暂停新读取，容量归还后自动接续。停止、失权或无法安全保留恢复责任时关闭来源，
+未完成的 PEL 留给后续合法 owner。
 
 接管命令超时或连接失败时，Redis 可能已经迁移 PEL 并重置 idle。来源保持本轮游标、新读取屏障和恢复责任，
 退避后分页复验当前 consumer 的 PEL，补回已迁移但尚未交接的记录。这些记录的恢复不重新等待 `min-idle-ms`；
@@ -645,7 +662,8 @@ readiness 保持关闭；全部未交接页面与本轮扫描收敛后，才撤�
 | 取得执行权后 PEL 已缺席或迁移 | 收敛当前来源的对应责任，不执行旧正文、不代替新 owner 确认 |
 | PEL 仍属于当前来源，且恢复权威有效 | 完整解析并取得容量后发布 Task |
 | 任一待处理成员的 PEL 或 holder 证据不明确 | 保留完整页、raw 容量和恢复驱动力，证据明确前不发布本页 Task |
-| 停止、明确失权或恢复容量拒绝 | 关闭对应来源，未完成的 PEL 留给后续合法 owner |
+| 恢复状态容量暂满且能够保留原批次 | 暂停新读取，保留来源权威、整批坐标与 raw 配额；已有重试和确认继续推进，接续后自动恢复读取 |
+| 单批需求超过总上限、无法保留恢复责任、停止或明确失权 | 关闭对应来源，未完成的 PEL 留给后续合法 owner |
 
 执行句柄受已准入 raw batch 与重试容量约束；物理分区不会占用 BOTH 多 field 账本额度。
 这些本地约束不覆盖进程崩溃后已丢失的成功证据，不能据此推导外部副作用 exactly-once。
@@ -838,7 +856,7 @@ XPENDING <streamPrefix>:<partition> <streamPrefix>
 | 发布报告 partition topic route mismatch | topic 是否在所有生产者和消费者中映射到同一组、分区数与键布局 |
 | PEL 持续增长 | listener 连续失败、routeBlocked、ACK UNKNOWN、接管阈值、业务耗时与 Runner 健康 |
 | 同一业务对象观察到并行 | 生产者是否使用同类型稳定 key、是否绕过分区入口、分区数或 topic 到组映射是否变化 |
-| 来源进入 routeBlocked | topic/event/data 合同、listener 计划、`partitionKey`、序列化配置与原批次 PEL 坐标 |
+| 来源进入 routeBlocked | topic/event/data 合同、listener 计划、`partitionKey`、序列化配置、PEL/holder 证据及 retry/gate/ledger 容量 |
 | 停机等待超过预期 | 活动分区组数量、在途回调时长、`drain-timeout-ms`、Redis 命令超时 |
 
 ## 参数调优

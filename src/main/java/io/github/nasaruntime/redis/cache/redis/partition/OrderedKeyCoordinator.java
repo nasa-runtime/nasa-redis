@@ -39,6 +39,57 @@ final class OrderedKeyCoordinator {
     }
 
     /**
+     * 业务作用：在任何 Task 发布前原子预留整批 ordered 门禁，容量暂满时撤销本批新增责任以便前序恢复继续推进。
+     *
+     * @param units 当前批次按 Redis 遇见顺序排列的 ordered 执行单元
+     * @param authority 本批来源权威及期望代次
+     * @return 与输入逐项对应的执行或 deferred 结论；暂满时抛出容量异常，单批 key 数超出总上限时拒绝执行
+     */
+    List<GateReservation> reserveBatch(List<StreamDispatchUnit> units, StreamSourceAuthority.Snapshot authority) {
+        lock.lock();
+        Map<OrderedKeyId, KeyGate> previous = new LinkedHashMap<>();
+        Map<OrderedKeyId, Long> previousSince = new HashMap<>();
+        Map<OrderedKeyId, Long> previousFailures = new HashMap<>();
+        try {
+            for (StreamDispatchUnit unit : units) {
+                OrderedKeyId key = new OrderedKeyId(unit.plan().planId(), unit.route().effectiveHash());
+                if (previous.containsKey(key)) continue;
+                KeyGate gate = gates.get(key);
+                previous.put(key, gate == null ? null : new KeyGate(gate.token(), gate.business(), gate.commit(),
+                        gate.holdReason(), gate.active(), new ArrayList<>(gate.deferred()),
+                        gate.proxyWaitingCoordinates(), gate.pendingCommitCoordinates()));
+                previousSince.put(key, gateSinceNanos.get(key));
+                previousFailures.put(key, consecutiveFailures.get(key));
+            }
+            if (previous.size() > maxBlockedKeysPerSource) {
+                throw new IllegalArgumentException("ordered batch exceeds source key capacity");
+            }
+            List<GateReservation> reservations = new ArrayList<>(units.size());
+            for (StreamDispatchUnit unit : units) {
+                reservations.add(reserve(unit.plan().planId(), unit.route().effectiveHash(), authority, unit.refs()));
+            }
+            return List.copyOf(reservations);
+        } catch (Throwable failure) {
+            // 整批尚未发布业务，恢复原门禁与 deferred；序号不回退，撤销的令牌不能在后续批次复用。
+            for (Map.Entry<OrderedKeyId, KeyGate> entry : previous.entrySet()) {
+                OrderedKeyId key = entry.getKey();
+                if (entry.getValue() == null) {
+                    gates.remove(key);
+                    gateSinceNanos.remove(key);
+                    consecutiveFailures.remove(key);
+                } else {
+                    gates.put(key, entry.getValue());
+                    gateSinceNanos.put(key, previousSince.get(key));
+                    consecutiveFailures.put(key, previousFailures.get(key));
+                }
+            }
+            throw failure;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * 业务作用：原子取得 key 执行权或把完整 Redis 坐标登记为 deferred，避免观察与登记之间丢失后继。
      *
      * @param planId    消费计划标识
@@ -933,11 +984,11 @@ final class OrderedKeyCoordinator {
     }
 
     /**
-     * 业务作用：表示 ordered gate 硬容量已满，来源必须暂停而不能丢弃精确 PEL 坐标。
+     * 业务作用：表示 ordered gate 暂无足够额度，当前批次保留恢复责任而不关闭来源权威。
      */
     static final class OrderedGateCapacityException extends RuntimeException {
         /**
-         * 业务作用：创建容量拒绝结论。参数说明: 失败摘要。返回: 不可重试的当前批结论。
+         * 业务作用：创建容量暂满结论。参数说明: 失败摘要。返回: 需要保留批次并退避的异常。
          */
         OrderedGateCapacityException(String message) {
             super(message);

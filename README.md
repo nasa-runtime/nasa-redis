@@ -608,8 +608,10 @@ XREADGROUP / XAUTOCLAIM / 精确重试
 PEL 并重试 XACK；PEL 或 holder 证据不确定时保留完整页和恢复容量，关闭该来源的新读取。
 
 业务失败会阻断同一计划和有效 hash 的后继，失败头与未执行尾部按精确坐标恢复；其它 key 可以继续推进。
-无法解析路由时保留整批，避免未知前序被后继越过。raw record、Task、确认与重试均有硬容量，容量不足时等待
-或关闭对应来源，不驱逐已经登记的未决责任。配置位于 `stream.partition.local-consumer`。
+无法解析路由时保留整批，避免未知前序被后继越过。raw record、Task、确认与重试均有硬容量。容量暂满时暂停
+对应来源的新读取，已有重试与确认继续推进；受阻批次保留 PEL 坐标和读取配额，容量归还并接续该批次后自动恢复
+读取，无需重启或更换 consumer/holder。单批需求超过总上限、停止或明确失权仍关闭来源，不驱逐未决责任。
+配置位于 `stream.partition.local-consumer`。
 
 `BOTH` 的普通 Stream 侧使用独立的手工确认容器和唯一 consumer epoch。多 event field 共用一个 record 的 PEL，
 只有全部 field 成功才确认；当前 epoch 内保留成功 field 的证据。它仅提供 JVM 内顺序，不能代替物理分区的集群
