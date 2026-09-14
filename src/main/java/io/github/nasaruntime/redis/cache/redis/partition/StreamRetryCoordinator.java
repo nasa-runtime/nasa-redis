@@ -38,7 +38,7 @@ final class StreamRetryCoordinator implements AutoCloseable {
      * @param status              排干与运行指标
      * @param maxInFlight         同时执行的重试上限
      * @param maxPendingUnordered null-key 待重试坐标上限
-     * @param maxRouteBlocked     整批路由阻断坐标上限
+     * @param maxRouteBlocked     整批恢复坐标上限，覆盖路由、证据与容量阻断
      * @param initialDelayMillis  首次退避
      * @param maxDelayMillis      最大退避
      *                            返回: 尚无待重试坐标的协调器。
@@ -118,14 +118,14 @@ final class StreamRetryCoordinator implements AutoCloseable {
     }
 
     /**
-     * 业务作用：在原批次释放前登记一个 listener 失败或未执行的 exact 坐标。
+     * 业务作用：在原批次释放前尝试登记失败或未执行坐标，容量暂满时由调用方保留整批恢复责任。
      *
      * @param source  当前 Redis 来源
      * @param ref     需要重建的 record/field 坐标
      * @param ordered 是否已由 ordered gate 保护
-     *                返回: 无返回值；重复坐标合并为一个退避状态。
+     * @return 已登记、已存在或来源已停止时返回 true；容量暂满返回 false，调用方不得丢弃尚未交接的批次
      */
-    void register(StreamPartitionRuntime.PartitionSource source,
+    boolean register(StreamPartitionRuntime.PartitionSource source,
                   PartitionRecordRef ref,
                   boolean ordered) {
         RetryKey key = RetryKey.of(source, ref);
@@ -133,30 +133,30 @@ final class StreamRetryCoordinator implements AutoCloseable {
         boolean capacityRejected = false;
         registrationLock.lock();
         try {
-            if (!accepting.get() || !runtime.admissionOpen() || !source.allowsRecovery()) return;
-            if (retries.containsKey(key)) return;
+            if (!accepting.get() || !runtime.admissionOpen() || !source.allowsRecovery()) return true;
+            if (retries.containsKey(key)) return true;
             if (!ordered && pendingUnordered >= maxPendingUnordered) {
                 capacityRejected = true;
             } else {
                 created = new RetryState(source, ref, ordered, initialDelayMillis);
                 // admission、容量预留与 Map 发布属于同一事务，关闭扫描不会遗漏已通过检查的状态。
                 RetryState previous = retries.putIfAbsent(key, created);
-                if (previous != null) return;
+                if (previous != null) return true;
                 if (!ordered) pendingUnordered++;
             }
         } finally {
             registrationLock.unlock();
         }
         if (capacityRejected) {
-            status.failReadiness("unordered_retry_capacity");
-            source.pause(new RetryCapacityException("unordered retry capacity exhausted"));
-            return;
+            // 暂满不是失权，既有重试必须继续推进；未登记坐标仍由调用方的 raw 批次容量保护。
+            return false;
         }
         if (created != null) schedule(key, created);
+        return true;
     }
 
     /**
-     * 业务作用：在整条解析失败时以原 Redis 顺序登记批内全部 id，不允许部分 Task 先产生业务副作用。
+     * 业务作用：按原 Redis 顺序保留路由、证据或容量受阻批次的全部 id，并封闭后继新读取直到该批接续。
      *
      * @param source  受阻断的 Redis 来源
      * @param records 该原始批次的全部坐标

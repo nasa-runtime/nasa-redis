@@ -700,7 +700,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
     }
 
     /**
-     * 业务作用：执行两种来源共用的批次所有权流程，历史 PEL 证据不确定或解析失败时保留整批恢复责任。
+     * 业务作用：执行两种来源共用的批次所有权流程，证据不确定、解析失败或恢复容量暂满时保留整批恢复责任。
      *
      * @param source     Redis 来源
      * @param rawBatch   原始批次
@@ -734,6 +734,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
         Preparation preparation = null;
         ProxyPreparation proxyPreparation = null;
         ProxyRecordAckLedger.ExecutionBatch execution = null;
+        ProxyRecordAckLedger.OpenBatch ledgerBatch = null;
         boolean retainedAdmission = false;
         List<Throwable> failures = new ArrayList<>();
         try {
@@ -801,7 +802,8 @@ final class StreamPartitionRuntime implements AutoCloseable {
                     () -> admission.get() && (recoveryAdmission ? source.allowsRecovery() : source.allowsAdmission()))) {
                 if (proxy) {
                     // 组合容量先于全局 ledger 发布，准备失败不会占住无 Task 负责的 record 条目。
-                    preparation = publishProxyLedgers(proxyPreparation);
+                    ledgerBatch = openProxyLedgers(proxyPreparation);
+                    preparation = publishProxyLedgers(proxyPreparation, ledgerBatch);
                 }
                 List<StreamDispatchUnit> units = buildUnits(preparation.prepared());
                 redisProxy.streamPartitionMetrics().batch(
@@ -813,11 +815,12 @@ final class StreamPartitionRuntime implements AutoCloseable {
                     }
                 }
                 capacity.releaseUnusedTasks(taskDemand - units.size());
-                SubmissionBatch submitted = submitUnits(source, units, failures, recoveryAdmission);
+                SubmissionBatch submitted = submitUnits(source, units, failures, recoveryAdmission, ledgerBatch);
                 capacity.releaseUnusedTasks(submitted.blockedUnits());
+                boolean capacityRetained = false;
                 for (DeferredUnit deferred : submitted.deferred()) {
                     for (PartitionRecordRef ref : deferred.unit().refs()) {
-                        retries.register(source, ref, deferred.unit().route().ordered());
+                        if (!retries.register(source, ref, deferred.unit().route().ordered())) capacityRetained = true;
                     }
                 }
                 if (recovery && !submitted.deferred().isEmpty()) {
@@ -825,7 +828,12 @@ final class StreamPartitionRuntime implements AutoCloseable {
                     failures.add(new IllegalStateException("ordered key remains deferred during exact recovery"));
                 }
                 awaitOutcomes(submitted.tickets());
-                settle(source, preparation, submitted.tickets(), capacity, failures);
+                capacityRetained |= settle(source, preparation, submitted.tickets(), capacity, failures);
+                if (capacityRetained) {
+                    // 已提交 Task 和 ACK 先完整交接，再保留整批坐标；退避不占 Task/确认配额，前序恢复才能释放容量。
+                    retainHistoricalBatch(source, unresolvedCoordinates(source, rawBatch), recovery);
+                    throw new PartitionDispatchException("Stream batch 等待恢复容量", failures, true);
+                }
             } catch (PartitionDispatchCapacity.OversizedBatchException oversized) {
                 failures.add(oversized);
                 status.failReadiness("dispatch_capacity_oversized");
@@ -839,6 +847,10 @@ final class StreamPartitionRuntime implements AutoCloseable {
                 // 尚未接续的 record 不能让整批路由恢复提前注销；已经完成的成员由各自确认链收口。
                 throw new PartitionDispatchException("Stream record 等待已有执行或确认责任", List.of(), true);
             }
+        } catch (ProxyRecordAckLedger.LedgerCapacityException | OrderedKeyCoordinator.OrderedGateCapacityException capacity) {
+            // 账本或门禁在任何 Task 之前原子拒绝；保留当前 epoch 的成功证据及整批读取容量，等待前序恢复归还额度。
+            retainHistoricalBatch(source, unresolvedCoordinates(source, rawBatch), recovery);
+            throw new PartitionDispatchException("Stream batch 等待账本或门禁容量", List.of(capacity), true);
         } catch (PartitionDispatchException retained) {
             throw retained;
         } catch (Throwable infrastructureFailure) {
@@ -852,22 +864,23 @@ final class StreamPartitionRuntime implements AutoCloseable {
                 for (PreparedRecord record : preparation.prepared()) record.route().releaseObjectKeyAfterSubmit();
             }
             for (RecycleLinkedMap<String, Object> passthrough : pooledPassthrough) passthrough.recycle();
+            if (ledgerBatch != null) ledgerBatch.close();
             if (execution != null) execution.close();
             batchDrain.close();
         }
     }
 
     /**
-     * 业务作用：把尚未建立恢复责任的历史页整体交给路由重试，证据明确前阻止后继读取越过该页。
+     * 业务作用：把尚未建立恢复责任的受阻批次整体交给重试，容量或证据恢复前阻止后继读取越过该批。
      *
      * @param source   当前消费来源
      * @param refs     当前完整页的冻结坐标，包括仍由其它执行或确认责任持有的成员
      * @param recovery 当前调用是否已经由原重试状态持有完整责任
-     *                 返回: 无返回值；已有责任继续退避，新页交接 raw 容量；停止或失权由重试协调器交回 PEL。
+     *                 返回: 无返回值；已有责任继续退避，新批次交接 raw 容量；停止或失权由重试协调器交回 PEL。
      */
     private void retainHistoricalBatch(PartitionSource source, List<PartitionRecordRef> refs, boolean recovery) {
         if (!recovery) {
-            // 先交接完整页再释放本次执行权，UNKNOWN 不得留下已被接管却无人驱动的记录。
+            // 先交接完整批次再释放本次执行权，容量暂满或 UNKNOWN 都不得留下无人驱动的 PEL。
             PartitionRecordCapacity.Permit permit = source.retainActiveBatch();
             retries.registerRouteBlocked(source, refs, permit);
         }
@@ -980,12 +993,12 @@ final class StreamPartitionRuntime implements AutoCloseable {
     }
 
     /**
-     * 业务作用：在整批组合容量已经取得后一次发布全部 BOTH record ledger，并排除同 epoch 已成功的 field。
+     * 业务作用：在组合容量已经取得后暂存整批 BOTH 账本，后续 gate 容量拒绝可撤销本批新条目。
      *
      * @param preparation 完整解析但尚未发布 ledger 的批次
-     * @return 与全局 ledger 建立精确关联的实际 Task 输入
+     * @return 持有本批新增账本责任的可撤销句柄
      */
-    private Preparation publishProxyLedgers(ProxyPreparation preparation) {
+    private ProxyRecordAckLedger.OpenBatch openProxyLedgers(ProxyPreparation preparation) {
         List<ProxyRecordAckLedger.OpenRequest> requests = new ArrayList<>(preparation.records().size());
         for (ProxyParsedRecord record : preparation.records()) {
             requests.add(new ProxyRecordAckLedger.OpenRequest(
@@ -993,6 +1006,17 @@ final class StreamPartitionRuntime implements AutoCloseable {
                     record.fields().stream().map(ProxyParsedField::field).toList()));
         }
 
+        return proxyLedger.openBatch(requests);
+    }
+
+    /**
+     * 业务作用：关联整批 BOTH 账本与实际 Task 输入，排除当前 epoch 已成功的 field；调用方在门禁预留后接管新条目。
+     *
+     * @param preparation 完整解析的批次
+     * @param opened 可在首个 Task 发布前撤销新条目的账本句柄
+     * @return 与全局账本建立精确关联的实际 Task 输入；此步骤不提交新条目所有权
+     */
+    private Preparation publishProxyLedgers(ProxyPreparation preparation, ProxyRecordAckLedger.OpenBatch opened) {
         LinkedHashMap<RecordFieldKey, PreparedRecord> provisionalByField = new LinkedHashMap<>();
         for (PreparedRecord record : preparation.provisional().prepared()) {
             provisionalByField.put(RecordFieldKey.of(record.decoded().ref()), record);
@@ -1000,33 +1024,30 @@ final class StreamPartitionRuntime implements AutoCloseable {
         LinkedHashMap<RecordFieldKey, ProxyRecordAckLedger.Entry> ledgerByField = new LinkedHashMap<>();
         LinkedHashMap<ProxyRecordAckLedger.Entry, Boolean> ledgerPolicies = new LinkedHashMap<>();
         List<PreparedRecord> prepared = new ArrayList<>();
-        try (ProxyRecordAckLedger.OpenBatch opened = proxyLedger.openBatch(requests)) {
-            for (int index = 0; index < preparation.records().size(); index++) {
-                ProxyParsedRecord record = preparation.records().get(index);
-                ProxyRecordAckLedger.BatchEntry openedRecord = opened.entries().get(index);
-                ProxyRecordAckLedger.Entry ledger = openedRecord.entry();
-                Set<String> execute = Set.copyOf(openedRecord.fieldsToExecute());
-                ledgerPolicies.put(ledger, record.autoDelete());
-                for (ProxyParsedField field : record.fields()) {
-                    RecordFieldKey key = RecordFieldKey.of(field.ref());
-                    PreparedRecord provisional = provisionalByField.get(key);
-                    if (provisional == null) {
-                        throw new IllegalStateException("BOTH field has no provisional record");
-                    }
-                    ledgerByField.put(key, ledger);
-                    if (execute.contains(field.field())) {
-                        prepared.add(new PreparedRecord(
-                                provisional.plan(), provisional.decoded(), provisional.route(), ledger));
-                    } else {
-                        provisional.route().releaseObjectKeyAfterSubmit();
-                    }
+        for (int index = 0; index < preparation.records().size(); index++) {
+            ProxyParsedRecord record = preparation.records().get(index);
+            ProxyRecordAckLedger.BatchEntry openedRecord = opened.entries().get(index);
+            ProxyRecordAckLedger.Entry ledger = openedRecord.entry();
+            Set<String> execute = Set.copyOf(openedRecord.fieldsToExecute());
+            ledgerPolicies.put(ledger, record.autoDelete());
+            for (ProxyParsedField field : record.fields()) {
+                RecordFieldKey key = RecordFieldKey.of(field.ref());
+                PreparedRecord provisional = provisionalByField.get(key);
+                if (provisional == null) {
+                    throw new IllegalStateException("BOTH field has no provisional record");
+                }
+                ledgerByField.put(key, ledger);
+                if (execute.contains(field.field())) {
+                    prepared.add(new PreparedRecord(
+                            provisional.plan(), provisional.decoded(), provisional.route(), ledger));
+                } else {
+                    provisional.route().releaseObjectKeyAfterSubmit();
                 }
             }
-            Preparation published = new Preparation(
-                    List.copyOf(prepared), Map.copyOf(ledgerByField), Map.copyOf(ledgerPolicies));
-            opened.commit();
-            return published;
         }
+        Preparation published = new Preparation(
+                List.copyOf(prepared), Map.copyOf(ledgerByField), Map.copyOf(ledgerPolicies));
+        return published;
     }
 
     /**
@@ -1170,48 +1191,43 @@ final class StreamPartitionRuntime implements AutoCloseable {
     }
 
     /**
-     * 业务作用：取得 ordered gate 并在提交屏障内原子发布 Submission，屏障外通知结果；未取得 gate 的坐标保留 deferred 责任。
+     * 业务作用：先整批预留 ordered gate，再于提交屏障内发布 Submission；屏障外通知结果，受阻坐标保留 deferred 责任。
      *
      * @param source   当前 Redis 来源
      * @param units    待提交执行单元
      * @param failures 批次基础设施失败列表
      * @param recovery 是否按来源恢复准入规则复验本批执行单元
+     * @param ledgerBatch BOTH 本批可撤销账本，物理分区为 null
      * @return 已提交 ticket、blocked 数及 deferred 单元
      */
     private SubmissionBatch submitUnits(PartitionSource source,
                                         List<StreamDispatchUnit> units,
                                         List<Throwable> failures,
-                                        boolean recovery) {
+                                        boolean recovery,
+                                        ProxyRecordAckLedger.OpenBatch ledgerBatch) {
         List<TaskTicket> tickets = new ArrayList<>(units.size());
         List<DeferredUnit> deferred = new ArrayList<>();
         int blocked = 0;
+        StreamSourceAuthority.Snapshot authority = source.authority().snapshot();
+        // Task/确认配额与整批 gate 先于业务提交；单元间发生容量拒绝时不留下半批执行或半批门禁。
+        var reservations = orderedKeys.reserveBatch(
+                units.stream().filter(unit -> unit.route().ordered()).toList(), authority).iterator();
+        if (ledgerBatch != null) ledgerBatch.commit();
         for (StreamDispatchUnit unit : units) {
-            StreamSourceAuthority.Snapshot authority = source.authority().snapshot();
             OrderedKeyCoordinator.GateToken token = null;
             if (unit.route().ordered()) {
-                try {
-                    OrderedKeyCoordinator.GateReservation gate = orderedKeys.reserve(
-                            unit.plan().planId(), unit.route().effectiveHash(), authority, unit.refs());
-                    if (!gate.acquired()) {
-                        blocked++;
-                        if (gate.authorityStale()) {
-                            failures.add(new IllegalStateException("Partition source authority is stale"));
-                        } else {
-                            deferred.add(new DeferredUnit(unit));
-                        }
-                        unit.route().releaseObjectKeyAfterSubmit();
-                        continue;
-                    }
-                    token = gate.token();
-                } catch (OrderedKeyCoordinator.OrderedGateCapacityException capacity) {
-                    failures.add(capacity);
-                    status.failReadiness("ordered_gate_capacity");
-                    source.pause(capacity);
+                OrderedKeyCoordinator.GateReservation gate = reservations.next();
+                if (!gate.acquired()) {
                     blocked++;
-                    deferred.add(new DeferredUnit(unit));
+                    if (gate.authorityStale()) {
+                        failures.add(new IllegalStateException("Partition source authority is stale"));
+                    } else {
+                        deferred.add(new DeferredUnit(unit));
+                    }
                     unit.route().releaseObjectKeyAfterSubmit();
                     continue;
                 }
+                token = gate.token();
             }
             CompletableFuture<ConsumeTaskOutcome> future = new CompletableFuture<>();
             PartitionStreamConsumeTask task = new PartitionStreamConsumeTask(
@@ -1290,9 +1306,9 @@ final class StreamPartitionRuntime implements AutoCloseable {
      * @param tickets     已取得真实终态的 ticket
      * @param capacity    批次组合容量
      * @param failures    需要保留 PEL 的原因列表
-     *                    返回: 无返回值；UNKNOWN 由 CommitAttempt 在批次外继续持有。
+     * @return 存在未取得精确重试额度的坐标时返回 true，调用方须保留整批；UNKNOWN 由 CommitAttempt 在批次外继续持有
      */
-    private void settle(PartitionSource source,
+    private boolean settle(PartitionSource source,
                         Preparation preparation,
                         List<TaskTicket> tickets,
                         PartitionDispatchCapacity.Reservation capacity,
@@ -1300,6 +1316,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
         LinkedHashMap<String, MutableCommitRecord> candidates = new LinkedHashMap<>();
         LinkedHashSet<ProxyRecordAckLedger.Entry> touchedLedgers =
                 new LinkedHashSet<>(preparation.ledgerPolicies().keySet());
+        boolean capacityRetained = false;
         try {
             for (TaskTicket ticket : tickets) {
                 ConsumeTaskOutcome outcome = ticket.future().join();
@@ -1318,8 +1335,9 @@ final class StreamPartitionRuntime implements AutoCloseable {
                     if (outcome.failed() != null) retained.add(outcome.failed());
                     retained.addAll(outcome.deferredTail());
                     if (retained.isEmpty()) retained.addAll(ticket.unit().refs());
-                    for (PartitionRecordRef ref : retained)
-                        retries.register(source, ref, ticket.unit().route().ordered());
+                    for (PartitionRecordRef ref : retained) {
+                        if (!retries.register(source, ref, ticket.unit().route().ordered())) capacityRetained = true;
+                    }
                     failures.add(outcome.cause() == null
                             ? new IllegalStateException("Partition Task did not succeed: " + outcome.status())
                             : outcome.cause());
@@ -1346,6 +1364,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
                 PartitionDispatchCapacity.CommitLease lease = capacity.transferCommitCapacity(candidates.size());
                 commits.commit(source, candidates.values().stream().map(MutableCommitRecord::freeze).toList(), lease);
             }
+            return capacityRetained;
         } finally {
             for (TaskTicket ticket : tickets) {
                 try {
