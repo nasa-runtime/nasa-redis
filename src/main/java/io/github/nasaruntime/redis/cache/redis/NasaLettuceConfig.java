@@ -1,5 +1,7 @@
 package io.github.nasaruntime.redis.cache.redis;
 
+import io.github.nasaruntime.redis.cache.redis.partition.RedisPartitionProperties;
+
 import com.fasterxml.jackson.annotation.JsonAutoDetect;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.PropertyAccessor;
@@ -10,11 +12,13 @@ import io.github.nasaruntime.core.base.DistributedLock;
 import io.github.nasaruntime.core.config.Graceful;
 import io.github.nasaruntime.core.utils.ReflectUtils;
 import io.github.nasaruntime.core.utils.StringUtils;
+import io.github.nasaruntime.redis.cache.redis.partition.StreamPartitionMetrics;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.Setter;
 import org.springframework.data.redis.connection.lettuce.LettuceClientConfiguration;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.beans.factory.support.DefaultSingletonBeanRegistry;
 import org.springframework.boot.autoconfigure.data.redis.RedisProperties.Pool;
@@ -287,6 +291,17 @@ public class NasaLettuceConfig {
     }
 
     /**
+     * 业务作用：在全部 RedisProxy 与可选 MeterRegistry 单例完成装配后建立指标桥接，避免多数据源手工单例遗漏登记。
+     *
+     * @param context 当前 Spring 应用上下文
+     * @return 单例初始化末尾执行一次的绑定动作
+     */
+    @Bean
+    SmartInitializingSingleton streamPartitionMetricsBinder(ApplicationContext context) {
+        return () -> StreamPartitionMetrics.bindAvailable(context);
+    }
+
+    /**
      * 业务作用：承载本组件在 Spring Boot 原生 Redis 配置之上扩展的参数：
      * 运行模式、走原生接口还是批次的并发阈值、以及采集该并发度的时间窗口。
      * 继承原生配置类使连接地址、密码等标准项无需重复声明。
@@ -346,7 +361,7 @@ public class NasaLettuceConfig {
         /* 非group时是否启用线程池并发处理 */
         private boolean nonGroupExecutorEnable = true;
         /* 分区消费 (RedisPartition) 配置. 拉取参数 (pollTimeout/batchSize) 复用上面 Stream 全局配置, 这里只放分区独有的参数 */
-        private final Partition partition = new Partition();
+        private final RedisPartitionProperties partition = new RedisPartitionProperties();
 
     }
 
@@ -385,122 +400,6 @@ public class NasaLettuceConfig {
          */
         private Integer pollTimeout;
 
-    }
-
-    /**
-     * 分区消费 (RedisPartition) 配置。
-     * <p>
-     * 这里只放分区独有的运行参数, 拉取相关 (pollTimeout / batchSize) 仍走 {@link Stream} 全局配置。
-     * <p>
-     * <b>命名空间约定</b>: {@link #defaultGroup} 是所有分区组的命名空间前缀, 也是默认共享组本身的 group 名。
-     * <ul>
-     *   <li>默认共享组: stream = {@code {defaultGroup}:0..count-1}, consumer group 名 = {@code {defaultGroup}}</li>
-     *   <li>隔离组 (yml 中以 {@code groups.<逻辑名>} 配置): stream = {@code {defaultGroup}:<逻辑名>:0..count-1},
-     *       consumer group 名 = {@code {defaultGroup}:<逻辑名>}</li>
-     * </ul>
-     * 业务在 yml 和代码里只用 "逻辑名" (短名), 实际 Redis key 由框架在 {@link #defaultGroup} 命名空间下自动拼接。
-     * <p>
-     * yml 配置示例:
-     * <pre>
-     * nasa:
-     *   redis:
-     *     properties:
-     *       primary:
-     *         stream:
-     *           pollTimeout: 500          # 与普通 stream 消费共享
-     *           batchSize: 100            # 与普通 stream 消费共享
-     *           partition:
-     *             enabled: true           # 分区消费总开关
-     *             default-group: SINGLE-CONSUME  # 命名空间前缀, 也是默认共享组的 group 名
-     *             count: 64               # 默认共享组的分区数
-     *             rebalance-ms: 3000
-     *             min-idle-ms: 30000
-     *             holds-check-interval-ms: 5000
-     *             drain-timeout-ms: 5000
-     *             groups:                 # 隔离组配置, key 用业务逻辑短名 (不要带 default-group 前缀)
-     *               contract:settlement:  # → 实际 stream = SINGLE-CONSUME:contract:settlement:0..63
-     *                 count: 64
-     *                 min-idle-ms: 60000
-     *               spot:settlement:      # → 实际 stream = SINGLE-CONSUME:spot:settlement:0..31
-     *                 count: 32
-     *                 batch-size: 200
-     * </pre>
-     */
-    @Getter
-    @Setter
-    public static class Partition {
-
-        /* 分区消费总开关. false → RedisPartition.init 静默返回, 不启 rebalance / consumer task, 节省启动开销 */
-        private boolean enabled = false;
-        /**
-         * 命名空间前缀, 同时也是默认共享组的 stream/consumer group 名。
-         * 默认 SINGLE-CONSUME (全大写做命名空间标识, 与业务 key 视觉上分离)。
-         * <p>
-         * 实际 Redis key 命名规则:
-         * <ul>
-         *   <li>默认共享组 stream: {@code {defaultGroup}:0..count-1}, consumer group 名 = {defaultGroup}</li>
-         *   <li>隔离组 stream: {@code {defaultGroup}:{逻辑名}:0..count-1}, consumer group 名 = {defaultGroup}:{逻辑名}</li>
-         *   <li>分区锁 key: {@code DISTRIBUTED-LOCK:{stream前缀}:lock:{partition}}</li>
-         * </ul>
-         */
-        private String defaultGroup = "SINGLE-CONSUME";
-        /* 默认共享组的分区数. 业务调 RedisPartition.init() 不传 count 时用这个 */
-        private int count = 64;
-        /* 再平衡周期 ms (按 fair = count / aliveNodes 重新均摊持有的分区数) */
-        private long rebalanceMs = 3_000;
-        /* XAUTOCLAIM 接管 pending 的最小 idle 时间 ms, 与 LettuceDistributedLock 的 leaseTime 对齐, 默认 30s */
-        private long minIdleMs = 30_000;
-        /* holds() 自检最小间隔 ms (防长 GC / 业务长跑后锁丢失). 默认 5s, 远小于 lease=30s */
-        private long holdsCheckIntervalMs = 5_000;
-        /* drain 超时 ms（主动 stop 后等待 in-flight listener / recoverPending 的最大时长）。默认 5s，超时强制 exit，迟到的 XACK 由 fencing 拒绝。 */
-        private long drainTimeoutMs = 5_000;
-        /**
-         * 隔离组配置表。key = 业务逻辑短名 (不要带 defaultGroup 前缀, 框架会自动拼)。
-         * 例如 key="contract:settlement" → 实际 stream 前缀 = "{defaultGroup}:contract:settlement"。
-         * <p>
-         * 默认共享组无需在这里配置, 它的参数由 Partition 顶层字段直接决定。
-         */
-        private final Map<String, PartitionGroup> groups = new LinkedHashMap<>();
-    }
-
-    /**
-     * 单个分区组的覆盖配置。允许隔离组用与默认组不同的参数,
-     * 例如高频低耗时的 settlement 用大 batchSize, 慢任务的某 topic 用更长 minIdleMs。
-     */
-    @Getter
-    @Setter
-    public static class PartitionGroup {
-
-        /* 分区数, 必填 (决定 key.hashCode() % count 的取模基数) */
-        private int count;
-        /* 覆盖父级 rebalanceMs, null = 用父级 Partition.rebalanceMs */
-        private Long rebalanceMs;
-        /* 覆盖父级 minIdleMs, null = 用父级 */
-        private Long minIdleMs;
-        /* 覆盖父级 holdsCheckIntervalMs, null = 用父级 */
-        private Long holdsCheckIntervalMs;
-        /* 覆盖父级 drainTimeoutMs, null = 用父级 */
-        private Long drainTimeoutMs;
-        /* 覆盖父级 Stream.batchSize, null = 用 Stream 全局 */
-        private Integer batchSize;
-        /* 覆盖父级 Stream.pollTimeout, null = 用 Stream 全局 */
-        private Integer pollTimeout;
-        /**
-         * 该隔离组接收哪些业务 topic 的消息。
-         * <p>
-         * 不配 (空列表) → 默认 = [logical name]: yml key 同时作为 topic 名 (1 隔离组 1 topic 简化场景)。
-         * 配了非空 → 框架对每个 topic 调 {@code RedisPartition.isolate(topic, logicalName, count)},
-         * 让多个 topic 共享同一个隔离组的 stream/lock 命名空间。
-         * <p>
-         * 例如 yml:
-         * <pre>
-         * groups:
-         *   high-freq-settle:                        # logical name
-         *     count: 128
-         *     topics: [contract:settlement, spot:settlement]   # 两个 topic 共享 high-freq-settle 组
-         * </pre>
-         */
-        private final List<String> topics = new ArrayList<>();
     }
 
     /**

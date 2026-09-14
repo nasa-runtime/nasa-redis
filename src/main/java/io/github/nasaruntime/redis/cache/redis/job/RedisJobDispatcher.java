@@ -583,8 +583,9 @@ final class RedisJobDispatcher implements AutoCloseable {
     /**
      * 业务作用：在 Scheduler 共享截止内停止新消息领取，并等待普通派发的控制、Stream 与 Handler 执行器终止。
      *
+     * <p>返回: 无返回值；全部关闭和终止步骤均完成时返回；任一步失败时在尝试其余步骤后抛出首个异常。
+     *
      * @param deadlineNanos Scheduler 停机共享的绝对单调时钟截止
-     * @return 全部关闭和终止步骤均完成时返回；任一步失败时在尝试其余步骤后抛出首个异常。
      */
     void close(long deadlineNanos) {
         accepting.set(false);
@@ -659,8 +660,9 @@ final class RedisJobDispatcher implements AutoCloseable {
     /**
      * 业务作用：在同一绝对截止内等待普通派发的 Stream、控制与 Handler 执行器全部实际终止。
      *
+     * <p>返回: 无返回值；三个执行器均终止时返回；任一截止超时时抛出汇总失败。
+     *
      * @param deadlineNanos Scheduler 资源收口使用的绝对单调时钟截止
-     * @return 三个执行器均终止时返回；任一截止超时时抛出汇总失败。
      */
     private void awaitExecutors(long deadlineNanos) {
         List<Throwable> failures = new ArrayList<>();

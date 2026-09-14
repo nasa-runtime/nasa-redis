@@ -26,3 +26,5 @@ https://github.com/nasa-runtime/nasa-redis/security/advisories/new
   与资金或额度场景的保留要求一致。
 - 分布式锁和分区 owner 都是有期限的执行权。可能超过租期的业务操作必须续期并在提交前复验当前权威，
   不能把曾经获得锁或分区所有权视为永久授权。
+- Stream 的逐记录执行权和成功 field 证据属于当前进程与来源代次。它们用于协调本地消费、恢复和确认，
+  不构成跨进程持久业务账本；接管、重启或 consumer epoch 改变后，业务仍须使用稳定事件键去重。

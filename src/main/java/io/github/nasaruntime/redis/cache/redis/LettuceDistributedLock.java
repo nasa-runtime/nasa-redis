@@ -411,7 +411,7 @@ public class LettuceDistributedLock implements DistributedLock {
      *
      * @return 当前锁入口解析后的非空前缀。
      */
-    String keyPrefix() {
+    public String keyPrefix() {
         return prefixes[0];
     }
 
@@ -897,7 +897,7 @@ public class LettuceDistributedLock implements DistributedLock {
      * 表示本地记录中的 owner 正在解锁，但 Redis 端已经不再承认该所有权。
      * 它仍属于 {@link IllegalMonitorStateException}，同时让框架层能与真正的跨线程误用分开诊断。
      */
-    static final class OwnershipLostException extends IllegalMonitorStateException {
+    public static final class OwnershipLostException extends IllegalMonitorStateException {
 
         /**
          * 业务作用：携带已经失去 Redis 锁所有权的诊断信息。
@@ -908,6 +908,19 @@ public class LettuceDistributedLock implements DistributedLock {
         OwnershipLostException(String message) {
             super(message);
         }
+    }
+
+    /**
+     * 业务作用：按 acquisition holder 结束锁句柄的本地所有权，供已失权来源停止续租并清理线程状态。
+     *
+     * <p>返回: 无返回值；只清理匹配 holder 的本地状态，不发送 Redis 解锁命令；非本组件锁保持不变。
+     *
+     * @param lock 当前来源持有的锁句柄
+     * @param holder 本次 acquisition 的 holder，避免迟到清理影响后续所有权
+     */
+    public static void disposeLocal(Lock lock, String holder) {
+        // Redis 已不再承认旧 holder 时不能代替新 owner 解锁；具体锁仍须复验本地 acquisition 身份。
+        if (lock instanceof RedisLock redisLock && holder != null) redisLock.disposeLocal(holder);
     }
 
     // ==================== RedisLock ====================

@@ -188,8 +188,9 @@ final class RedisJobLeaseRenewer implements AutoCloseable {
     /**
      * 业务作用：停止后续续租并等待已经进入执行器的批量续租退出，避免 Registry 注销后仍访问 Redis。
      *
+     * <p>返回: 无返回值；执行器与本地索引均完成收口时返回；截止前未终止或清理失败时抛出异常。
+     *
      * @param deadlineNanos Scheduler 资源收口使用的绝对单调时钟截止
-     * @return 执行器与本地索引均完成收口时返回；截止前未终止或清理失败时抛出异常。
      */
     void close(long deadlineNanos) {
         Throwable failure = RedisJobShutdownSupport.attempt(null, executor::shutdown);

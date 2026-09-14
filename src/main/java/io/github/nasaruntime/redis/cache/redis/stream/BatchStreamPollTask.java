@@ -126,6 +126,48 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
     }
 
     /**
+     * 业务作用：停止阶段只复验来源内部异步工作是否排干，避免把已关闭的 poll admission 当成在途业务。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 生命周期内部可以安全退出时返回 true
+     */
+    boolean isDrainComplete() {
+        return lifecycle.isDrainComplete();
+    }
+
+    /**
+     * 业务作用：在加入本轮 XREADGROUP 前取得来源级读取容量，容量暂缺时保留订阅并等待唤醒。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 可以参加本轮读取时返回 true。
+     */
+    boolean tryAcquirePollPermit() {
+        return lifecycle.tryAcquirePollPermit();
+    }
+
+    /**
+     * 业务作用：把本轮读取结果数量交给来源生命周期，使预留容量收缩为真实批次所有权。
+     *
+     * @param recordCount 当前任务获得的记录数
+     * 返回: 无返回值；零结果同样完成本轮容量交接。
+     */
+    void onPollResult(int recordCount) {
+        lifecycle.onPollResult(recordCount);
+    }
+
+    /**
+     * 业务作用：读取命令或结果交接失败时释放本轮尚未转交的来源容量。
+     *
+     * <p>参数说明: 无。
+     * 返回: 无返回值；重复调用由生命周期实现保证幂等。
+     */
+    void afterPollFailure() {
+        lifecycle.afterPollFailure();
+    }
+
+    /**
      * 业务作用：判断是否已收到停止请求，循环每轮据此决定是否继续。
      *
      * <p>参数说明: 无。
@@ -391,12 +433,21 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
                     break;
                 }
 
-                List<ByteRecord> raw = readFunction.apply(pollState.getCurrentReadOffset());
+                if (!lifecycle.tryAcquirePollPermit()) continue;
+                List<ByteRecord> raw;
+                try {
+                    raw = readFunction.apply(pollState.getCurrentReadOffset());
+                    lifecycle.onPollResult(raw == null ? 0 : raw.size());
+                } catch (Throwable readFailure) {
+                    lifecycle.afterPollFailure();
+                    throw readFailure;
+                }
                 try {
                     deserializeAndEmitRecords(raw);
                 } finally {
                     // 线程级上下文兜底清理 (与 handleBatchResult 路径对称)
                     AnyHolder.clear();
+                    lifecycle.afterBatchComplete();
                 }
 
             } catch (InterruptedException ex) {
@@ -546,6 +597,7 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
             lastHadData = false;
             lastPollNanos = nowNanos;
             recycleRecords(records);
+            lifecycle.afterBatchComplete();
             return;
         }
         lastHadData = true;
@@ -571,6 +623,7 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
                     // 先归池让 runner 醒来时池里有热实例可拿, 避免瞬时 new RecycleLinkedList
                     complete = true;
                     recycleRecords(records);
+                    lifecycle.afterBatchComplete();
                     // 唤醒 ManagedRunner, 让它立即 poll 下一批, 不用傻等 pollTimeout
                     Runnable cb = onComplete;
                     if (cb != null) cb.run();
@@ -593,6 +646,7 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
                 // 这批消息因此本节点没处理, 留在 PEL 等下一轮 / 别节点 XAUTOCLAIM 重投。
                 complete = true;
                 recycleRecords(records);
+                lifecycle.afterBatchComplete();
                 Runnable cb = onComplete;
                 if (cb != null) cb.run();
             }

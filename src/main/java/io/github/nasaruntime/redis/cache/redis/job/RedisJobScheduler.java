@@ -133,9 +133,10 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     /**
      * 业务作用：使用虚拟线程承载迟到权威工作的最终资源收口，不占用平台线程池容量。
      *
+     * <p>返回: 无返回值；线程无法建立或启动时抛出原异常，由当前停机调用方接管。
+     *
      * @param threadName 线程名
      * @param task       final-cleanup 任务
-     * @return 无返回值；线程无法建立或启动时抛出原异常，由当前停机调用方接管。
      */
     private static void startVirtualContinuation(String threadName, Runnable task) {
         Thread.ofVirtual().name(threadName).start(task);
@@ -295,8 +296,9 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     /**
      * 业务作用：在注册表写入或撤权结局不明时永久封闭 source，并复用停机序列完成全量注销补偿。
      *
+     * <p>返回: 无返回值；停机失败附加到原异常，原调用方仍收到首个控制面失败。
+     *
      * @param cause 原始控制面失败，用于附加停机阶段证据
-     * @return 无返回值；停机失败附加到原异常，原调用方仍收到首个控制面失败。
      */
     private void terminateAfterAuthorityFailure(Throwable cause) {
         prepareStop();
@@ -310,8 +312,9 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
     /**
      * 业务作用：监视线程发现能力重建结局不明时提交永久关门，并把可能阻塞的资源收口移交独立线程。
      *
+     * <p>返回: 无返回值；线程无法建立时由当前线程接管同一停机序列。
+     *
      * @param cause 能力重建失败，用于保留停机编排证据
-     * @return 无返回值；线程无法建立时由当前线程接管同一停机序列。
      */
     private void terminateAfterAuthorityFailureAsync(Throwable cause) {
         prepareStop();
@@ -1639,7 +1642,7 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
      *
      * <p>参数说明: 无。
      *
-     * @return 退避结束后返回；中断延迟到最外层资源边界再恢复。
+     * <p>返回: 无返回值；退避结束后返回；中断延迟到最外层资源边界再恢复。
      */
     private void awaitCleanupRetry() {
         long delayMs = Math.max(10L, Math.min(properties.getHeartbeatMs(), 250L));
@@ -1764,9 +1767,10 @@ public final class RedisJobScheduler implements SmartLifecycle, AutoCloseable {
         /**
          * 业务作用：启动一个承担最终资源收口的独立任务。
          *
+         * <p>返回: 无返回值；无法启动时抛出异常，调用方必须同步接管任务。
+         *
          * @param threadName 稳定线程名
          * @param task       最终资源收口任务
-         * @return 无返回值；无法启动时抛出异常，调用方必须同步接管任务。
          */
         void start(String threadName, Runnable task);
     }

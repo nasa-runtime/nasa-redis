@@ -339,9 +339,10 @@ final class RedisJobFanoutMonitor {
      * <p>目标仍在兼容存活快照时，接收后的阻塞尚不能证明节点失联，应按本地执行槽或控制队列拥塞
      * 使用独立容量预算。快照读取失败同样不能证明节点失联，因此保留 assignment 继续等待。
      *
+     * <p>返回: 无返回值；当前 assignment 已变化时原子脚本拒绝迟到裁决。
+     *
      * @param root  Fanout 根数据
      * @param shard 已确认接收但尚未启动的 shard
-     * @return 无返回值；当前 assignment 已变化时原子脚本拒绝迟到裁决。
      */
     private void handleAcceptedStall(RootData root, ShardData shard) {
         CapacityTargets targets = capacityTargets(root, shard.targetNodeIdentity());
@@ -362,9 +363,10 @@ final class RedisJobFanoutMonitor {
      * <p>容量压力证明节点仍在响应，不能写跨根失联证据；换节点配额耗尽也只停止改派，不把忙碌节点
      * 降级为能力缺失。
      *
+     * <p>返回: 无返回值；状态已变化时原子脚本拒绝迟到裁决。
+     *
      * @param root  Fanout 根数据
      * @param shard 当前等待容量的 shard
-     * @return 无返回值；状态已变化时原子脚本拒绝迟到裁决。
      */
     private void handleCapacityPressure(RootData root, ShardData shard) {
         CapacityTargets targets = capacityTargets(root, shard.targetNodeIdentity());
@@ -383,10 +385,11 @@ final class RedisJobFanoutMonitor {
     /**
      * 业务作用：对仍在兼容存活快照中的拥塞目标执行容量专用路由，无候选或预算受限时继续原地等待。
      *
+     * <p>返回: 无返回值；容量换节点不改变故障 assignment 计数。
+     *
      * @param root    Fanout 根数据
      * @param shard   当前等待启动的 shard
      * @param targets 已确认包含当前目标的容量路由快照
-     * @return 无返回值；容量换节点不改变故障 assignment 计数。
      */
     private void routeCapacityPressure(RootData root, ShardData shard, CapacityTargets targets) {
         if (targets.alternate() == null) {
@@ -400,9 +403,10 @@ final class RedisJobFanoutMonitor {
     /**
      * 业务作用：没有其它兼容目标时为当前 assignment 原子开启下一段容量等待窗口。
      *
+     * <p>返回: 无返回值；当前目标或代次变化时不改写新 assignment。
+     *
      * @param root  Fanout 根数据
      * @param shard 当前等待容量的 shard
-     * @return 无返回值；当前目标或代次变化时不改写新 assignment。
      */
     private void continueCapacityWait(RootData root, ShardData shard) {
         scripts.list(RedisJobScript.FANOUT_DEFER_READY,
@@ -416,11 +420,12 @@ final class RedisJobFanoutMonitor {
     /**
      * 业务作用：对已经确认无法由当前 assignment 启动的分片执行根级确定性失败策略。
      *
+     * <p>返回: 无返回值。
+     *
      * @param root             Fanout 根数据
      * @param shard            当前 shard 数据
      * @param reason           失败原因
      * @param reassignmentKind FAILURE 或容量目标离开存活快照后的 CAPACITY_TARGET_LOST
-     * @return 无返回值。
      */
     private void handleUnavailable(RootData root, ShardData shard, String reason, String reassignmentKind) {
         if (root.failurePolicy() == RedisJobFanoutFailurePolicy.STRICT_SNAPSHOT) return;

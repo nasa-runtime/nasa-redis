@@ -10,7 +10,10 @@ Stream 派发和 `XAUTOCLAIM` 完成故障恢复；根任务还可以按实际�
 
 另一项核心能力是 [RedisPartition](REDIS-PARTITION.md)：按稳定业务键把消息路由到固定 Redis Stream 分区，
 以每分区独占锁、Redis 服务端时间成员心跳、通知加周期再平衡、`XAUTOCLAIM` 和 ACK fencing，保证集群中
-同一分区任一时刻只有一个有效消费 owner；节点扩缩容、进程退出或租约失效后由其它实例接管未确认消息。
+同一分区任一时刻只有一个有效消费 owner；Redis 批量读取后按单条消息的 `partitionKey` 进入本地 Partition
+Task，Future 真实结束后再以 holder/consumer-fenced Lua 原子确认。批量传输与单条业务事务分开，
+本地逐记录执行权协调正常消费、PEL 接管、精确重试和确认责任；ACK 未决时只推进确认，迟到接管正文在重新
+查询 PEL 后才可执行。节点扩缩容、进程退出或租约失效后由其它实例接管未确认消息，业务仍须按至少一次交付实现幂等。
 
 组件同时提供 `RedisProxy` 命令代理及面向余额、额度等资金字段的 nonce 幂等计数，默认在 7 天窗口内保证
 同一业务事件最多改变一次计数；此外还包括轻量分布式锁、RediSearch 查询 DSL、显式批量 Pipeline、
@@ -24,7 +27,8 @@ Stream 派发和 `XAUTOCLAIM` 完成故障恢复；根任务还可以按实际�
 </dependency>
 ```
 
-要求 JDK 21+、Maven 3.6.3+。RedisJob 默认使用 Redis 7+ 的 Sharded Pub/Sub；选择
+要求 JDK 21+、Maven 3.6.3+。Stream 分区接管需要 Redis 6.2+ 的 `XAUTOCLAIM`。
+RedisJob 默认使用 Redis 7+ 的 Sharded Pub/Sub；选择
 `BROADCAST` 降级模式时最低要求 Redis 6.2，并需要评估普通 Pub/Sub 在 Cluster 总线上的放大量。
 
 ## 核心价值与运行架构
@@ -38,7 +42,7 @@ Spring 应用实例
 ├─ @EnableRedis ─────▶ RedisProxy（命令、Pipeline、Search、nonce、锁）
 ├─ @EnableRedisJob ──▶ 按 qualifier 隔离的 Scheduler
 │                      定义/Run/租约 ─▶ Dispatch Stream ─▶ attempt fencing
-└─ RedisPartition ───▶ 稳定业务键 ─▶ Stream 分区 ─▶ 独占 owner ─▶ ACK fencing
+└─ RedisPartition ───▶ Stream 分区与独占 owner ─▶ 按键 Partition Task ─▶ Future ─▶ ACK fencing
 
 Redis Cluster
 ├─ Redis TIME：租约、心跳与过期判断的统一时间依据
@@ -276,6 +280,11 @@ nasa:
 @Component
 public class WalletSweepJobs {
 
+    /**
+     * 业务作用：收集待清扫钱包并向兼容 Worker 派发分片。
+     * 参数说明: context 为当前 Run 的执行权与 Fanout 入口。
+     * 返回: Fanout 派发结果，成功后根任务等待分片聚合。
+     */
     @RedisJob(
             name = "contract-wallet-sweep",
             qualifier = "primary",
@@ -295,6 +304,11 @@ public class WalletSweepJobs {
                 .dispatch();
     }
 
+    /**
+     * 业务作用：在当前分片执行权下处理钱包集合。
+     * 参数说明: context 为当前分片上下文；wallets 为该分片的钱包列表。
+     * 返回: 处理完成时返回成功；取消、失权或业务异常由运行时收敛。
+     */
     @RedisJob(
             name = "contract-wallet-sweep-worker",
             qualifier = "primary",
@@ -488,11 +502,17 @@ try {
 - 未取得锁的线程共享释放频道订阅，收到解锁通知后立即重试，并以剩余 TTL 作为通知丢失时的等待上限；
 - 看门狗任务名包含 Redis 数据源、锁入口会话、完整 key、公开句柄和 holder，多数据源同名锁不会覆盖续期任务。
 
-### Stream 分区消费 —— 独占分区与故障接管
+### Stream 分区消费 —— 独占认领、按键执行与故障接管
+
+Java 入口为 `io.github.nasaruntime.redis.cache.redis.partition.RedisPartition`；分区配置由同包的
+`RedisPartitionProperties` 承载，通过 `nasa.redis.properties.<qualifier>.stream.partition` 绑定。
+接入代码、反射类名及原生镜像附加配置都应使用上述完整包名。直接引用 Java 配置类型时，使用
+`RedisPartitionProperties` 及其嵌套类型；应用需要重新编译相关引用，不能只替换 JAR。配置键不随 Java 包名变化。
 
 RedisPartition 把稳定业务键映射到 N 条 Redis Stream，每条 Stream 由一个分布式锁独占。当前 owner 先用
-`XAUTOCLAIM` 接管已达到空闲阈值的 PEL，再用 `XREADGROUP` 读取新消息；处理成功且 ACK 前复验锁权威。
-同键在分区数和命名空间不变时落入同一分区，不同分区可以并行。该能力提供至少一次交付与分区内串行入口，
+`XAUTOCLAIM` 接管已达到空闲阈值的 PEL，再用 `XREADGROUP` 读取新消息；恢复提交前复验实际 holder，
+处理成功后的 XACK 与 holder 检查由同一段 Lua 原子完成。同键在分区数和命名空间不变时落入同一分区，
+同一计划、同一有效 hash 的本地 Task 保序，不同执行槽允许并行。该能力提供至少一次交付与持权消费入口，
 不替外部数据库、HTTP 或其它系统提供 exactly-once，业务回调必须幂等。
 
 ```yaml
@@ -512,26 +532,99 @@ nasa:
 
 除 `enabled: true` 和实际使用的隔离组 `count` 外，其它字段都可以省略并采用内置默认值。默认共享组无需声明
 `groups`；完整配置、默认值、参数约束和滚动变更边界见 [REDIS-PARTITION.md](REDIS-PARTITION.md)。
+RedisPartition 的物理键协议固定使用 Spring UTF-8 `StringRedisSerializer`；通过公开构造器或 fallback
+`RedisTemplate` 注入其它 key serializer 时，会在合同或 Stream 写入前拒绝启用分区能力。
 
-消费侧实现 `RedisEventBatchListener`（或 Single 形态）并把 `mode()` 标成 `ConsumeMode.PARTITION`，注册为 Bean 即可——分区 stream 与消费组由 `RedisProxy` 在初始化阶段按 listener 声明的 topic 自动建好，业务侧不需要显式调 `init` / `isolate`：
+消费侧实现 `RedisEventSingleListener`，把 `mode()` 标成 `ConsumeMode.PARTITION`，并从单条消息返回稳定的
+`partitionKey`。Redis 仍按批拉取，框架按计划和有效 hash 分桶；单条 listener 调用承担业务事务边界。
+这里的 Future 表示框架 Partition Task 的真实终态，不等待回调自行派发的异步工作；`onEvent` 应在这条消息的
+业务处理完成后返回，不能先返回成功再执行持久副作用。
+每个 RedisProxy 只对应一个独立的 `RedisPartition` 和一个 `PartitionRunner`，其全部 listener 共用这套执行域；不同
+Redis 数据源不会共享队列、taskType 状态或故障门禁。首个 listener 显式返回的 Runner 会永久绑定到当前 RedisProxy，
+后续 listener 只能复用同一对象；其它代理复用该对象会在启动和 Redis 副作用前被拒绝。
+单个 listener 登记失败不会停止同代理已经承载其它计划的 Runner；`RedisPartition` 关闭时会先排干来源与本地任务，
+再停止自己独占的 Runner 及其 TimingWheel，不需要应用另行管理这套内部执行域。
+分区 stream 与消费组由 `RedisProxy` 在初始化阶段按 listener 声明的 topic 自动建好，业务侧不需要显式调
+`init` / `isolate`：
 
 ```java
+import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.nasaruntime.redis.cache.redis.ConsumeMode;
+import io.github.nasaruntime.redis.cache.redis.RedisEventSingleListener;
+import org.springframework.stereotype.Component;
+
 @Component
-public class SettlementListener implements RedisEventBatchListener<Order> {
+public class SettlementListener implements RedisEventSingleListener<Order> {
+    /** 业务作用：声明结算事件来源。参数说明: 无。返回: 由结算分区组承载的 topic。 */
     @Override public String[] topics() { return new String[]{"contract:settlement"}; }
+    /** 业务作用：选择开仓事件。参数说明: 无。返回: 当前计划处理的 event。 */
     @Override public String event()    { return "open-position"; }
+    /** 业务作用：使用持权物理分区消费。参数说明: 无。返回: PARTITION 模式。 */
     @Override public ConsumeMode mode(){ return ConsumeMode.PARTITION; }
-    @Override public void onEvent(List<Order> orders) { ... }   // 同分区串行
+    /** 业务作用：声明订单解码类型。参数说明: 无。返回: 精确订单类型。 */
+    @Override public TypeReference<Order> paramType() { return new TypeReference<>() {}; }
+    /** 业务作用：按账户约束本地执行顺序。参数说明: order 为当前订单。返回: 稳定账户键。 */
+    @Override public Object partitionKey(Order order) { return order.uid(); }
+    /** 业务作用：处理一条订单事件。参数说明: order 为当前订单。返回: 正常返回后可进入确认，异常保留重试。 */
+    @Override public void onEvent(Order order) { ... }
 }
 
 // 发布：分区数与命名空间不变时，同一个 uid 始终落入同一分区
 redisProxy.partition("contract:settlement", "open-position", uid, order);
 ```
 
+`PARTITION` 和 `BOTH` 注册期拒绝 Batch listener；`PROXY` 保持既有 Single/Batch 行为。`partitionKey` 返回
+`null` 时逐条走非保序 Task，任意 `Number` 按 `longValue()` 走 Partition 的 long 入口，其它对象原样走 Object
+入口且 `hashCode()` 必须跨反序列化、重启和 PEL 重投保持稳定。成功确认使用 holder-fenced 或 consumer-fenced
+Lua 原子完成；`autoDelete=true` 只删除本次实际 XACK 成功的正文，并会影响该 Stream 的其它 group。
+
 节点身份由应用名、节点序号和每次运行生成的 UUID 组成，同机多进程与同一 JVM 的多个应用上下文不会合并成
 一个成员。每个分区组独立使用 Redis `TIME` 维护成员 ZSET，并按 `ceil(分区数 / 存活节点数)` 限制单节点持有量；
 上线、释放和优雅下线通知用于立即唤醒再平衡，周期任务负责在 Pub/Sub 通知不可达时继续收敛。进程突然退出时，
 成员通常在三个再平衡周期后被剔除，但真正接管仍必须等待原分区锁租期失效。
+
+#### 本地执行、恢复与确认的衔接
+
+```text
+XREADGROUP / XAUTOCLAIM / 精确重试
+              │
+              ▼
+逐 record 执行权 ──已有 Task 或确认责任──▶ 原执行者继续推进
+              │
+              ▼
+历史 PEL 复验 + 实际 holder 复验
+              │
+              ▼
+完整解析计划与业务键 ─▶ 预留容量 ─▶ Partition Task ─▶ Future 真实终态
+                                                        │
+                                  ┌─────────────────────┴──────────────────┐
+                                  ▼                                        ▼
+                             失败坐标重试                      CommitAttempt ─▶ 原子 fencing ACK
+```
+
+执行权按 Stream、group、consumer、record ID 和来源代次隔离，覆盖业务执行以及向重试或确认链的交接。
+`min-idle-ms` 只决定 Redis 接管资格，耗时较长的本地消费也可能达到阈值；接管页不能据此重新提交已有责任的记录。
+取得执行权后再次查询历史 PEL，已经缺席的记录不再调用 listener。ACK 超时或断线时，成功业务交给确认链复验
+PEL 并重试 XACK；PEL 或 holder 证据不确定时保留完整页和恢复容量，关闭该来源的新读取。
+
+业务失败会阻断同一计划和有效 hash 的后继，失败头与未执行尾部按精确坐标恢复；其它 key 可以继续推进。
+无法解析路由时保留整批，避免未知前序被后继越过。raw record、Task、确认与重试均有硬容量，容量不足时等待
+或关闭对应来源，不驱逐已经登记的未决责任。配置位于 `stream.partition.local-consumer`。
+
+`BOTH` 的普通 Stream 侧使用独立的手工确认容器和唯一 consumer epoch。多 event field 共用一个 record 的 PEL，
+只有全部 field 成功才确认；当前 epoch 内保留成功 field 的证据。它仅提供 JVM 内顺序，不能代替物理分区的集群
+holder 权威；进程退出或 consumer epoch 改变后仍可能整条重放。
+
+停机先关闭读取与提交，再等待 Task、Future、确认和恢复责任收口。Claim 排干预算耗尽时，来源代次失效并把未决
+PEL 留给后续 owner；迟到 Task 不得确认消息，但其外部副作用仍由业务幂等约束。`stop()` 及完成回调等待本地资源
+实际结束，不能把“队列为空”或“排干预算耗尽”视为全部工作结束。
+
+#### 容量与运行观测
+
+classpath 存在 Micrometer 且应用提供 `MeterRegistry` 时，组件自动登记低基数指标。重点观察
+`stream_partition_runtime` 的 readiness、raw/Task/commit/retry 使用量、ACK UNKNOWN 和 routeBlocked，
+并结合组级 PEL 数量、最老 idle、锁自检和 owner 收敛时间判断处理是否停滞。采集读取缓存，不执行 Redis I/O。
+没有指标后端也不改变消费语义；配置默认值、容量关系、指标名称及排干边界见 [REDIS-PARTITION.md](REDIS-PARTITION.md)。
 
 ### 普通 Stream 消费与保留期
 
@@ -604,25 +697,29 @@ long total = rediSearch.count(q, Order.class);
 Actuator act = LettucePipeline.open(redisProxy, null);
 try {
     act.hSetAsync(key, hashKey, value);   // 排入批次，不等结果
-    act.hSet(key, otherKey, value2);      // 排入批次并等结果，失败可感知
+    act.hSet(key, otherKey, value2);      // 排入批次，发送该分段时等待响应
 } finally {
-    act.pipeline();                       // 收尾：统一发出。必须调用，否则命令留在线程上
+    act.pipeline();                      // 发送剩余命令并交还批次结果，结束当前线程的批次状态
 }
 ```
 
 `open()` 是线程级的：收尾前该线程上的命令一律缓冲，收尾后恢复直通。批次只能由 `@EnableRedis` 装配出的
 `RedisProxy` 使用——手工 `new` 的实例没有 pipeline 连接池，调用批次 API 会直接报错点名原因。
+达到 `pipelineLength` 时会自动发送当前物理分段，最终仍须调用 `pipeline()` 收尾。无 `Async` 后缀的写入在
+对应分段发送时等待响应，并由最终收尾交还累计失败；方法排队返回不表示 Redis 已执行。未登记成功动作时，
+异步写入不等待 Redis 结果，失败通过日志报告。Pipeline 不提供事务回滚，前面已发送的命令可能已经生效。
 
 显式 `LettucePipeline.open(...)` 不依赖 `RedisProxy.before()`。另一条按 OPS 并发阈值把普通命令自动切到
 批次队列的路径依赖 `RedisProxy` 的 `Initialization.before()`：同时使用 `nasa-spring-boot-starter` 时由其
 初始化编排自动执行；只使用 `@EnableRedis` 时不会自动启用。两条路径不能混为同一种能力。
 
-内部用**并行数组**而非对象链表存放待执行命令，数组连续、cache-friendly，批量场景下比逐条发送显著更快，且不为每条命令分配包装对象。
+待执行命令使用并行数组保存，不为每条命令分配队列包装对象。按批发送可以减少网络往返，实际吞吐取决于命令类型、
+批大小、序列化成本与连接状况。代理关闭时先封闭入队准入，再等待已接纳命令实际发送和完成；迟到调用以异常结束。
 
 ### 其它
 
 - **`RedisProxy`** —— 命令代理，统一序列化、key 前缀与异常转换。
-- **`JedisSnowflake` / `JdkSnowflake`** —— Redis 只负责分配互不重复的 workerId；`JdkSnowflake` 的纯 JDK 生成算法由 `nasa-core` 提供，原有包名和 `@EnableSnowflake` 入口保持不变。
+- **`JedisSnowflake` / `JdkSnowflake`** —— Redis 只负责分配互不重复的 workerId；`JdkSnowflake` 的纯 JDK 生成算法由 `nasa-core` 提供，通过 `@EnableSnowflake` 装配。
 - **`RefreshCacheSub`** —— 基于 Redis pub/sub 的集群本地缓存失效通知。
 - **MyBatis 二级缓存**（`MybatisCache` / `MybatisJedisCache`）—— MyBatis 依赖是 `optional`，不使用 MyBatis 的调用方不会被拖入；要用这两个类时自行声明 `org.mybatis:mybatis`。
 
@@ -646,7 +743,9 @@ Fanout、回收和对账脚本。它们随主 JAR 发布。RedisJob 脚本通过
 
 ## 与 nasa-core 的关系
 
-分布式锁的看门狗续期依赖 `nasa-core` 的 `TimingWheel`；锁实例与 Pipeline 缓冲走 `ObjectPool`；分区消费的上下文用 `RecycleLinkedMap` 承载；`JdkSnowflake` 复用 core 中不依赖 Redis 的 ID 生成算法。当前发布坐标依赖 `io.github.nasa-runtime:nasa-core:1.0.3`，使用方应让 Maven 解析到该版本或兼容的更新版本。
+分布式锁的看门狗续期依赖 `nasa-core` 的 `TimingWheel`；锁实例与 Pipeline 缓冲走 `ObjectPool`；分区消费的上下文用
+`RecycleLinkedMap` 承载，本地 Task 由 `PartitionRunner` 执行；`Snowflake` 复用 core 中不依赖 Redis 的 ID 生成算法。
+当前 POM 依赖 `io.github.nasa-runtime:nasa-core:1.0.4`，应用应保持依赖收敛，并在替换依赖时核对公开接口与执行合同。
 
 ## 构建
 

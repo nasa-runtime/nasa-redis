@@ -108,10 +108,11 @@ final class RedisJobHeartbeatAuthority {
      * <p>在途数是周期观测值：未决请求确认后即使采样已变化，也留给下一周期以新请求发布，避免一次
      * 周期因并发任务起止产生额外 Redis 往返。状态迁移是准入门禁，必须在同一次调用内追加发布。</p>
      *
+     * <p>返回: 无返回值；服务端连续确认当前状态后完成，传输失败、记录过期、权威变化或协议不完整时抛出异常。
+     *
      * @param desiredState    本次调用必须发布的执行器状态
      * @param desiredInflight 本次调用采样的在途执行数
      * @param exchange        Redis 心跳交换边界
-     * @return 无返回值；服务端连续确认当前状态后完成，传输失败、记录过期、权威变化或协议不完整时抛出异常。
      */
     void heartbeat(String desiredState, int desiredInflight, Exchange exchange) {
         Request request = request(desiredState, desiredInflight);

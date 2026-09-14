@@ -37,10 +37,10 @@ registry 与 Fanout hash tag 和当前统一使用的 `<qualifier>:<namespace>` 
 
 当前 source-aware 公开合同包括：
 
-- `RedisJobIdentifiers` 的 scheduled/manual Run 标识计算增加 qualifier，Fanout `executionKey` 随之变化；
-- `RedisJobKeyspace` 构造参数增加 qualifier，生成的全部键和频道进入新 hash tag；
+- `RedisJobIdentifiers` 的 scheduled/manual Run 标识计算包含 qualifier，Fanout `executionKey` 同样绑定来源；
+- `RedisJobKeyspace` 构造参数包含 qualifier，生成的全部键和频道使用对应来源的 hash tag；
 - RedisJob 与 `@EnableRedis` 分离，业务必须显式使用 `@EnableRedisJob`；框架不提供默认
-  `RedisJobScheduler` Bean，编程式入口改为 `RedisJobSchedulers.scheduler(sourceId)`；
+  `RedisJobScheduler` Bean，编程式入口使用 `RedisJobSchedulers.scheduler(sourceId)`；
 - `@RedisJob.qualifier` 没有默认 source，每个注解任务都必须显式声明；
 - 不提供根级 `nasa.redis.job.qualifier`；直接构造 Scheduler 时，source id 从传入 RedisProxy 冻结，不能由
   另一份配置字段伪装成其它来源；
@@ -407,6 +407,11 @@ Map<String, List<WalletSweepItem>> groups =
 `LinkedHashMap`：
 
 ```java
+/**
+ * 业务作用：处理当前 Fanout 分片的钱包条目。
+ * 参数说明: context 为分片上下文；items 为按完整泛型解码的条目。
+ * 返回: 业务执行结论，由运行时依据当前执行权收敛分片。
+ */
 @RedisJob(name = "contract-wallet-sweep-worker", qualifier = "primary",
         trigger = RedisJobTrigger.FANOUT_ONLY)
 public RedisJobResult sweepShard(RedisJobContext context, List<WalletSweepItem> items) { ... }
@@ -441,10 +446,12 @@ public class Application {
 Redis 数据源：
 
 ```java
+/** 业务作用：在 primary 数据源执行结算清扫。参数说明: context 为当前 Run。返回: 当前执行的业务结论。 */
 @RedisJob(name = "settle-sweep", qualifier = "primary", cron = "0/30 * * * * *")
 public RedisJobResult onPrimary(RedisJobContext context) { ... }
 
-@RedisJob(name = "settle-sweep", qualifier = "match", cron = "0/30 * * * * *")  // 登记到 match
+/** 业务作用：在 match 数据源执行结算清扫。参数说明: context 为当前 Run。返回: 当前执行的业务结论。 */
+@RedisJob(name = "settle-sweep", qualifier = "match", cron = "0/30 * * * * *")
 public RedisJobResult onMatch(RedisJobContext context) { ... }
 ```
 
@@ -514,7 +521,7 @@ Fanout 的合同复验不能省略：能力快照冻结之后可能发生滚动�
 **已经在飞的 shard 被升级后的节点拒绝**——这是有意为之，静默用新 Schema 解码旧参数比丢一批分片
 严重得多，但它是部署行为的变更：
 
-- `REASSIGN_ON_FAILURE`：每个被拒 shard 先耗尽 `fanout-receipt-max-retries` 次重发，再重分配到尚未
+- `REASSIGN_ON_FAILURE`：每个被拒 shard 先耗尽根任务注解 `fanoutReceiptMaxRetries` 指定的重发次数，再重分配到尚未
   升级的节点；全部节点完成升级后这些 shard 找不到兼容目标，根在 `fanout-max-wait-ms` 后以
   `WAIT_TIMEOUT` 收敛为 `FAILED`。
 - `STRICT_SNAPSHOT`：不换目标，直接等到根等待超时。
@@ -548,8 +555,8 @@ rjob:{<qualifier>:<namespace>:registry}:layout
 
 ```text
 RedisJob layout mismatch for qualifier=primary namespace=settle;
-this node=1|primary|settle|32|2|redis-job-executor;
-already established=1|primary|settle|64|2|redis-job-executor
+this node=1|primary|settle|32|2|redis-job-executor|SHARDED;
+already established=1|primary|settle|64|2|redis-job-executor|SHARDED
 ```
 
 分片数不同会让同一任务落到不同分片、形成两份定义和两套调度时刻并产生重复 Run；Fanout 桶数不同会让相同

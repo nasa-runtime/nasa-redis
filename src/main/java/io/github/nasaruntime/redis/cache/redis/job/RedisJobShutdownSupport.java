@@ -186,10 +186,11 @@ final class RedisJobShutdownSupport {
     /**
      * 业务作用：在共享绝对截止内等待一个已请求关闭的执行器终止，防止迟到回调越过资源注销边界。
      *
+     * <p>返回: 无返回值；执行器在截止前终止时返回；超时时抛出明确停机失败，中断延迟到最外层资源边界后恢复。
+     *
      * @param executor      已调用 shutdown 的执行器
      * @param deadlineNanos Scheduler 停机共享的绝对单调时钟截止
      * @param resourceName  稳定资源名，用于失败定位
-     * @return 执行器在截止前终止时返回；超时时抛出明确停机失败，中断延迟到最外层资源边界后恢复。
      */
     static void awaitTermination(ExecutorService executor, long deadlineNanos, String resourceName) {
         try (InterruptDeferral ignored = deferInterrupts()) {

@@ -1,5 +1,6 @@
 package io.github.nasaruntime.redis.cache.redis.stream;
 
+import io.github.nasaruntime.redis.cache.redis.partition.RedisPartition;
 import org.springframework.data.redis.stream.StreamListener;
 import org.springframework.data.redis.stream.StreamMessageListenerContainer;
 
@@ -101,6 +102,59 @@ public interface PollLifecycle {
     }
 
     /**
+     * 业务作用：在停止已经关闭新读取后，仅判断来源自己的异步初始化或恢复工作是否已经排干。
+     * 该结论不读取 admission、active 或 routeBlocked；这些状态用于阻止 poll，不能阻止空闲任务退出。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 来源内部没有需要 runner 等待的异步工作时返回 true
+     */
+    default boolean isDrainComplete() {
+        return true;
+    }
+
+    /**
+     * 业务作用：在任务已经通过冷流退避、权威复验与 runner 亲和校验后，为即将发生的一次读取预留容量。
+     * 容量暂缺只跳过本轮读取，不撤销订阅；实现必须保持非阻塞，并在容量归还时主动唤醒 runner。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 已取得本轮读取容量时返回 true；容量暂缺时返回 false
+     */
+    default boolean tryAcquirePollPermit() {
+        return true;
+    }
+
+    /**
+     * 业务作用：接收本轮读取的精确记录数，把读取前预留容量缩减为真实批次所有权。
+     * 批量 XREADGROUP 的每个参与任务都必须收到一次回调，包括返回零条记录的任务。
+     *
+     * @param recordCount 当前来源本轮实际取得的记录数
+     * 返回: 无返回值；零条记录时应立即归还全部预留容量。
+     */
+    default void onPollResult(int recordCount) {
+    }
+
+    /**
+     * 业务作用：在原始批次完成业务结果与确认决策并即将回收时释放读取容量所有权。
+     * 已经把容量转交给 retained recovery 状态的实现应保持幂等，不得重复归还。
+     *
+     * <p>参数说明: 无。
+     * 返回: 无返回值；重复调用保持幂等。
+     */
+    default void afterBatchComplete() {
+    }
+
+    /**
+     * 业务作用：读取、分桶或退出在结果交接前失败时归还尚未转成交付批次的容量。
+     *
+     * <p>参数说明: 无。
+     * 返回: 无返回值；没有待释放容量时保持幂等。
+     */
+    default void afterPollFailure() {
+    }
+
+    /**
      * 业务作用：task 退出时调用, 恰好一次。适合做清理 (unlock / 从注册表中移除等)。
      * <p>
      * 调用时机分场景:
@@ -115,7 +169,7 @@ public interface PollLifecycle {
      * 钩子内部抛出的异常会被框架 catch 并交给 errorHandler 处理, 不会泄漏。
      * <p>
      * <b>实施警示</b>: ManagedRunner 模式下, 如果 beforeStart 已成功获取资源 (例如 tryLock 拿锁), 不能再返回 false —
-     * 否则资源不会通过 afterExit 释放, 下一轮 retry 会重入覆盖资源造成泄漏. 见 {@link io.github.nasaruntime.redis.cache.redis.RedisPartition.Claim}
+     * 否则资源不会通过 afterExit 释放，下一轮 retry 会重入覆盖资源；{@link RedisPartition} 的分区认领遵守此资源交接顺序。
      * 内 submitRecoverPending 的本地 catch 设计.
      *
      * @param normal true → doLoop 完整跑过 (cancel 或 stop 触发的退出);

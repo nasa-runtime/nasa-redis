@@ -1148,27 +1148,36 @@ public class BatchStreamMessageListenerContainer<K, V extends Record<K, ?>> impl
                                 }
                             }
 
+                            // 停止态不能继续使用 isPollReady：来源关闭 admission 后它必然为 false，
+                            // 空闲任务应只等待已交付 batch 和来源内部异步恢复真正排干。
+                            if (task.isStopRequested()) {
+                                if (task.complete && task.isDrainComplete()) {
+                                    this.removeAndExit(task, it, tasks);
+                                    continue;
+                                }
+                                if (task.isLockLost()) {
+                                    this.removeAndExit(task, it, tasks);
+                                    continue;
+                                }
+                                if (task.drainTimedOut(System.currentTimeMillis())) {
+                                    log.warn("partition drain timeout, force exit");
+                                    this.removeAndExit(task, it, tasks);
+                                    continue;
+                                }
+                                if (!task.checkAliveHoldsOnly()) {
+                                    this.removeAndExit(task, it, tasks);
+                                    continue;
+                                }
+                                long next = nowNanos + TimeUnit.MILLISECONDS.toNanos(DRAIN_POLL_MS);
+                                if (next < earliestNextWakeNanos) earliestNextWakeNanos = next;
+                                continue;
+                            }
+
                             // === 业务 in-flight 或异步初始化中 ===
                             if (!task.complete || !task.isPollReady()) {
                                 // 锁真丢失必须立即 exit，不能等待 drain；ACK fencing 会拒绝失权后的迟到确认。
                                 if (task.isLockLost()) {
                                     this.removeAndExit(task, it, tasks);
-                                    continue;
-                                }
-                                // 主动 stop 进入 drain 等待
-                                if (task.isStopRequested()) {
-                                    if (task.drainTimedOut(System.currentTimeMillis())) {
-                                        log.warn("partition drain timeout, force exit");
-                                        this.removeAndExit(task, it, tasks);
-                                        continue;
-                                    }
-                                    // drain 期间仍要 holds 自检 (不读 active/running 以免立即 exit)
-                                    if (!task.checkAliveHoldsOnly()) {
-                                        this.removeAndExit(task, it, tasks);
-                                        continue;
-                                    }
-                                    long next = nowNanos + TimeUnit.MILLISECONDS.toNanos(DRAIN_POLL_MS);
-                                    if (next < earliestNextWakeNanos) earliestNextWakeNanos = next;
                                     continue;
                                 }
                                 // 非 stop 的 in-flight: 走原 checkAlive (含 active/running + holds 自检)
@@ -1187,12 +1196,6 @@ public class BatchStreamMessageListenerContainer<K, V extends Record<K, ?>> impl
                                 }
                                 long next = nowNanos + TimeUnit.SECONDS.toNanos(1);
                                 if (next < earliestNextWakeNanos) earliestNextWakeNanos = next;
-                                continue;
-                            }
-
-                            // === complete=true && isPollReady=true: drain 已完成则立即 exit ===
-                            if (task.isStopRequested()) {
-                                this.removeAndExit(task, it, tasks);
                                 continue;
                             }
 
@@ -1229,6 +1232,11 @@ public class BatchStreamMessageListenerContainer<K, V extends Record<K, ?>> impl
                                 this.removeAndExit(task, it, tasks);
                                 continue;
                             }
+                            if (!task.tryAcquirePollPermit()) {
+                                long next = nowNanos + TimeUnit.MILLISECONDS.toNanos(1);
+                                if (next < earliestNextWakeNanos) earliestNextWakeNanos = next;
+                                continue;
+                            }
 
                             // 收集到本 slot 的 ready 缓冲
                             sb.tasks.add(task);
@@ -1261,6 +1269,7 @@ public class BatchStreamMessageListenerContainer<K, V extends Record<K, ?>> impl
                         if (batchConsumer == null) {
                             errorHandler.handleError(new IllegalStateException(
                                     "ManagedRunner got non-group task (consumer=null), this should not happen"));
+                            for (int j = 0; j < readySize; j++) sb.tasks.get(j).afterPollFailure();
                             continue;
                         }
                         if (sb.hasDuplicateStreamKey()) {
@@ -1277,6 +1286,7 @@ public class BatchStreamMessageListenerContainer<K, V extends Record<K, ?>> impl
                             errorHandler.handleError(ex);
                             for (int j = 0; j < readySize; j++) {
                                 BatchStreamPollTask<K, V> t = sb.tasks.get(j);
+                                t.afterPollFailure();
                                 t.lastHadData = false;
                                 t.lastPollNanos = nowNanos;
                             }
@@ -1288,6 +1298,7 @@ public class BatchStreamMessageListenerContainer<K, V extends Record<K, ?>> impl
                                 BatchStreamPollTask<K, V> t = sb.tasks.get(j);
                                 RecycleLinkedList<ByteRecord> myRecords = grouped.get(t.streamKey());
                                 boolean taskHadData = myRecords != null && !myRecords.isEmpty();
+                                t.onPollResult(myRecords == null ? 0 : myRecords.size());
                                 t.handleBatchResult(myRecords, businessExecutor, nowNanos);
                                 if (taskHadData) anyHadData = true;
                             }
@@ -1357,12 +1368,14 @@ public class BatchStreamMessageListenerContainer<K, V extends Record<K, ?>> impl
                     grouped = container.batchPollAndDemux(List.of(sb.offsets.get(j)), batchConsumer, batchAutoAck);
                     RecycleLinkedList<ByteRecord> records = grouped.get(task.streamKey());
                     boolean taskHadData = records != null && !records.isEmpty();
+                    task.onPollResult(records == null ? 0 : records.size());
                     task.handleBatchResult(records, businessExecutor, nowNanos);
                     if (taskHadData) {
                         anyHadData = true;
                     }
                 } catch (RuntimeException ex) {
                     errorHandler.handleError(ex);
+                    task.afterPollFailure();
                     task.lastHadData = false;
                     task.lastPollNanos = nowNanos;
                 } finally {
@@ -1422,8 +1435,8 @@ public class BatchStreamMessageListenerContainer<K, V extends Record<K, ?>> impl
                 task.exitManaged(false);
                 return;
             }
-            // 已 markStop: 轮询等 drain 完成或超时
-            while (!task.complete || !task.isPollReady()) {
+            // 已 markStop: poll admission 已关闭，只等待已交付业务与来源内部异步工作。
+            while (!task.complete || !task.isDrainComplete()) {
                 long now = System.currentTimeMillis();
                 if (task.isLockLost()) break;
                 if (task.drainTimedOut(now)) {

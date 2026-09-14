@@ -508,10 +508,12 @@ final class RedisJobFanoutCoordinator implements RedisJobFanoutService {
         /**
          * 业务作用：在 commit 后按固定批次建立 inbox、receipt deadline 和低延迟通知。
          *
-         * @param fanoutId Fanout 标识
-         * @param snapshot 能力快照
-         * @param shards   分片参数
-         *                 返回：无返回值。
+         * <p>返回: 无返回值；各批次成功后对应分片进入目标 inbox，脚本返回非成功状态时抛出异常。
+         *
+         * @param fanoutId         Fanout 标识
+         * @param snapshot         能力快照，确定每个分片的目标执行器
+         * @param shards           本次需投递的分片列表，其大小限定投递范围
+         * @param receiptTimeoutMs 从本次投递起等待目标确认接收的时限，单位毫秒
          */
         private void deliver(String fanoutId, RedisJobClusterSnapshot snapshot, List<RedisJobPayload> shards,
                              long receiptTimeoutMs) {

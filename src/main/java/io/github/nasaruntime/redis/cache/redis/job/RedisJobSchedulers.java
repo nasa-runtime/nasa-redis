@@ -465,8 +465,9 @@ public final class RedisJobSchedulers implements SmartLifecycle, AutoCloseable {
     /**
      * 业务作用：在短生命周期临界区提交管理器不可逆终态，并按 close 语义撤销 JVM 静态入口。
      *
+     * <p>返回: 无返回值；该步骤不等待 Redis、Handler 或子资源。
+     *
      * @param closing true 表示永久关闭管理器并撤销静态入口，false 表示提交 Spring 停机终态
-     * @return 无返回值；该步骤不等待 Redis、Handler 或子资源。
      */
     private void commitTerminal(boolean closing) {
         // 终态必须先于管理器生命周期锁发布；启动中的 source 即使持锁阻塞 Redis，其它已开放 source 也能立即关门。
@@ -490,8 +491,9 @@ public final class RedisJobSchedulers implements SmartLifecycle, AutoCloseable {
     /**
      * 业务作用：阻止与管理器终态并发建立的 source 逃离统一停机快照并继续开放准入。
      *
+     * <p>返回: 无返回值；管理器仍可接纳 source 时返回；终态已提交时先关闭该 source，再抛出稳定异常。
+     *
      * @param scheduler 刚放入管理器路由表的 Scheduler
-     * @return 管理器仍可接纳 source 时返回；终态已提交时先关闭该 source，再抛出稳定异常。
      */
     private void rejectTerminalCreation(RedisJobScheduler scheduler) {
         if (!terminalRequested.get()) return;
@@ -561,8 +563,9 @@ public final class RedisJobSchedulers implements SmartLifecycle, AutoCloseable {
     /**
      * 业务作用：等待全部 source 的最终资源阶段，并发布独立于首次管理器停机结果的共享结论。
      *
+     * <p>返回: 无返回值；最终结果先发布，再释放生命周期等待者。
+     *
      * @param orchestrationFailure 建立异步观察者时的失败，可为 null
-     * @return 无返回值；最终结果先发布，再释放生命周期等待者。
      */
     private void finishFinalCleanup(Throwable orchestrationFailure) {
         List<Throwable> failures = new ArrayList<>();
