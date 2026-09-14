@@ -11,13 +11,14 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -43,6 +44,7 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
     private final Consumer<String> receiptListener;
     private final RedisJobLeaseRenewer leaseRenewer;
     private final RedisJobMetrics metrics;
+    private final RedisJobPreStartBarrier preStartBarrier;
     private final Map<String, RedisJobDefinition> definitions = new ConcurrentHashMap<>();
     private final Map<String, RedisJobHandler> handlers = new ConcurrentHashMap<>();
     private final Map<String, Boolean> executions = new ConcurrentHashMap<>();
@@ -54,9 +56,13 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicBoolean accepting = new AtomicBoolean(true);
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final CountDownLatch closeCompleted = new CountDownLatch(1);
+    private volatile Throwable closeFailure;
 
     /**
      * 业务作用：建立具有独立容量配额的 Fanout 接收与执行通道，避免普通派发挤占确认能力。
+     *
+     * <p>返回：创建入口默认关闭、尚未开始接收通知的 Fanout 派发器。
      *
      * @param redisProxy      Redis 命令代理
      * @param properties      Job 配置
@@ -67,12 +73,14 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
      * @param receiptListener Fanout 回执信号处理器
      * @param leaseRenewer    批量租约续期器
      * @param metrics         基础指标容器
+     * @param preStartBarrier 普通与 Fanout 共享的停机前置回调屏障
      */
     RedisJobFanoutDispatcher(RedisProxy redisProxy, RedisJobProperties properties, RedisJobKeyspace keys,
                              RedisJobScriptExecutor scripts, RedisJobExecutorRegistry registry,
                              RedisJobJsonCodec jsonCodec,
                              Consumer<String> receiptListener,
-                             RedisJobLeaseRenewer leaseRenewer, RedisJobMetrics metrics) {
+                             RedisJobLeaseRenewer leaseRenewer, RedisJobMetrics metrics,
+                             RedisJobPreStartBarrier preStartBarrier) {
         this.redisProxy = redisProxy;
         this.properties = properties;
         this.keys = keys;
@@ -82,6 +90,7 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
         this.receiptListener = receiptListener;
         this.leaseRenewer = Objects.requireNonNull(leaseRenewer, "leaseRenewer must not be null");
         this.metrics = Objects.requireNonNull(metrics, "metrics must not be null");
+        this.preStartBarrier = Objects.requireNonNull(preStartBarrier, "preStartBarrier must not be null");
         this.pubSub = new RedisJobPubSub(redisProxy, properties.getPubsubMode());
         this.capacity = new Semaphore(properties.getHandlerCapacity());
         this.businessExecutor = Executors.newThreadPerTaskExecutor(
@@ -91,7 +100,7 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
                 new ArrayBlockingQueue<>(Math.max(16, properties.getHandlerCapacity() * 4)),
                 Thread.ofPlatform().daemon().name("redis-job-fanout-notify-", 0).factory(),
                 new ThreadPoolExecutor.AbortPolicy());
-        this.controlExecutor = Executors.newScheduledThreadPool(1,
+        this.controlExecutor = RedisJobShutdownSupport.scheduledExecutor(1,
                 Thread.ofPlatform().daemon().name("redis-job-fanout-control-", 0).factory());
     }
 
@@ -196,46 +205,52 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
      */
     private void onNotification(String envelope) {
         if (!running.get() || !accepting.get()) return;
-        String[] fields = envelope.split("\\|", -1);
-        if (fields.length != 4) {
-            log.warn("RedisJob fanout notification is invalid");
-            return;
-        }
-        String fanoutId = fields[0];
-        long seq;
-        long epoch;
+        RedisJobPreStartBarrier.Lease preStart = preStartBarrier.enter();
+        if (preStart == null) return;
         try {
-            seq = Long.parseLong(fields[1]);
-            epoch = Long.parseLong(fields[2]);
-        } catch (NumberFormatException error) {
-            log.warn("RedisJob fanout notification has invalid numeric fields");
-            return;
+            String[] fields = envelope.split("\\|", -1);
+            if (fields.length != 4) {
+                log.warn("RedisJob fanout notification is invalid");
+                return;
+            }
+            String fanoutId = fields[0];
+            long seq;
+            long epoch;
+            try {
+                seq = Long.parseLong(fields[1]);
+                epoch = Long.parseLong(fields[2]);
+            } catch (NumberFormatException error) {
+                log.warn("RedisJob fanout notification has invalid numeric fields");
+                return;
+            }
+            String messageId = fields[3];
+            FanoutShardData shard = read(fanoutId, seq);
+            if (shard == null || !registry.nodeIdentity().equals(shard.targetNodeIdentity())
+                    || epoch != shard.assignmentEpoch()) return;
+            RedisJobDefinition definition = definitions.get(shard.workerName());
+            RedisJobHandler handler = handlers.get(shard.workerName());
+            if (definition == null || handler == null) return;
+            createInboxGroup(keys.fanoutInbox(fanoutId, registry.nodeIdentity()));
+            List<Object> accepted = scripts.list(RedisJobScript.FANOUT_ACCEPT_SHARD,
+                    new String[]{keys.fanoutRoot(fanoutId), keys.fanoutShard(fanoutId, seq),
+                            keys.fanoutReceipts(fanoutId), keys.fanoutReady(fanoutId),
+                            keys.fanoutReceiptChannel(fanoutId, shard.originExecutorId())},
+                    fanoutId, seq, registry.nodeIdentity(), registry.executorId(), epoch,
+                    properties.getMinScanIntervalMs(), pubSub.publishCommand(),
+                    // 持久确认前复验来源、协议代次与本地 Worker 合同：确认即承诺执行，
+                    // 不可执行的 shard 必须留在 AWAITING_RECEIPT，由接收重试按失败策略换兼容节点。
+                    keys.qualifier(), properties.getProtocolVersion(),
+                    definition.contractRevision(), definition.schemaId(), definition.wireCodecs());
+            String acceptCode = value(accepted, 0);
+            if (!"OK".equals(acceptCode) && !"ADOPTED".equals(acceptCode)) {
+                metrics.incrementClassified("redis_job_fanout_accept", acceptCode, "");
+                return;
+            }
+            metrics.increment("redis_job_fanout_received_total");
+            start(definition, handler, read(fanoutId, seq), messageId);
+        } finally {
+            preStart.close();
         }
-        String messageId = fields[3];
-        FanoutShardData shard = read(fanoutId, seq);
-        if (shard == null || !registry.nodeIdentity().equals(shard.targetNodeIdentity())
-                || epoch != shard.assignmentEpoch()) return;
-        RedisJobDefinition definition = definitions.get(shard.workerName());
-        RedisJobHandler handler = handlers.get(shard.workerName());
-        if (definition == null || handler == null) return;
-        createInboxGroup(keys.fanoutInbox(fanoutId, registry.nodeIdentity()));
-        List<Object> accepted = scripts.list(RedisJobScript.FANOUT_ACCEPT_SHARD,
-                new String[]{keys.fanoutRoot(fanoutId), keys.fanoutShard(fanoutId, seq),
-                        keys.fanoutReceipts(fanoutId), keys.fanoutReady(fanoutId),
-                        keys.fanoutReceiptChannel(fanoutId, shard.originExecutorId())},
-                fanoutId, seq, registry.nodeIdentity(), registry.executorId(), epoch,
-                properties.getMinScanIntervalMs(), pubSub.publishCommand(),
-                // 持久确认前复验来源、协议代次与本地 Worker 合同: 确认即承诺执行,
-                // 不可执行的 shard 必须留在 AWAITING_RECEIPT, 由接收重试按失败策略换兼容节点
-                keys.qualifier(), properties.getProtocolVersion(),
-                definition.contractRevision(), definition.schemaId(), definition.wireCodecs());
-        String acceptCode = value(accepted, 0);
-        if (!"OK".equals(acceptCode) && !"ADOPTED".equals(acceptCode)) {
-            metrics.incrementClassified("redis_job_fanout_accept", acceptCode, "");
-            return;
-        }
-        metrics.increment("redis_job_fanout_received_total");
-        start(definition, handler, read(fanoutId, seq), messageId);
     }
 
     /**
@@ -287,6 +302,8 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
     private void start(RedisJobDefinition definition, RedisJobHandler handler,
                        FanoutShardData shard, String messageId) {
         if (shard == null) return;
+        // 尚未请求 attempt 时遵守最新终态；已经进入 Redis 的回包则由下方在途交接路径负责收口。
+        if (!accepting.get() || preStartBarrier.isClosed()) return;
         if (!capacity.tryAcquire()) {
             deferForCapacity(shard);
             return;
@@ -327,13 +344,22 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
             capacity.release();
             return;
         }
+        boolean shutdownHandoff = preStartBarrier.isClosed() || !accepting.get();
+        // Redis 已授予 attempt 时先登记在途，再交给业务执行器；停机屏障不会在两份账目之间观察到零。
         registry.executionStarted();
         try {
             businessExecutor.submit(() -> execute(definition, handler, shard, attempt, token, executionId));
-        } catch (RejectedExecutionException error) {
-            registry.executionFinished();
-            executions.remove(executionId);
-            capacity.release();
+            if (shutdownHandoff) metrics.increment("redis_job_shutdown_handoff_total");
+        } catch (Throwable submissionFailure) {
+            // shard attempt 已经取得权威，开放态拒绝、关闭态拒绝或执行器 Error 都必须由当前通知线程接管，
+            // 只有 execute 的 finally 才能同时释放 Registry 在途、执行去重和容量账目。
+            metrics.increment("redis_job_shutdown_handoff_total");
+            try {
+                execute(definition, handler, shard, attempt, token, executionId);
+            } catch (Throwable executionFailure) {
+                submissionFailure.addSuppressed(executionFailure);
+            }
+            RedisJobShutdownSupport.rethrow(submissionFailure);
         }
     }
 
@@ -468,22 +494,138 @@ final class RedisJobFanoutDispatcher implements AutoCloseable {
     }
 
     /**
-     * 业务作用：停止接收新通知并释放 Fanout 控制与业务执行资源。
+     * 业务作用：停止接收新通知并尽力释放全部 Fanout 订阅、控制与业务执行资源。
      *
      * <p>参数说明: 无。
      * <p>
-     * 返回：无返回值。
+     * 返回：全部关闭步骤均已尝试后返回；重复调用等待并复用首次关闭结果。
      */
     @Override
     public void close() {
+        close(RedisJobShutdownSupport.deadlineAfterMillis(properties.getMaxRunDurationMs()));
+    }
+
+    /**
+     * 业务作用：在 Scheduler 共享截止内停止 Fanout 通知，并等待通知、控制与 Handler 执行器全部终止。
+     *
+     * <p>返回: 无返回值；全部关闭和终止步骤均完成时返回；任一步失败时在尝试其余步骤后抛出首个异常。
+     *
+     * @param deadlineNanos Scheduler 停机共享的绝对单调时钟截止
+     */
+    void close(long deadlineNanos) {
         accepting.set(false);
-        if (!closed.compareAndSet(false, true)) return;
+        if (!closed.compareAndSet(false, true)) {
+            RedisJobShutdownSupport.await(closeCompleted);
+            List<Throwable> failures = new ArrayList<>();
+            if (closeFailure != null) failures.add(closeFailure);
+            Throwable subscriptionFailure = closeSubscriptions(null);
+            if (subscriptionFailure != null) failures.add(subscriptionFailure);
+            Throwable shutdownFailure = shutdownExecutors(null);
+            if (shutdownFailure != null) failures.add(shutdownFailure);
+            Throwable terminationFailure = null;
+            try {
+                awaitExecutors(deadlineNanos);
+            } catch (Throwable failure) {
+                terminationFailure = failure;
+            }
+            if (terminationFailure != null) failures.add(terminationFailure);
+            RedisJobShutdownSupport.rethrow(RedisJobShutdownSupport.aggregate(
+                    "RedisJob Fanout dispatcher close and executor termination failed", failures));
+            return;
+        }
         running.set(false);
-        pubSub.close();
-        receiptChannels.clear();
-        notificationExecutor.shutdown();
-        controlExecutor.shutdown();
-        businessExecutor.shutdown();
+        Throwable failure = null;
+        try {
+            failure = closeSubscriptions(failure);
+            failure = shutdownExecutors(failure);
+            failure = RedisJobShutdownSupport.attempt(failure, () -> awaitExecutors(deadlineNanos));
+        } finally {
+            closeFailure = failure;
+            closeCompleted.countDown();
+        }
+        RedisJobShutdownSupport.rethrow(failure);
+    }
+
+    /**
+     * 业务作用：撤销全部 Fanout 通知订阅，并只在底层确认关闭后清除频道路由清单。
+     *
+     * @param failure 已有关闭失败，可为 null
+     * @return 保留最早失败并附带本轮退订失败；全部步骤成功时返回原 failure。
+     */
+    private Throwable closeSubscriptions(Throwable failure) {
+        failure = RedisJobShutdownSupport.attempt(failure, pubSub::close);
+        if (pubSub.isClosed()) {
+            failure = RedisJobShutdownSupport.attempt(failure, receiptChannels::clear);
+        }
+        return failure;
+    }
+
+    /**
+     * 业务作用：向 Fanout 的全部执行器重复提交幂等关闭请求，避免一次资源异常永久留下通知或 Handler 线程。
+     *
+     * @param failure 已有关闭失败，可为 null
+     * @return 保留最早失败并附带后续关闭失败；全部请求成功时返回原 failure。
+     */
+    private Throwable shutdownExecutors(Throwable failure) {
+        failure = RedisJobShutdownSupport.attempt(failure, notificationExecutor::shutdown);
+        failure = RedisJobShutdownSupport.attempt(failure, controlExecutor::shutdown);
+        failure = RedisJobShutdownSupport.attempt(failure, businessExecutor::shutdown);
+        // 关闭请求本身失败不代表执行器已进入终态；立即复验并重试一次，避免随后在未 shutdown 的执行器上无限等待。
+        if (!notificationExecutor.isShutdown()) {
+            failure = RedisJobShutdownSupport.attempt(failure, notificationExecutor::shutdown);
+        }
+        if (!controlExecutor.isShutdown()) {
+            failure = RedisJobShutdownSupport.attempt(failure, controlExecutor::shutdown);
+        }
+        if (!businessExecutor.isShutdown()) {
+            failure = RedisJobShutdownSupport.attempt(failure, businessExecutor::shutdown);
+        }
+        return failure;
+    }
+
+    /**
+     * 业务作用：在同一绝对截止内等待 Fanout 通知、控制与 Handler 执行器全部实际终止。
+     *
+     * <p>返回: 无返回值；三个执行器均终止时返回；任一截止超时时抛出汇总失败。
+     *
+     * @param deadlineNanos Scheduler 资源收口使用的绝对单调时钟截止
+     */
+    private void awaitExecutors(long deadlineNanos) {
+        List<Throwable> failures = new ArrayList<>();
+        try {
+            RedisJobShutdownSupport.awaitTermination(
+                    notificationExecutor, deadlineNanos, "RedisJob fanout notification executor");
+        } catch (Throwable failure) {
+            failures.add(failure);
+        }
+        try {
+            RedisJobShutdownSupport.awaitTermination(
+                    controlExecutor, deadlineNanos, "RedisJob fanout control executor");
+        } catch (Throwable failure) {
+            failures.add(failure);
+        }
+        try {
+            RedisJobShutdownSupport.awaitTermination(
+                    businessExecutor, deadlineNanos, "RedisJob fanout handler executor");
+        } catch (Throwable failure) {
+            failures.add(failure);
+        }
+        RedisJobShutdownSupport.rethrow(RedisJobShutdownSupport.aggregate(
+                "RedisJob Fanout dispatcher executors did not terminate", failures));
+    }
+
+    /**
+     * 业务作用：确认 Fanout 的全部回调执行器已经停止，作为 Registry 注销前的本地权威证据。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 通知、控制与 Handler 执行器均已终止时为 true。
+     */
+    boolean resourcesClosed() {
+        return pubSub.isClosed()
+                && notificationExecutor.isTerminated()
+                && controlExecutor.isTerminated()
+                && businessExecutor.isTerminated();
     }
 
     /**

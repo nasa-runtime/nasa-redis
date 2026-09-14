@@ -17,14 +17,16 @@ import org.springframework.data.redis.stream.Subscription;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Semaphore;
@@ -47,6 +49,7 @@ final class RedisJobDispatcher implements AutoCloseable {
     private final String executorId;
     private final RedisJobLeaseRenewer leaseRenewer;
     private final RedisJobMetrics metrics;
+    private final RedisJobPreStartBarrier preStartBarrier;
     private final Semaphore capacity;
     private final ExecutorService businessExecutor;
     private final ExecutorService streamExecutor;
@@ -59,9 +62,14 @@ final class RedisJobDispatcher implements AutoCloseable {
     private final Map<String, Boolean> executions = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicBoolean accepting = new AtomicBoolean(true);
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final CountDownLatch closeCompleted = new CountDownLatch(1);
+    private volatile Throwable closeFailure;
 
     /**
      * 业务作用：建立 Job 专用字符串 Stream 容器和隔离的控制、业务执行资源。
+     *
+     * <p>返回：创建入口默认关闭、尚未开始消费的普通任务派发器。
      *
      * @param redisProxy    Redis 命令代理
      * @param properties    Job 配置
@@ -72,11 +80,13 @@ final class RedisJobDispatcher implements AutoCloseable {
      * @param registry      执行器注册表，提供当前执行器身份并登记在执行数
      * @param leaseRenewer  批量租约续期器
      * @param metrics       基础指标容器
+     * @param preStartBarrier 普通与 Fanout 共享的停机前置回调屏障
      */
     RedisJobDispatcher(RedisProxy redisProxy, RedisJobProperties properties, RedisJobKeyspace keys,
                        RedisJobRepository repository, RedisJobJsonCodec jsonCodec,
                        RedisJobFanoutService fanoutService, RedisJobExecutorRegistry registry,
-                       RedisJobLeaseRenewer leaseRenewer, RedisJobMetrics metrics) {
+                       RedisJobLeaseRenewer leaseRenewer, RedisJobMetrics metrics,
+                       RedisJobPreStartBarrier preStartBarrier) {
         this.properties = properties;
         this.redisProxy = redisProxy;
         this.keys = keys;
@@ -87,12 +97,13 @@ final class RedisJobDispatcher implements AutoCloseable {
         this.executorId = registry.executorId();
         this.leaseRenewer = Objects.requireNonNull(leaseRenewer, "leaseRenewer must not be null");
         this.metrics = Objects.requireNonNull(metrics, "metrics must not be null");
+        this.preStartBarrier = Objects.requireNonNull(preStartBarrier, "preStartBarrier must not be null");
         this.capacity = new Semaphore(properties.getExecutorCapacity());
         this.businessExecutor = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("redis-job-handler-", 0).factory());
         this.streamExecutor = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("redis-job-stream-", 0).factory());
-        this.controlExecutor = Executors.newScheduledThreadPool(2,
+        this.controlExecutor = RedisJobShutdownSupport.scheduledExecutor(2,
                 Thread.ofPlatform().daemon().name("redis-job-control-", 0).factory());
         var options = StreamMessageListenerContainer.StreamMessageListenerContainerOptions.builder()
                 .pollTimeout(Duration.ofMillis(Math.min(properties.getMaxScanIntervalMs(), 1_000L)))
@@ -351,72 +362,96 @@ final class RedisJobDispatcher implements AutoCloseable {
                     jobName, runId, envelopeSource, keys.qualifier());
             metrics.incrementClassified("redis_job_dispatch_envelope", "SOURCE_MISMATCH", "");
         }
-        if (!accepting.get()) {
-            repository.defer(jobName, runId, message.getId().getValue(), binding.group, binding.stream,
-                    properties.getMaxScanIntervalMs());
-            return;
-        }
-        RedisJobDefinition definition = definitions.get(jobName);
-        RedisJobHandler handler = handlers.get(jobName);
-        if (definition == null || handler == null) {
-            log.warn("RedisJob local handler is unavailable: jobName={}, runId={}", jobName, runId);
-            repository.defer(jobName, runId, message.getId().getValue(), binding.group, binding.stream,
-                    properties.getMaxScanIntervalMs());
-            return;
-        }
-        String workerName = message.getValue().get("workerName");
-        if (!definition.workerName().equals(workerName)) {
-            log.warn("RedisJob worker route is incompatible: jobName={}, workerName={}", jobName, workerName);
-            repository.defer(jobName, runId, message.getId().getValue(), binding.group, binding.stream,
-                    properties.getMaxScanIntervalMs());
-            return;
-        }
         String messageId = message.getId().getValue();
-        if (!capacity.tryAcquire()) {
-            repository.defer(definition, runId, messageId, binding.group);
-            pause(binding);
-            controlExecutor.schedule(() -> resume(binding), properties.getMinScanIntervalMs(), TimeUnit.MILLISECONDS);
+        RedisJobPreStartBarrier.Lease preStart = preStartBarrier.enter();
+        if (preStart == null) {
+            repository.defer(jobName, runId, message.getId().getValue(), binding.group, binding.stream,
+                    properties.getMaxScanIntervalMs());
             return;
         }
-        Semaphore handlerCapacity = handlerCapacities.get(definition.workerName());
-        if (handlerCapacity == null || !handlerCapacity.tryAcquire()) {
-            capacity.release();
-            repository.defer(definition, runId, messageId, binding.group);
-            return;
-        }
-        metrics.gauge("redis_job_running", properties.getExecutorCapacity() - capacity.availablePermits());
-        RedisJobRepository.StartResult start;
         try {
-            start = repository.start(definition, runId, executorId, messageId, binding.group);
-        } catch (RuntimeException e) {
-            handlerCapacity.release();
-            capacity.release();
-            throw e;
-        }
-        if (!"STARTED".equals(start.code()) && !"ADOPTED".equals(start.code())) {
-            metrics.incrementClassified("redis_job_start", start.code(), "");
-            handlerCapacity.release();
-            capacity.release();
+            if (!accepting.get()) {
+                repository.defer(jobName, runId, messageId, binding.group, binding.stream,
+                        properties.getMaxScanIntervalMs());
+                return;
+            }
+            RedisJobDefinition definition = definitions.get(jobName);
+            RedisJobHandler handler = handlers.get(jobName);
+            if (definition == null || handler == null) {
+                log.warn("RedisJob local handler is unavailable: jobName={}, runId={}", jobName, runId);
+                repository.defer(jobName, runId, messageId, binding.group, binding.stream,
+                        properties.getMaxScanIntervalMs());
+                return;
+            }
+            String workerName = message.getValue().get("workerName");
+            if (!definition.workerName().equals(workerName)) {
+                log.warn("RedisJob worker route is incompatible: jobName={}, workerName={}", jobName, workerName);
+                repository.defer(jobName, runId, messageId, binding.group, binding.stream,
+                        properties.getMaxScanIntervalMs());
+                return;
+            }
+            if (!capacity.tryAcquire()) {
+                repository.defer(definition, runId, messageId, binding.group);
+                pause(binding);
+                controlExecutor.schedule(() -> resume(binding), properties.getMinScanIntervalMs(), TimeUnit.MILLISECONDS);
+                return;
+            }
+            Semaphore handlerCapacity = handlerCapacities.get(definition.workerName());
+            if (handlerCapacity == null || !handlerCapacity.tryAcquire()) {
+                capacity.release();
+                repository.defer(definition, runId, messageId, binding.group);
+                return;
+            }
+            if (!accepting.get() || preStartBarrier.isClosed()) {
+                handlerCapacity.release();
+                capacity.release();
+                repository.defer(definition, runId, messageId, binding.group);
+                return;
+            }
             metrics.gauge("redis_job_running", properties.getExecutorCapacity() - capacity.availablePermits());
-            resumePausedStreams();
-            return;
-        }
-        metrics.increment("redis_job_started_total");
-        String executionId = runId + ':' + start.attemptToken();
-        if (executions.putIfAbsent(executionId, Boolean.TRUE) != null) {
-            handlerCapacity.release();
-            capacity.release();
-            return;
-        }
-        registry.executionStarted();
-        try {
-            businessExecutor.submit(() -> execute(binding, definition, handler, runId, start, executionId,
-                    handlerCapacity));
-        } catch (RejectedExecutionException error) {
-            registry.executionFinished();
-            executions.remove(executionId);
-            handlerCapacity.release();
-            capacity.release();
+            RedisJobRepository.StartResult start;
+            try {
+                start = repository.start(definition, runId, executorId, messageId, binding.group);
+            } catch (RuntimeException e) {
+                handlerCapacity.release();
+                capacity.release();
+                throw e;
+            }
+            if (!"STARTED".equals(start.code()) && !"ADOPTED".equals(start.code())) {
+                metrics.incrementClassified("redis_job_start", start.code(), "");
+                handlerCapacity.release();
+                capacity.release();
+                metrics.gauge("redis_job_running", properties.getExecutorCapacity() - capacity.availablePermits());
+                resumePausedStreams();
+                return;
+            }
+            metrics.increment("redis_job_started_total");
+            String executionId = runId + ':' + start.attemptToken();
+            if (executions.putIfAbsent(executionId, Boolean.TRUE) != null) {
+                handlerCapacity.release();
+                capacity.release();
+                return;
+            }
+            boolean shutdownHandoff = preStartBarrier.isClosed() || !accepting.get();
+            // Redis 已授予 attempt 时不能因并发停机丢弃；先登记 Handler 在途，再交给仍开放的业务执行器。
+            registry.executionStarted();
+            try {
+                businessExecutor.submit(() -> execute(binding, definition, handler, runId, start, executionId,
+                        handlerCapacity));
+                if (shutdownHandoff) metrics.increment("redis_job_shutdown_handoff_total");
+            } catch (Throwable submissionFailure) {
+                // attempt 已在 Redis 成立，任何本地提交失败都不能仅释放账目；当前回调必须接管唯一完成出口，
+                // 否则 RUNNING 只能等待租约恢复，停机还可能在错误的零在途证据上注销执行器。
+                metrics.increment("redis_job_shutdown_handoff_total");
+                try {
+                    execute(binding, definition, handler, runId, start, executionId, handlerCapacity);
+                } catch (Throwable executionFailure) {
+                    submissionFailure.addSuppressed(executionFailure);
+                }
+                RedisJobShutdownSupport.rethrow(submissionFailure);
+            }
+        } finally {
+            preStart.close();
         }
     }
 
@@ -534,29 +569,137 @@ final class RedisJobDispatcher implements AutoCloseable {
     }
 
     /**
-     * 业务作用：停止新消息领取并关闭控制与业务执行资源。
+     * 业务作用：停止新消息领取并尽力关闭所有订阅、控制与业务执行资源。
      *
      * <p>参数说明: 无。
      * <p>
-     * 返回：无返回值。
+     * 返回：全部关闭步骤均已尝试后返回；重复调用等待并复用首次关闭结果。
      */
     @Override
     public void close() {
+        close(RedisJobShutdownSupport.deadlineAfterMillis(properties.getMaxRunDurationMs()));
+    }
+
+    /**
+     * 业务作用：在 Scheduler 共享截止内停止新消息领取，并等待普通派发的控制、Stream 与 Handler 执行器终止。
+     *
+     * <p>返回: 无返回值；全部关闭和终止步骤均完成时返回；任一步失败时在尝试其余步骤后抛出首个异常。
+     *
+     * @param deadlineNanos Scheduler 停机共享的绝对单调时钟截止
+     */
+    void close(long deadlineNanos) {
         accepting.set(false);
-        running.set(false);
-        streams.values().forEach(this::pause);
-        container.stop();
-        controlExecutor.shutdown();
-        streamExecutor.shutdown();
-        businessExecutor.shutdown();
-        try {
-            if (!streamExecutor.awaitTermination(
-                    Math.max(1_000L, properties.getMaxScanIntervalMs() * 2L), TimeUnit.MILLISECONDS)) {
-                log.warn("RedisJob stream executor did not stop before shutdown deadline");
+        if (!closed.compareAndSet(false, true)) {
+            RedisJobShutdownSupport.await(closeCompleted);
+            List<Throwable> failures = new ArrayList<>();
+            if (closeFailure != null) failures.add(closeFailure);
+            Throwable streamFailure = closeStreams(null);
+            if (streamFailure != null) failures.add(streamFailure);
+            Throwable shutdownFailure = shutdownExecutors(null);
+            if (shutdownFailure != null) failures.add(shutdownFailure);
+            Throwable terminationFailure = null;
+            try {
+                awaitExecutors(deadlineNanos);
+            } catch (Throwable failure) {
+                terminationFailure = failure;
             }
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
+            if (terminationFailure != null) failures.add(terminationFailure);
+            RedisJobShutdownSupport.rethrow(RedisJobShutdownSupport.aggregate(
+                    "RedisJob ordinary dispatcher close and executor termination failed", failures));
+            return;
         }
+        running.set(false);
+        Throwable failure = null;
+        try {
+            failure = closeStreams(failure);
+            failure = shutdownExecutors(failure);
+            failure = RedisJobShutdownSupport.attempt(failure, () -> awaitExecutors(deadlineNanos));
+        } finally {
+            closeFailure = failure;
+            closeCompleted.countDown();
+        }
+        RedisJobShutdownSupport.rethrow(failure);
+    }
+
+    /**
+     * 业务作用：停止全部 Stream 订阅与监听容器，并保留可供重复 close 复验的真实运行状态。
+     *
+     * @param failure 已有关闭失败，可为 null
+     * @return 保留最早失败并附带本轮 Stream 关闭失败；全部步骤成功时返回原 failure。
+     */
+    private Throwable closeStreams(Throwable failure) {
+        for (StreamBinding binding : streams.values()) {
+            failure = RedisJobShutdownSupport.attempt(failure, () -> pause(binding));
+        }
+        return RedisJobShutdownSupport.attempt(failure, container::stop);
+    }
+
+    /**
+     * 业务作用：向普通派发的全部执行器重复提交幂等关闭请求，避免一次资源异常永久留下活动线程。
+     *
+     * @param failure 已有关闭失败，可为 null
+     * @return 保留最早失败并附带后续关闭失败；全部请求成功时返回原 failure。
+     */
+    private Throwable shutdownExecutors(Throwable failure) {
+        failure = RedisJobShutdownSupport.attempt(failure, controlExecutor::shutdown);
+        failure = RedisJobShutdownSupport.attempt(failure, streamExecutor::shutdown);
+        failure = RedisJobShutdownSupport.attempt(failure, businessExecutor::shutdown);
+        // 关闭请求本身失败不代表执行器已进入终态；立即复验并重试一次，避免随后在未 shutdown 的执行器上无限等待。
+        if (!controlExecutor.isShutdown()) {
+            failure = RedisJobShutdownSupport.attempt(failure, controlExecutor::shutdown);
+        }
+        if (!streamExecutor.isShutdown()) {
+            failure = RedisJobShutdownSupport.attempt(failure, streamExecutor::shutdown);
+        }
+        if (!businessExecutor.isShutdown()) {
+            failure = RedisJobShutdownSupport.attempt(failure, businessExecutor::shutdown);
+        }
+        return failure;
+    }
+
+    /**
+     * 业务作用：在同一绝对截止内等待普通派发的 Stream、控制与 Handler 执行器全部实际终止。
+     *
+     * <p>返回: 无返回值；三个执行器均终止时返回；任一截止超时时抛出汇总失败。
+     *
+     * @param deadlineNanos Scheduler 资源收口使用的绝对单调时钟截止
+     */
+    private void awaitExecutors(long deadlineNanos) {
+        List<Throwable> failures = new ArrayList<>();
+        try {
+            RedisJobShutdownSupport.awaitTermination(
+                    streamExecutor, deadlineNanos, "RedisJob stream executor");
+        } catch (Throwable failure) {
+            failures.add(failure);
+        }
+        try {
+            RedisJobShutdownSupport.awaitTermination(
+                    controlExecutor, deadlineNanos, "RedisJob control executor");
+        } catch (Throwable failure) {
+            failures.add(failure);
+        }
+        try {
+            RedisJobShutdownSupport.awaitTermination(
+                    businessExecutor, deadlineNanos, "RedisJob handler executor");
+        } catch (Throwable failure) {
+            failures.add(failure);
+        }
+        RedisJobShutdownSupport.rethrow(RedisJobShutdownSupport.aggregate(
+                "RedisJob ordinary dispatcher executors did not terminate", failures));
+    }
+
+    /**
+     * 业务作用：确认普通派发的全部回调执行器已经停止，作为 Registry 注销前的本地权威证据。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return Stream、控制与 Handler 执行器均已终止时为 true。
+     */
+    boolean resourcesClosed() {
+        return !container.isRunning()
+                && streamExecutor.isTerminated()
+                && controlExecutor.isTerminated()
+                && businessExecutor.isTerminated();
     }
 
     /**

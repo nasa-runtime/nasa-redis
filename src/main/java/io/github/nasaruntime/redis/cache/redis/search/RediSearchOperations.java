@@ -9,7 +9,7 @@ import java.util.Optional;
 
 /**
  * Nasa
- * RediSearch 主操作接口，对标 Spring Data 的 MongoOperations。
+ * RediSearch 主操作接口，统一索引管理、文档写入、查询和聚合入口。
  * <p>
  * 完整生命周期：
  * <pre>

@@ -171,7 +171,8 @@ public class RedisJobProperties {
     private int handlerCapacity = 8;
 
     /**
-     * attempt 租约时长，同时也是执行器失联后该任务被恢复的最坏等待。
+     * attempt 租约时长。执行器失联后须等租约到期，再由恢复扫描取得新执行权；
+     * 实际恢复延迟还受扫描间隔、Redis 可用性与新执行器容量影响。
      * 必须覆盖两个续期周期加上允许的进程停顿，否则正常运行的任务会被误判失权重跑。
      */
     private long leaseMs = 30_000L;
@@ -193,7 +194,8 @@ public class RedisJobProperties {
     private long clockDriftAllowanceMs = 1_000L;
 
     /**
-     * Handler 协作式取消阈值、重试退避和停机等待的全局上界。
+     * Handler 协作式取消阈值、重试退避和首次有界停机等待的全局上界；
+     * callback 与 close 的最终资源等待没有由此字段限定的截止时间。
      * 到点后请求取消但不强制中断业务线程；Handler 必须在安全点检查信号并主动返回。
      */
     private long maxRunDurationMs = 3_600_000L;

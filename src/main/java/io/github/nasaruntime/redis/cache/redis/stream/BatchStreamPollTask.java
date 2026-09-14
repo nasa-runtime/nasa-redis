@@ -77,9 +77,9 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
      */
     boolean managedSuccess = false;
     /**
-     * 上次 tryLock 重试时间 (ms)。managedSuccess=false 时记录, runner 每 10s 重试一次。
+     * 上次 tryLock 重试的单调时钟快照。managedSuccess=false 时记录, runner 每 10s 重试一次。
      */
-    long lastRetryTime = 0;
+    long lastRetryNanos = 0;
     /**
      * 业务处理完成标识。true = 上一批已处理完 (或还没派发过), 可以加入下一轮 batch poll;
      * false = 业务正在 businessExecutor 上处理中, runner 跳过本 task 不进 batch。
@@ -90,9 +90,9 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
      */
     boolean lastHadData = false;
     /**
-     * 上次拉取时间 (ms)。lastHadData=false 时记录, runner 用 now - lastPollTime &gt;= pollTimeout 判断是否该拉。
+     * 上次拉取的单调时钟快照。lastHadData=false 时记录, runner 按经过时间判断是否该拉。
      */
-    long lastPollTime = 0;
+    long lastPollNanos = 0;
     /**
      * 业务处理完成后的唤醒回调。ManagedRunner 在 drainPending 时设置为 unpark(runnerThread),
      * 让 runner 从 parkNanos 中立即醒来, 不用傻等 pollTimeout。
@@ -100,7 +100,7 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
      */
     volatile Runnable onComplete;
     private volatile boolean containerStopRequested;
-    private volatile long containerStopTime;
+    private volatile long containerStopNanos;
 
     /**
      * 业务作用：判断本任务是否以消费组身份读取。
@@ -126,6 +126,48 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
     }
 
     /**
+     * 业务作用：停止阶段只复验来源内部异步工作是否排干，避免把已关闭的 poll admission 当成在途业务。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 生命周期内部可以安全退出时返回 true
+     */
+    boolean isDrainComplete() {
+        return lifecycle.isDrainComplete();
+    }
+
+    /**
+     * 业务作用：在加入本轮 XREADGROUP 前取得来源级读取容量，容量暂缺时保留订阅并等待唤醒。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 可以参加本轮读取时返回 true。
+     */
+    boolean tryAcquirePollPermit() {
+        return lifecycle.tryAcquirePollPermit();
+    }
+
+    /**
+     * 业务作用：把本轮读取结果数量交给来源生命周期，使预留容量收缩为真实批次所有权。
+     *
+     * @param recordCount 当前任务获得的记录数
+     * 返回: 无返回值；零结果同样完成本轮容量交接。
+     */
+    void onPollResult(int recordCount) {
+        lifecycle.onPollResult(recordCount);
+    }
+
+    /**
+     * 业务作用：读取命令或结果交接失败时释放本轮尚未转交的来源容量。
+     *
+     * <p>参数说明: 无。
+     * 返回: 无返回值；重复调用由生命周期实现保证幂等。
+     */
+    void afterPollFailure() {
+        lifecycle.afterPollFailure();
+    }
+
+    /**
      * 业务作用：判断是否已收到停止请求，循环每轮据此决定是否继续。
      *
      * <p>参数说明: 无。
@@ -134,6 +176,18 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
      */
     boolean isStopRequested() {
         return containerStopRequested || lifecycle.isStopRequested();
+    }
+
+    /**
+     * 业务作用：判断业务生命周期是否已经撤销本任务的消费权威。
+     * 与容器停止分开判断，因为自动确认任务已经从 Redis 取出的批次不能仅因容器收尾而静默丢弃。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 生命周期对象已经要求停止时返回 true。
+     */
+    private boolean isLifecycleStopRequested() {
+        return lifecycle.isStopRequested();
     }
 
     /**
@@ -162,8 +216,9 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
             return true;
         }
         return containerStopRequested
-                && containerStopTime > 0
-                && now - containerStopTime >= CONTAINER_STOP_DRAIN_TIMEOUT_MS;
+                && containerStopNanos > 0
+                && System.nanoTime() - containerStopNanos
+                >= TimeUnit.MILLISECONDS.toNanos(CONTAINER_STOP_DRAIN_TIMEOUT_MS);
     }
 
     /**
@@ -257,7 +312,7 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
      */
     void requestStop() throws DataAccessResourceFailureException {
         if (!containerStopRequested) {
-            containerStopTime = System.currentTimeMillis();
+            containerStopNanos = System.nanoTime();
             containerStopRequested = true;
         }
         cancel();
@@ -378,12 +433,21 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
                     break;
                 }
 
-                List<ByteRecord> raw = readFunction.apply(pollState.getCurrentReadOffset());
+                if (!lifecycle.tryAcquirePollPermit()) continue;
+                List<ByteRecord> raw;
+                try {
+                    raw = readFunction.apply(pollState.getCurrentReadOffset());
+                    lifecycle.onPollResult(raw == null ? 0 : raw.size());
+                } catch (Throwable readFailure) {
+                    lifecycle.afterPollFailure();
+                    throw readFailure;
+                }
                 try {
                     deserializeAndEmitRecords(raw);
                 } finally {
                     // 线程级上下文兜底清理 (与 handleBatchResult 路径对称)
                     AnyHolder.clear();
+                    lifecycle.afterBatchComplete();
                 }
 
             } catch (InterruptedException ex) {
@@ -439,6 +503,18 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
         return lifecycle.beforeStart();
     }
 
+    /**
+     * 业务作用：消费生命周期对象发出的立即重试信号，供 ManagedRunner 决定是否跳过固定退避。
+     * 信号只会加快下一次权威校验，不会直接把任务标记为已经取得资源。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 生命周期对象要求立即重试时返回 true。
+     */
+    boolean consumeImmediateRetry() {
+        return lifecycle.consumeImmediateRetry();
+    }
+
     // ==================== 批量路径访问器 (ManagedRunner 用) ====================
 
     /**
@@ -491,7 +567,7 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
     /**
      * 业务作用：处理 batch 拉到的本 task 的 records 子集 (已经过 streamKey demux 切片)。
      * <p>
-     * 空 records → 视为本周期未拉到, 标 lastHadData=false + 推进 lastPollTime;
+     * 空 records → 视为本周期未拉到, 标 lastHadData=false + 推进 lastPollNanos;
      * 非空 → complete=false 标记 in-flight, 异步派发到 businessExecutor 做反序列化 + listener.onMessage,
      * 完成时 complete=true + onComplete unpark runner 让其立即拉下一批。
      * <p>
@@ -504,14 +580,24 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
      *
      * @param records  见上述说明
      * @param executor 见上述说明
-     * @param now      见上述说明
+     * @param nowNanos 本轮单调时钟快照
+     * 返回: 无返回值；空批次推进退避时钟，非空批次移交业务执行器并在完成后唤醒 runner。
      */
-    void handleBatchResult(List<ByteRecord> records, Executor executor, long now) {
+    void handleBatchResult(List<ByteRecord> records, Executor executor, long nowNanos) {
         if (records == null || records.isEmpty()) {
             lastHadData = false;
-            lastPollTime = now;
+            lastPollNanos = nowNanos;
             // 即使 empty, records 仍是 ObjectPool 借出的实例, 需要回收
             recycleRecords(records);
+            return;
+        }
+        // 停止门禁必须位于业务执行器提交之前；否则容器已经进入关闭阶段时仍会把刚读到的批次
+        // 投递给正在收缩的线程池，既可能继续产生业务副作用，也会把正常停机表现成拒绝异常。
+        if (isLifecycleStopRequested()) {
+            lastHadData = false;
+            lastPollNanos = nowNanos;
+            recycleRecords(records);
+            lifecycle.afterBatchComplete();
             return;
         }
         lastHadData = true;
@@ -522,7 +608,11 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
         try {
             executor.execute(() -> {
                 try {
-                    deserializeAndEmitRecords(records);
+                    // 提交成功到真正开始执行之间仍可能进入停止态。此时保留消息在 PEL，交给存活节点接管，
+                    // 不允许关闭中的节点继续调用业务 listener。
+                    if (!isLifecycleStopRequested()) {
+                        deserializeAndEmitRecords(records);
+                    }
                 } catch (RuntimeException ex) {
                     errorHandler.handleError(ex);
                 } finally {
@@ -533,6 +623,7 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
                     // 先归池让 runner 醒来时池里有热实例可拿, 避免瞬时 new RecycleLinkedList
                     complete = true;
                     recycleRecords(records);
+                    lifecycle.afterBatchComplete();
                     // 唤醒 ManagedRunner, 让它立即 poll 下一批, 不用傻等 pollTimeout
                     Runnable cb = onComplete;
                     if (cb != null) cb.run();
@@ -543,7 +634,11 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
             // executor 拒绝 (RejectedExecutionException / 关闭态适配器 / 装饰器异常) 必须就地吞掉:
             // 不能让异常冒泡到 ManagedRunner 外层 catch — 那会让整个 runner 退出, finally 清掉本 runner
             // 名下所有 partition task, 一次 reject 打死全部分区消费. 交 errorHandler 记录, 下面 finally 兜底 recycle.
-            errorHandler.handleError(new RuntimeException("BatchStreamPollTask submit batch failed", t));
+            // 停机与线程池关闭可能在提交这一瞬间交错。停止态下拒绝表示批次留在 PEL 等待接管，
+            // 属于预期收尾；运行态拒绝仍需报告，否则会掩盖容量不足或执行器异常。
+            if (!isLifecycleStopRequested()) {
+                errorHandler.handleError(new RuntimeException("BatchStreamPollTask submit batch failed", t));
+            }
         } finally {
             if (!submitted) {
                 // executor 拒绝 → lambda 永远不会跑,
@@ -551,6 +646,7 @@ class BatchStreamPollTask<K, V extends Record<K, ?>> implements NasaStreamTask {
                 // 这批消息因此本节点没处理, 留在 PEL 等下一轮 / 别节点 XAUTOCLAIM 重投。
                 complete = true;
                 recycleRecords(records);
+                lifecycle.afterBatchComplete();
                 Runnable cb = onComplete;
                 if (cb != null) cb.run();
             }

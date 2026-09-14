@@ -3,6 +3,7 @@ package io.github.nasaruntime.redis.cache.redis;
 import io.github.nasaruntime.core.base.ObjectPool;
 import io.github.nasaruntime.core.base.RecycleLinkedList;
 import io.github.nasaruntime.core.base.RecycleLinkedMap;
+import io.github.nasaruntime.redis.cache.redis.partition.RedisPartition;
 import io.github.nasaruntime.redis.cache.redis.search.EntityWriteOp;
 import io.github.nasaruntime.redis.cache.redis.search.JsonArrayLuaScripts;
 import io.github.nasaruntime.redis.cache.redis.search.RediSearch;
@@ -90,6 +91,7 @@ import java.util.function.Function;
  *   ThreadLocal&lt;CmdBuffer&gt; CMD: 每线程独占一个 CmdBuffer (并行数组, 所有写命令)  ← 实例级 ThreadLocal
  *   ThreadLocal&lt;RecycleLinkedList&lt;Function&gt;&gt; LF: 每线程独占一个读命令列表
  *   ThreadLocal&lt;Boolean&gt; open / ThreadLocal&lt;Object&gt; execTag: pipeline 控制状态
+ *   ThreadLocal&lt;AutoFlushState&gt;: 跨自动物理分段保留首个失败，直到公开 session 最终收尾
  * </pre>
  * 同一 Actuator 可被任意线程并发使用, 各线程操作自己的 ThreadLocal 状态, 零锁零竞争.
  * ThreadLocal 是<b>实例级</b>字段: 不同 Actuator 实例 (单例 vs throwaway) 状态互不干扰.
@@ -589,7 +591,7 @@ public abstract class LettucePipeline {
      *       保证最终调用 {@link Actuator#pipelineForce()} / {@link Actuator#pipeline()} / {@link Actuator#clearSession()}。
      *       openIsolated 本身只 new 对象 + 设 open ThreadLocal, 不借连接; 忘记收尾会让其 ThreadLocal 状态残留到当前线程
      *       (直到线程结束 / ThreadLocalMap 后续清理)。若已进入 flush / autoFlush 路径再异常, 才涉及连接归还、permit 释放、CmdBuffer 回收依赖异常分支。</li>
-     *   <li>每次调用都分配一个新 Actuator + 5 个 ThreadLocal, 有 GC 成本。<b>只用于低频场景, 不要放热路径。</b></li>
+     *   <li>每次调用都分配一个新 Actuator + 6 个 ThreadLocal, 有 GC 成本。<b>只用于低频场景, 不要放热路径。</b></li>
      *   <li>它在另一条独立连接上立即 flush, 会先于外层仍在缓冲的 session 到达 Redis — 这是"独立执行"的预期语义,
      *       调用方需自行确保两者之间没有顺序依赖。</li>
      *   <li>异常路径想丢弃已入队命令: 调 {@link Actuator#clearSession()} (abort, 只清不发)。</li>
@@ -2925,6 +2927,38 @@ public abstract class LettucePipeline {
         load().pipeline(map);
     }
 
+    /**
+     * 业务作用：把外部组件持有的命令生命周期接入 pipeline，使命令在真正派发前可以被关闭门禁取消，
+     * 派发后则由 Redis future 的终态收回外部责任。
+     */
+    public interface BufferedCommandLifecycle {
+
+        /**
+         * 业务作用：在创建 Redis 命令前复验外部准入，并把已排队命令原子转为在途命令。
+         *
+         * <p>参数说明: 无。
+         *
+         * @return true 表示可以派发；false 表示外部生命周期已关闭，本条命令必须跳过。
+         */
+        boolean beginDispatch();
+
+        /**
+         * 业务作用：登记已创建命令的 Redis future，使外部关闭边界持续覆盖到命令成功或失败。
+         *
+         * @param future 当前命令的 Redis future；null 表示命令未形成可等待的在途结果
+         * 返回: 无返回值；future 到达终态后释放外部生命周期责任。
+         */
+        void bind(RedisFuture<?> future);
+
+        /**
+         * 业务作用：撤销尚未绑定 Redis future 的命令；已进入 Redis 在途阶段时保持等待责任不变。
+         *
+         * <p>参数说明: 无。
+         * 返回: 无返回值；仅在命令仍可安全取消时释放外部生命周期责任。
+         */
+        void abort();
+    }
+
     // ==================== CmdBuffer: 写命令的平坦缓冲区 ====================
 
     /**
@@ -2989,10 +3023,16 @@ public abstract class LettucePipeline {
          * <p>
          * extras 中若是 {@link RecycleLinkedMap} (OP_XADD_MULTI 的 field-message map), 一并 recycle 还池;
          * dispatch 后 lettuce 已把 byte[] 引用复制到 CommandArgs, map 不再被引用, 可安全回收.
+         *
+         * <p>参数说明: 无。
+         * 返回: 无返回值；全部引用槽清空，未派发的外部生命周期被撤销，缓冲区恢复为空。
          */
         @Override
         public void restore() {
             for (int i = 0; i < count; i++) {
+                BufferedCommandLifecycle lifecycle = lifecycles[i];
+                if (lifecycle != null) lifecycle.abort();
+                lifecycles[i] = null;
                 arg1[i] = null;
                 arg2[i] = null;
                 arg3[i] = null;
@@ -3050,9 +3090,13 @@ public abstract class LettucePipeline {
         /**
          * 返回值占位 future: 读命令通过此槽把 dispatchOne 返回的 RedisFuture 回填给业务线程的 LettuceFuture.
          * <p>
-         * 写命令 (fire-and-forget) 此槽为 null, sync 写命令走 SYNC_BIT + syncFutures 列表, 互斥关系.
+         * 写命令此槽为 null；需要确认的写命令通过 SYNC_BIT 或成功动作门禁进入 awaitedFutures，二者互斥。
          */
         LettuceFuture<?>[] lfs;
+        /**
+         * 需要由外部关闭边界跟踪的命令生命周期；普通 pipeline 命令保持 null。
+         */
+        BufferedCommandLifecycle[] lifecycles;
         /**
          * 当前已入队的命令数
          */
@@ -3063,6 +3107,7 @@ public abstract class LettucePipeline {
          * 预分配到批次长度上限，使稳态下入队不触发扩容——扩容要复制全部数组，发生在热路径上代价明显。
          *
          * @param capacity 初始槽位数
+         * 返回: 构造出的空命令缓冲。
          */
         CmdBuffer(int capacity) {
             this.ops = new short[capacity];
@@ -3073,10 +3118,14 @@ public abstract class LettucePipeline {
             this.longArg2 = new long[capacity];
             this.extras = new Object[capacity];
             this.lfs = new LettuceFuture[capacity];
+            this.lifecycles = new BufferedCommandLifecycle[capacity];
         }
 
         /**
-         * 业务作用：容量不足时 doubling 扩容, Arrays.copyOf 保留已有数据
+         * 业务作用：容量不足时 doubling 扩容, Arrays.copyOf 保留已有数据。
+         *
+         * <p>参数说明: 无。
+         * 返回: 无返回值；容量充足时保持原数组，否则同步扩展所有并行槽位。
          */
         void ensureCapacity() {
             if (count < ops.length) return;
@@ -3089,6 +3138,7 @@ public abstract class LettucePipeline {
             longArg2 = Arrays.copyOf(longArg2, newCap);
             extras = Arrays.copyOf(extras, newCap);
             lfs = Arrays.copyOf(lfs, newCap);
+            lifecycles = Arrays.copyOf(lifecycles, newCap);
         }
     }
 
@@ -3117,6 +3167,17 @@ public abstract class LettucePipeline {
          * pipeline 执行成功后的回调
          */
         private final ThreadLocal<RecycleLinkedList<Action>> pipelineSuccessActions = new ThreadLocal<>();
+        /**
+         * 自动物理分段状态；只在公开 session 达到自动 flush 阈值后创建，并在最终收尾或主动丢弃时移除。
+         */
+        private final ThreadLocal<AutoFlushState> autoFlushState = new ThreadLocal<>();
+
+        /**
+         * 自动物理分段是否发生，以及这些分段的首个失败。
+         */
+        private static final class AutoFlushState {
+            private Throwable firstFailure;
+        }
 
         /**
          * 写命令缓冲区: 平坦数组, 每条命令 = 数组下标赋值, 零对象分配
@@ -3358,15 +3419,27 @@ public abstract class LettucePipeline {
         }
 
         /**
-         * 业务作用：登记一个在批次<b>成功发出之后</b>执行的动作。
-         * 用于「命令确实写进 Redis 之后才该做」的后续处理（如发通知、改本地状态）——
-         * 在发出前做会让批次失败时留下已经生效的副作用。
+         * 业务作用：登记一个在公开 session 的全部命令都被 Redis 成功确认后执行的动作。
+         * 用于「命令确实写进 Redis 之后才该做」的后续处理（如发通知、改本地状态）。动作会跨自动物理分段保留，
+         * 只在最终 {@link #pipeline()} 或 {@link #pipelineForce()} 收尾时执行一次。第一项动作必须在首次自动 flush 前登记；
+         * 否则此前按 fire-and-forget 发出的异步命令已无法追溯确认，本方法会拒绝建立不完整的成功合同。
+         * 当前线程还必须已经 {@link #open()}，避免动作游离到后续无关 session。
          *
          * @param action 批次成功后执行的动作
          * 返回: 无返回值。
          */
         public void afterPipelineSuccess(Action action) {
+            Objects.requireNonNull(action, "pipeline success action must not be null");
+            if (this.nonOpen()) {
+                throw new IllegalStateException(
+                        "pipeline success action requires an open pipeline session");
+            }
             RecycleLinkedList<Action> actions = this.pipelineSuccessActions.get();
+            // 首次自动分段没有动作时，异步 future 已按 fire-and-forget 合同释放，不能事后补登记完整成功结论。
+            if (this.autoFlushState.get() != null && !ColUtils.isNotEmpty(actions)) {
+                throw new IllegalStateException(
+                        "pipeline success action must be registered before the first automatic flush");
+            }
             if (actions == null) {
                 this.pipelineSuccessActions.set(actions = RecycleLinkedList.of());
             }
@@ -3406,6 +3479,7 @@ public abstract class LettucePipeline {
          * @param l     见上述说明
          * @param l2    见上述说明
          * @param extra 见上述说明
+         * 返回: 无返回值；命令立即派发或进入当前线程的缓冲区。
          */
         private void enqueueAsync(short op, byte[] a1, Object a2, Object a3, long l, long l2, Object extra) {
             this.enqueueImpl(false, op, a1, a2, a3, l, l2, extra);
@@ -3453,11 +3527,32 @@ public abstract class LettucePipeline {
          * @param l     见上述说明
          * @param l2    见上述说明
          * @param extra 见上述说明
+         * 返回: 无返回值；命令立即派发或进入当前线程的缓冲区。
          */
         private void enqueueImpl(boolean sync, short op, byte[] a1, Object a2, Object a3, long l, long l2, Object extra) {
+            this.enqueueImpl(sync, op, a1, a2, a3, l, l2, extra, null);
+        }
+
+        /**
+         * 业务作用：把可选的外部生命周期与命令一起写入缓冲；未开启 pipeline 时立即按相同生命周期派发。
+         * 外部生命周期不为空时，真正创建 Redis 命令前必须先取得它的派发许可。
+         *
+         * @param sync      是否等待执行结果
+         * @param op        操作码
+         * @param a1        第一字节数组参数
+         * @param a2        第二参数
+         * @param a3        第三参数
+         * @param l         第一数值参数
+         * @param l2        第二数值参数
+         * @param extra     复杂参数
+         * @param lifecycle 外部命令生命周期；普通命令传 null
+         * 返回: 无返回值；命令已立即派发或连同生命周期进入当前线程的缓冲区。
+         */
+        private void enqueueImpl(boolean sync, short op, byte[] a1, Object a2, Object a3, long l, long l2,
+                                 Object extra, BufferedCommandLifecycle lifecycle) {
             // ① 未 open: 不缓冲, 单条 dispatch 立即发送 (nonOpen 走 doFlushSingle, 内部按 sync 决定是否 await)
             if (nonOpen()) {
-                this.doFlushSingle(sync, op, a1, a2, a3, l, l2, extra);
+                this.doFlushSingle(sync, op, a1, a2, a3, l, l2, extra, lifecycle);
                 return;
             }
             // ② 取/借 CmdBuffer (ThreadLocal 缓存当前 session, 末尾 clear 时归还池)
@@ -3474,6 +3569,7 @@ public abstract class LettucePipeline {
             buf.longArg[i] = l;
             buf.longArg2[i] = l2;
             buf.extras[i] = extra;
+            buf.lifecycles[i] = lifecycle;
             // ⑥ 命令累积达 pipelineLength 触发 autoFlush (中间 flush, 不关闭 open, 继续缓冲)
             if (totalCount() >= PIPELINE_LENGTH) this.pipelineAutoFlush();
         }
@@ -7648,6 +7744,35 @@ public abstract class LettucePipeline {
         }
 
         /**
+         * 业务作用：为分区发布追加带关闭边界的 Stream 消息；序列化后把生命周期所有权交给立即派发路径或当前缓冲区。
+         * 命令在派发前被关闭时跳过 XADD，派发后由 Redis future 的终态释放发布责任。
+         *
+         * @param stream    Stream 键
+         * @param field     哈希字段名
+         * @param message   消息体
+         * @param async     true 表示不在 flush 调用中等待命令结果，false 表示纳入同步等待
+         * @param lifecycle 分区发布生命周期
+         * 返回: 无返回值；入参无效或序列化、入队失败时撤销尚未派发的生命周期。
+         */
+        public void xAddPartition(Object stream, Object field, Object message, boolean async,
+                           BufferedCommandLifecycle lifecycle) {
+            Objects.requireNonNull(lifecycle, "lifecycle must not be null");
+            if (this.invalidXAddArg(stream, field, message)) {
+                lifecycle.abort();
+                return;
+            }
+            try {
+                byte[] s = stream instanceof byte[] bs ? bs : keySerializer.serialize((String) stream);
+                byte[] f = field instanceof byte[] bs ? bs : hashKeySerializer.serialize((String) field);
+                byte[] v = message instanceof byte[] bs ? bs : hashValueSerializer.serialize(message);
+                this.enqueueImpl(!async, OP_XADD, s, f, v, 0L, 0L, null, lifecycle);
+            } catch (Throwable failure) {
+                lifecycle.abort();
+                throw failure;
+            }
+        }
+
+        /**
          * 业务作用：单条 xAdd 入参非法判定: stream/field/message 任一 null, 或 stream/field 为空白 String → 非法.
          * (stream/field/message 允许 byte[] raw 直传, 此时不判空白.)
          *
@@ -8933,19 +9058,28 @@ public abstract class LettucePipeline {
         }
 
         /**
-         * 业务作用：自动 flush: 命令累积数 (CmdBuffer.count + LF.size()) 达到 pipelineLength 时触发.
-         * 中间 flush, flush 完恢复 pipeline 模式继续缓冲 (区别于 pipelineForce 会关闭 open).
+         * 业务作用：命令累积数达到 pipelineLength 时执行一次物理 flush，同时保持公开 session 的控制状态、
+         * 成功动作和累计失败，供后续命令与最终收尾继续使用。物理分段失败只记录首个原因，最终收尾统一报告，
+         * 避免成功动作在 session 尚未构造完成时提前生效。
          * <p>
-         * <b>private</b>: 这是"中间 flush 保持 open"语义, 只能内部 autoflush 用. 最终 flush 必须走 {@link #pipelineForce} /
-         * {@link #pipeline()} 关闭 session，否则会把 open 状态遗留给调用线程并污染后续批处理。
+         * <b>private</b>: 这是“中间物理 flush、保持公开 session”语义，只能内部使用。最终收尾必须走
+         * {@link #pipelineForce} 或 {@link #pipeline()}，否则累计状态会遗留在当前线程。
+         *
+         * <p>参数说明: 无。
+         * 返回: 无返回值；当前物理分段被清空，公开 session 保持开启，分段失败延迟到最终收尾报告。
          */
         private void pipelineAutoFlush() {
-            Boolean wasOpen = open.get();
-            Object tag = execTag.get();
-            this.pipelineForce();
-            if (Boolean.TRUE.equals(wasOpen)) {
-                open.set(true);
-                if (tag != null) execTag.set(tag);
+            AutoFlushState state = this.autoFlushState.get();
+            if (state == null) {
+                state = new AutoFlushState();
+                this.autoFlushState.set(state);
+            }
+            CmdBuffer buf = CMD.get();
+            RecycleLinkedList<Function<RedisClusterAsyncCommands<byte[], byte[]>, RedisFuture<?>>> funcs = LF.get();
+            try {
+                this.doFlush(funcs, buf, false);
+            } catch (RuntimeException failure) {
+                if (state.firstFailure == null) state.firstFailure = failure;
             }
         }
 
@@ -8955,6 +9089,9 @@ public abstract class LettucePipeline {
          * 当前 session 没任何命令缓冲时, 仍执行 {@link #clear()} 清理 ThreadLocal —
          * 给 "open 了但 drain 全异常 / open 了但什么都没 enqueue" 的兜底路径用 (RedisProxy.before tick 的 finally).
          * 不留 dangling open/execTag/CMD ThreadLocal, 避免污染下一次 session 状态.
+         *
+         * <p>参数说明: 无。
+         * 返回: 无返回值；最终物理分段和此前自动分段全部成功时执行动作，否则清理 session 后抛出失败。
          */
         public void pipelineForce() {
             CmdBuffer buf = CMD.get();
@@ -8962,10 +9099,65 @@ public abstract class LettucePipeline {
             boolean hasCmds = buf != null && buf.count > 0;
             boolean hasFuncs = ColUtils.isNotEmpty(funcs);
             if (!hasCmds && !hasFuncs) {
-                this.clear();
+                // 自动分段可能已经发送了全部命令；即使最终没有剩余缓冲，也必须完成失败门禁和成功动作。
+                if (this.autoFlushState.get() != null) {
+                    this.settlePipelineSession();
+                } else {
+                    this.clear();
+                }
                 return;
             }
-            this.doFlush(funcs, buf);
+            this.doFlush(funcs, buf, true);
+        }
+
+        /**
+         * 业务作用：在公开 session 发布成功结论前复验所有先前自动物理分段；任一分段失败都阻止成功动作。
+         *
+         * <p>参数说明: 无。
+         * 返回: 无返回值；没有累计失败时正常返回，否则抛出携带首个分段失败原因的异常。
+         */
+        private void ensureAutoFlushSucceeded() {
+            AutoFlushState state = this.autoFlushState.get();
+            if (state == null || state.firstFailure == null) return;
+            throw new CacheException("pipeline 自动分段未完整成功: {}",
+                    state.firstFailure.getMessage(), state.firstFailure);
+        }
+
+        /**
+         * 业务作用：完成公开 pipeline session 的成功结算。先复验自动分段，再从 ThreadLocal 分离动作列表并清理
+         * 旧 session，最后执行动作；因此动作通过同一 Actuator 发出的普通命令会按非批次语义立即派发，不能落回
+         * 已完成 dispatch 的旧缓冲。动作执行期间显式开启的新 session 归动作自身管理，不受旧 session 清理影响。
+         *
+         * <p>参数说明: 无。
+         * 返回: 无返回值；累计失败或动作异常交给收尾调用方，旧 session 在任何路径都完成清理。
+         */
+        private void settlePipelineSession() {
+            RecycleLinkedList<Action> actions = null;
+            boolean sessionClosed = false;
+            try {
+                this.ensureAutoFlushSucceeded();
+                actions = pipelineSuccessActions.get();
+                pipelineSuccessActions.remove();
+                // 先关闭旧 session 并回收已派发缓冲，回调中的同 Actuator 命令才能安全走立即派发路径。
+                this.clear();
+                sessionClosed = true;
+                this.runPipelineSuccessActions(actions);
+            } finally {
+                if (actions != null) actions.recycle();
+                if (!sessionClosed) this.clear();
+            }
+        }
+
+        /**
+         * 业务作用：按登记顺序执行已从旧 session 分离的成功动作快照，每个动作最多执行一次。
+         *
+         * @param actions 已脱离 ThreadLocal 的成功动作列表；null 或空列表表示没有后续动作
+         * 返回: 无返回值；任一动作抛异常时停止后续动作并把异常交给收尾调用方。
+         */
+        private void runPipelineSuccessActions(RecycleLinkedList<Action> actions) {
+            if (!ColUtils.isNotEmpty(actions)) return;
+            Iterator<Action> iter = actions.cachedIterator();
+            while (iter.hasNext()) iter.next().action();
         }
 
         /**
@@ -9070,29 +9262,34 @@ public abstract class LettucePipeline {
         }
 
         /**
-         * 业务作用：统一 flush: CmdBuffer (平坦数组所有写命令) + LF (读命令 / sync via lambda) 在同一个连接、同一次 flushCommands 发送.
+         * 业务作用：把当前物理分段的 CmdBuffer 与 LF 放在同一个连接、同一次 flushCommands 中发送。
+         * 自动分段只清理已发送缓冲并保留公开 session；最终分段复验此前累计失败后，先关闭并分离旧 session，
+         * 再执行成功动作，使动作中的同 Actuator 命令无法落回旧缓冲。
          * <p>
-         * 执行顺序 (嵌套 try/finally 保证 actions 在 ThreadLocal 完整时运行, clear 始终在最外执行):
+         * 执行顺序：
          * <ol>
-         *   <li>内 try: borrow → async(conn) → setAutoFlushCommands(false) → dispatch (CmdBuffer sync future 进 syncFutures, 返回首个 sync 分发异常) → LF (future 也并入) → flushCommands</li>
+         *   <li>内 try: borrow → async(conn) → setAutoFlushCommands(false) → dispatch (需要确认的 future 进入 awaitedFutures，并返回批次门禁异常) → LF (future 也并入) → flushCommands</li>
          *   <li>内 finally: 还原 autoFlush + 归还连接 (flush 成功且还原成功 → release, 否则 invalidate 关闭; 尽早归还, await 不持连接)</li>
-         *   <li>awaitAll syncFutures: 等所有 sync 命令完成</li>
-         *   <li>syncDispatchError gate: dispatch 阶段有 sync 写命令分发失败则在此上抛, 跳过 successActions</li>
-         *   <li>successActions: action() 逐个跑, 此时 ThreadLocal 仍完整</li>
-         *   <li>外 finally: syncFutures.recycle() + clear() 总会执行</li>
+         *   <li>awaitAll awaitedFutures: 等同步命令，以及存在成功动作时的异步命令完成</li>
+         *   <li>dispatchError gate: dispatch 阶段存在需要确认的命令本地分发失败或外部生命周期取消时在此上抛，跳过 successActions</li>
+         *   <li>最终分段复验此前自动分段，分离动作列表并关闭旧 session，再逐个执行 successActions</li>
+         *   <li>外 finally: 回收 awaitedFutures；自动分段只清缓冲，最终分段在结算开始前失败时清理整个 session</li>
          * </ol>
          *
          * @param funcs 见上述说明
          * @param buf   见上述说明
+         * @param completeSession true 表示最终收尾，false 表示保持公开 session 的自动物理分段
+         * 返回: 无返回值；当前分段失败时抛异常，调用方决定立即报告或累计到最终收尾。
          */
         private void doFlush(
                 RecycleLinkedList<Function<RedisClusterAsyncCommands<byte[], byte[]>, RedisFuture<?>>> funcs,
-                CmdBuffer buf) {
+                CmdBuffer buf, boolean completeSession) {
 
             boolean hasFuncs = ColUtils.isNotEmpty(funcs);
             boolean hasCmds = buf != null && buf.count > 0;
-            // ① 收 sync future 的容器 (CmdBuffer sync 槽 + 全部 LF), 都为空就不分配
-            RecycleLinkedList<RedisFuture<?>> syncFutures = (hasFuncs || hasCmds) ? RecycleLinkedList.of() : null;
+            boolean confirmAsync = ColUtils.isNotEmpty(pipelineSuccessActions.get());
+            // ① 收集同步 future；存在成功动作时，异步命令也必须等待 Redis 确认后才能发布成功结论。
+            RecycleLinkedList<RedisFuture<?>> awaitedFutures = (hasFuncs || hasCmds) ? RecycleLinkedList.of() : null;
             // ② 从 pipeline 专用连接池借独占连接 (Semaphore 控制, 虚拟线程友好).
             // borrow 放进 outer try, 失败时走 outer catch fail 整个 CmdBuffer 的所有 lf (防业务线程死锁).
             PipelineConnectionPool pool = redisProxy.getPipelinePool();
@@ -9104,8 +9301,10 @@ public abstract class LettucePipeline {
             // flushed: flushCommands 成功返回后置 true. 只有 flush 成功且 autoFlush 还原成功, 连接才允许回池;
             // 否则连接 buffer 可能残留未 flush 命令, 必须 invalidate (关闭) 而非 release, 防跨借用方命令串扰.
             boolean flushed = false;
-            // sync 写命令 (无 lf) 分发时的首个异常, 由 dispatch 返回; awaitAll 后、successActions 前 gate.
-            Throwable syncDispatchError = null;
+            // 最终成功结算一旦开始就由 settlePipelineSession 负责清理旧 session，外层不能再清理回调新建的状态。
+            boolean settlementStarted = false;
+            // 同步命令以及成功动作依赖的异步命令若未形成 future，就不能发布完整成功结论；生命周期取消同样否决。
+            Throwable dispatchError = null;
             try {
                 // 连接池只由 @EnableRedis 的自动装配注入。RedisProxy 的构造是 public,
                 // 手工 new 出来的实例没有连接池；这里给出明确的装配原因与可用入口。
@@ -9124,15 +9323,15 @@ public abstract class LettucePipeline {
                     // ③ 关闭自动 flush, 让所有命令累积到本地 buffer, 直到 flushCommands 才发网络
                     c.setAutoFlushCommands(false);
 
-                    // ④ CmdBuffer 路径: switch 分发, 零 lambda; sync 槽 (ops 高位置 1) 的 future 进 syncFutures.
+                    // ④ CmdBuffer 路径: switch 分发；同步槽以及成功动作依赖的异步槽进入 awaitedFutures。
                     // dispatch 内部 per-cmd try-catch 隔离单条异常, 不会向外抛.
                     if (hasCmds) {
-                        syncDispatchError = this.dispatch(c, buf, syncFutures);
+                        dispatchError = this.dispatch(c, buf, awaitedFutures, confirmAsync);
                     }
                     // 至此 buf 内所有 lf 都已 completeLf(rf), 无需兜底 fail
                     dispatched = true;
 
-                    // ⑤ Function 路径 (读命令 / 需自定义 lambda 的 sync 写) — future 也并入 syncFutures
+                    // ⑤ Function 路径 (读命令 / 需自定义 lambda 的 sync 写) — future 也并入 awaitedFutures
                     if (hasFuncs) {
                         for (var f : funcs) {
                             if (f == null) continue;
@@ -9140,7 +9339,7 @@ public abstract class LettucePipeline {
                             // function 必须 return RedisFuture; null 会让 awaitAll 拿到 null future, fail-fast
                             if (rf == null)
                                 throw new IllegalStateException("pipeline function returned null RedisFuture");
-                            syncFutures.add(rf);
+                            awaitedFutures.add(rf);
                         }
                     }
 
@@ -9166,22 +9365,20 @@ public abstract class LettucePipeline {
                     }
                 }
 
-                // ⑨ 同步等所有 sync 命令完成 (-1 表示无超时); async 槽 future 已被 dispatch 丢弃, 不等
-                if (syncFutures != null && !syncFutures.isEmpty()) {
-                    this.awaitAllOrTimeout(pool, ColUtils.toArray(RedisFuture.class, syncFutures));
+                // 成功动作要求 Redis 确认整个批次；没有成功动作时，异步槽仍不进入等待集合。
+                if (awaitedFutures != null && !awaitedFutures.isEmpty()) {
+                    this.awaitAllOrTimeout(pool, ColUtils.toArray(RedisFuture.class, awaitedFutures));
                 }
 
-                // ⑨.5 sync 写命令分发时失败 (CCE / 未知 op): future 未进 syncFutures, awaitAll 看不到,
-                // 这里在 successActions 前 gate, 与运行时 sync 失败 (awaitAll 抛) 一致: 跳过 successActions 并上抛.
-                if (syncDispatchError != null) {
-                    throw new CacheException("pipeline sync 命令分发失败: {}", syncDispatchError.getMessage(), syncDispatchError);
+                // 需要确认的命令未形成 future，或受约束命令已在派发前取消时，都不能把批次声明为成功。
+                if (dispatchError != null) {
+                    throw new CacheException("pipeline 命令未完成分发: {}", dispatchError.getMessage(), dispatchError);
                 }
 
-                // ⑩ pipeline 真正成功后跑 actions; cachedIterator 复用 (零迭代器分配); 用 .action() 直跑, 异常会上抛中断后续 + 跳出本方法 (与 v1 语义一致)
-                RecycleLinkedList<Action> actions = pipelineSuccessActions.get();
-                if (ColUtils.isNotEmpty(actions)) {
-                    Iterator<Action> iter = actions.cachedIterator();
-                    while (iter.hasNext()) iter.next().action();
+                if (completeSession) {
+                    // 结算方法会在任何失败路径清理旧 session，并在动作前分离已派发缓冲。
+                    settlementStarted = true;
+                    this.settlePipelineSession();
                 }
             } catch (Throwable ex) {
                 // dispatch 之前的异常 (borrow 超时 / setAutoFlushCommands 抛) → buf 内 lf 没一个被 complete,
@@ -9197,9 +9394,13 @@ public abstract class LettucePipeline {
                 }
                 throw ex;
             } finally {
-                // ⑪ syncFutures 归还池 + ThreadLocal 清理: 即使 await/action 抛异常也保证执行
-                if (syncFutures != null) syncFutures.recycle();
-                this.clear();
+                // 自动分段保留 session 级动作与失败状态；最终分段无论成功失败都彻底清理。
+                if (awaitedFutures != null) awaitedFutures.recycle();
+                if (completeSession) {
+                    if (!settlementStarted) this.clear();
+                } else {
+                    this.clearBufferedCommands();
+                }
             }
         }
 
@@ -9219,23 +9420,41 @@ public abstract class LettucePipeline {
          * @param l     见上述说明
          * @param l2    见上述说明
          * @param extra 见上述说明
+         * @param lifecycle 外部命令生命周期；普通命令传 null
+         * 返回: 无返回值；同步命令等待终态，异步命令把终态责任交给 Redis future。
          */
-        private void doFlushSingle(boolean sync, short op, byte[] a1, Object a2, Object a3, long l, long l2, Object extra) {
+        private void doFlushSingle(boolean sync, short op, byte[] a1, Object a2, Object a3, long l, long l2,
+                                   Object extra, BufferedCommandLifecycle lifecycle) {
             // ① 从 pipeline 专用连接池借独占连接 (borrow 放进 try: 失败也走 finally 回收 extra, 防 RecycleLinkedMap 泄漏)
             PipelineConnectionPool pool = redisProxy.getPipelinePool();
             StatefulConnection<byte[], byte[]> connection = null;
             RedisClusterAsyncCommands<byte[], byte[]> c = null;
             RedisFuture<?> f = null;
             boolean flushed = false;
+            BufferedCommandLifecycle pendingLifecycle = lifecycle;
             try {
+                // 非缓冲路径也必须在任何连接与 Redis 副作用前复验准入，使它与批量 dispatch 共享同一关闭边界。
+                if (pendingLifecycle != null && !pendingLifecycle.beginDispatch()) {
+                    if (sync) {
+                        throw new IllegalStateException(
+                                "pipeline command was cancelled because its owner is closed");
+                    }
+                    return;
+                }
                 connection = pool.borrow();
                 c = PipelineConnectionPool.async(connection);
                 // ② 同 doFlush: 关闭 auto-flush → dispatchOne (返回 future) → flushCommands
                 c.setAutoFlushCommands(false);
                 f = this.dispatchOne(c, op, a1, a2, a3, l, l2, extra);
+                if (pendingLifecycle != null) {
+                    pendingLifecycle.bind(f);
+                    pendingLifecycle = null;
+                }
                 c.flushCommands();
                 flushed = true;
             } finally {
+                // RedisFuture 尚未形成时不存在迟到写入，立即撤销；绑定后只能由 future 终态收口。
+                if (pendingLifecycle != null) pendingLifecycle.abort();
                 // ③ borrow 成功才还原 autoFlush + 归还连接; borrow 失败 (connection==null) 只回收 extra.
                 // flush 成功且还原成功 → release 回池; 否则 invalidate 关闭 (buffer 可能残留未 flush 命令, 见 doFlush).
                 if (connection != null) {
@@ -9286,21 +9505,24 @@ public abstract class LettucePipeline {
          * <p>
          * 每条 ops 字节高位 (SYNC_BIT) = 1 表示 sync, dispatchOne 返回的 RedisFuture:
          * <ul>
-         *   <li>sync 槽: future 收进 syncFutures, doFlush 末尾统一 awaitAll</li>
-         *   <li>async 槽: 不 await, 但挂 {@link #attachAsyncErrorLog} 监听异常打 ERROR 日志
-         *       (否则 lettuce 异步执行失败 exception 只存在被丢弃的 future 里, 完全静默无痕)</li>
+         *   <li>sync 槽: future 收进 awaitedFutures, doFlush 末尾统一 awaitAll</li>
+         *   <li>async 槽: 存在成功动作时同样收进 awaitedFutures；否则只挂 {@link #attachAsyncErrorLog}
+         *       保留 fire-and-forget 语义</li>
          * </ul>
          * <p>
-         * 返回首个 sync 写命令 (lf==null && SYNC_BIT) 的分发异常 (无则 null): 这类命令没有 lf 承接,
-         * 又不在 syncFutures 里被 awaitAll 看到, 不返回上去就会出现"sync 写分发失败却照跑 successActions"的不一致.
-         * doFlush 拿到后在 successActions 前抛出, 与运行时 sync 失败 (awaitAll 抛) 行为对齐.
+         * 返回首个需要阻止批次成功动作的分发异常：同步写命令无法形成 future、成功动作依赖的异步命令无法形成
+         * future，或任何受外部生命周期约束的命令在派发前已被取消。没有成功动作时，普通异步命令仍沿用
+         * fire-and-forget 合同，只记录本地或 Redis 执行异常而不转成批次失败。
          *
          * @param c           见上述说明
          * @param buf         见上述说明
-         * @param syncFutures 见上述说明
+         * @param awaitedFutures 需要在发布批次成功结论前等待的 Redis future
+         * @param confirmAsync true 表示成功动作要求异步命令也取得 Redis 成功终态
+         * @return 首个需要阻止批次成功动作的分发异常；所有命令均取得派发许可并按各自合同形成结果时返回 null。
          */
-        private Throwable dispatch(RedisClusterAsyncCommands<byte[], byte[]> c, CmdBuffer buf, RecycleLinkedList<RedisFuture<?>> syncFutures) {
-            Throwable firstSyncError = null;
+        private Throwable dispatch(RedisClusterAsyncCommands<byte[], byte[]> c, CmdBuffer buf,
+                                   RecycleLinkedList<RedisFuture<?>> awaitedFutures, boolean confirmAsync) {
+            Throwable firstDispatchError = null;
             for (int i = 0; i < buf.count; i++) {
                 short rawOp = buf.ops[i];
                 // ① 解码: 位 14 (0x4000) = sync 标记, 低 14 位 = 真 OP 码 (0-16383)
@@ -9311,15 +9533,37 @@ public abstract class LettucePipeline {
                 // (lettuce 同步校验 reject), 若不隔离则后续所有 task 的 lf 永远不会 complete, 业务线程死锁.
                 RedisFuture<?> f;
                 LettuceFuture<?> lf = buf.lfs[i];
+                BufferedCommandLifecycle lifecycle = buf.lifecycles[i];
                 try {
+                    // 外部关闭与命令派发在同一个生命周期对象上竞争；未取得许可时不能创建 RedisFuture，
+                    // 否则 shutdown 已取消的分区消息仍可能进入连接缓冲。
+                    if (lifecycle != null && !lifecycle.beginDispatch()) {
+                        lifecycle.abort();
+                        buf.lifecycles[i] = null;
+                        if (firstDispatchError == null) {
+                            firstDispatchError = new IllegalStateException(
+                                    "pipeline command was cancelled because its owner is closed");
+                        }
+                        continue;
+                    }
                     f = this.dispatchOne(c, op, buf.arg1[i], buf.arg2[i], buf.arg3[i], buf.longArg[i], buf.longArg2[i], buf.extras[i]);
+                    if (lifecycle != null) {
+                        // RedisFuture 一经形成，关闭方必须等待其终态；先绑定再清槽，clear 只撤销尚未派发的命令。
+                        lifecycle.bind(f);
+                        buf.lifecycles[i] = null;
+                    }
                 } catch (Throwable ex) {
-                    // lf 读命令: 异常直达业务线程; sync 写命令: 没 lf 承接, 记录首个异常交 doFlush 上抛.
-                    // 两种情况都 log + continue (保留逐条隔离, 不中断后续命令分发).
+                    if (lifecycle != null) {
+                        lifecycle.abort();
+                        buf.lifecycles[i] = null;
+                    }
+                    // 带结果句柄的命令先把异常交给等待方；同步槽以及成功动作依赖的异步槽还必须否决批次成功结论。
+                    // 继续逐条分发后续命令，保留既有部分提交语义，但不能把部分提交发布成完整成功。
                     if (lf != null) {
                         lf.completeExceptionally(ex);
-                    } else if (sync && firstSyncError == null) {
-                        firstSyncError = ex;
+                    }
+                    if ((sync || confirmAsync) && firstDispatchError == null) {
+                        firstDispatchError = ex;
                     }
                     log.error("[lettuce-pipeline] dispatchOne failed op={}", op, ex);
                     continue;
@@ -9331,9 +9575,9 @@ public abstract class LettucePipeline {
                     this.completeLf(lf, f);
                     continue;
                 }
-                if (sync) {
-                    // sync 槽: 收 future 由 doFlush 末尾统一 awaitAll
-                    syncFutures.add(f);
+                if (sync || confirmAsync) {
+                    // 同步命令始终等待；成功动作存在时，异步命令也必须先取得 Redis 成功终态。
+                    awaitedFutures.add(f);
                 } else {
                     // ④ async 槽: 不 await, 挂带 op+key+extras 的池化 logger 打异常.
                     // 否则 lettuce 异步执行失败时 exception 只存在于被丢弃的 future, 完全静默
@@ -9341,7 +9585,7 @@ public abstract class LettucePipeline {
                     attachAsyncErrorLog(f, op, buf.arg1[i], buf.extras[i]);
                 }
             }
-            return firstSyncError;
+            return firstDispatchError;
         }
 
         /**
@@ -9637,13 +9881,17 @@ public abstract class LettucePipeline {
         // ==================== 清理 ====================
 
         /**
-         * 业务作用：只清理当前线程的 session ThreadLocal (open/execTag/CMD/LF), 不发命令 (= abort, 丢弃已入队的命令).
+         * 业务作用：只清理当前线程的全部 session ThreadLocal，不发命令；尚未派发的命令被丢弃，
+         * 已完成自动分段的累计结果和成功动作也一并作废。
          * <p>
          * 给手动 {@code open(...)} / {@link #openIsolated} 的方法在 try/finally 里兜底用: 入队/序列化/flush 前半段抛异常时,
          * 保证 open/CMD/LF 不残留污染后续调用 (尤其定时任务线程会复用). 成功 flush 后调用是幂等 no-op (ThreadLocal 已清).
          * <p>
          * <b>public</b>: 外部包用 {@link #openIsolated} 时, 异常路径可调本方法 abort 临时 session (丢弃未发命令 + 清 ThreadLocal),
          * 不必为了清理而调 {@code pipeline()/pipelineForce()} 把残缺命令发出去.
+         *
+         * <p>参数说明: 无。
+         * 返回: 无返回值；当前 session 的缓冲、动作和累计状态全部作废。
          */
         public void clearSession() {
             this.clear();
@@ -9659,6 +9907,32 @@ public abstract class LettucePipeline {
         }
 
         /**
+         * 业务作用：回收当前物理分段的命令缓冲，但保留公开 session 的 open、execTag、成功动作与自动分段状态。
+         * 自动 flush 依赖该边界继续接收后续命令，不能把 session 级完成条件一并清除。
+         *
+         * <p>参数说明: 无。
+         * 返回: 无返回值；CMD 被归还对象池，LF 按线程类型清空复用或回收移除。
+         */
+        private void clearBufferedCommands() {
+            boolean fullRemove = throwaway || Thread.currentThread().isVirtual();
+
+            CmdBuffer buf = CMD.get();
+            if (buf != null) {
+                buf.recycle();
+                CMD.remove();
+            }
+
+            var funcs = LF.get();
+            if (funcs == null) return;
+            if (fullRemove) {
+                funcs.recycle();
+                LF.remove();
+            } else if (ColUtils.isNotEmpty(funcs)) {
+                funcs.clear();
+            }
+        }
+
+        /**
          * 业务作用：pipeline 执行完毕 (或 abort) 清理当前线程的 session ThreadLocal + 归还池化对象.
          * <p>
          * <b>CmdBuffer</b>: 一律 recycle 回池 + CMD.remove, 不论线程类型 — buf 是池化资源, 还池后会被其他线程借走,
@@ -9667,25 +9941,18 @@ public abstract class LettucePipeline {
          * <b>LF / pipelineSuccessActions</b>: {@code fullRemove}(虚拟线程 或 throwaway 实例)走 recycle+remove;
          * 否则 (CACHE 单例 + 平台线程) 仅 clear 容器、保留 ThreadLocal 引用复用 (单例长存, 容器是轻量链表壳子).
          * throwaway 实例不会被复用, 保留容器只会在 ThreadLocalMap 留残条目, 故和虚拟线程一样全 remove。
+         *
+         * <p>参数说明: 无。
+         * 返回: 无返回值；公开 session 控制状态、累计失败、命令缓冲和成功动作均被清理。
          */
         private void clear() {
             open.remove();
             execTag.remove();
+            autoFlushState.remove();
             boolean fullRemove = throwaway || Thread.currentThread().isVirtual();
-
-            // CmdBuffer 池化: 不论何种线程都 recycle 回池 + 清 ThreadLocal 引用
-            CmdBuffer buf = CMD.get();
-            if (buf != null) {
-                buf.recycle();
-                CMD.remove();
-            }
+            this.clearBufferedCommands();
 
             if (fullRemove) {
-                var lf = LF.get();
-                if (lf != null) {
-                    lf.recycle();
-                    LF.remove();
-                }
                 RecycleLinkedList<Action> actions = pipelineSuccessActions.get();
                 if (actions != null) {
                     actions.recycle();
@@ -9693,8 +9960,6 @@ public abstract class LettucePipeline {
                 }
                 return;
             }
-            var funcs = LF.get();
-            if (ColUtils.isNotEmpty(funcs)) funcs.clear();
             RecycleLinkedList<Action> actions = pipelineSuccessActions.get();
             if (ColUtils.isNotEmpty(actions)) actions.clear();
         }

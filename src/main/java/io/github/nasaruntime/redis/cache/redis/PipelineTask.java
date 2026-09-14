@@ -1,6 +1,7 @@
 package io.github.nasaruntime.redis.cache.redis;
 
 import io.github.nasaruntime.core.base.ObjectPool;
+import io.github.nasaruntime.core.base.RecycleLinkedMap;
 import io.github.nasaruntime.core.utils.ContextUtils;
 
 /**
@@ -17,6 +18,7 @@ import io.github.nasaruntime.core.utils.ContextUtils;
  *   <li>{@code arg1/arg2/arg3/extras/lf} 都是引用直传 — drain 时拷入 CmdBuffer 槽位, task.recycle 仅清引用</li>
  *   <li>extras 若是 {@code RecycleLinkedMap}, cascade recycle 由 CmdBuffer.restore 负责 (避免 double-recycle)</li>
  *   <li>lf 的生命周期由业务线程持有, task 不管</li>
+ *   <li>队列拒绝未接纳命令时就地异常完成 lf，并归还尚未移交给 CmdBuffer 的池化 extras 与槽位</li>
  * </ul>
  */
 public final class PipelineTask implements ObjectPool.Recycler<PipelineTask> {
@@ -152,6 +154,25 @@ public final class PipelineTask implements ObjectPool.Recycler<PipelineTask> {
     }
 
     /**
+     * 业务作用：收口未被命令队列接纳的槽位，异常完成等待方并归还尚未移交给 CmdBuffer 的池化参数。
+     *
+     * @param failure 队列拒绝接纳的确定原因
+     *                返回: 无返回值；不会发送 Redis 命令，槽位及自有 extras 被归还，future 的回收仍由调用方负责。
+     */
+    void reject(Throwable failure) {
+        try {
+            // 未入队的 extras 没有 CmdBuffer 接管者，必须在当前拒绝分支归还以免永久占用池化映射。
+            if (extras instanceof RecycleLinkedMap<?, ?> map) map.recycle();
+        } finally {
+            try {
+                if (lf != null) lf.completeExceptionally(failure);
+            } finally {
+                recycle();
+            }
+        }
+    }
+
+    /**
      * 业务作用：暴露本实例的池化句柄，供对象池完成借出与归还的状态跟踪。
      *
      * <p>参数说明: 无。
@@ -169,7 +190,7 @@ public final class PipelineTask implements ObjectPool.Recycler<PipelineTask> {
      * 表现为一个随批次量增长而不释放的内存占用。
      *
      * <p>参数说明: 无。
-     *
+     * <p>
      * 返回: 无返回值。
      */
     @Override

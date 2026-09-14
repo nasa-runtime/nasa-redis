@@ -1,15 +1,16 @@
 package io.github.nasaruntime.redis.cache.redis;
 
 import io.github.nasaruntime.core.evt.EventListener;
+import io.github.nasaruntime.core.base.Partition;
+import io.github.nasaruntime.core.evt.PartitionedEventListener;
 
 /**
- * Nasa
- * redis stream 订阅根接口。继承 {@link EventListener} 通用事件抽象,
+ * 业务作用：声明 Redis Stream 消费的业务计划、来源、顺序与确认策略。继承 {@link EventListener} 通用事件抽象，
  * 叠加 redis stream 专属的 qualifier / mode / group / autoDelete 语义。
  * <p>
  * <b>继承关系</b>:
  * <pre>
- *   EventListener&lt;T, TS&gt;           (io.github.nasaruntime.core.evt — 通用事件抽象)
+ *   PartitionedEventListener&lt;T, TS&gt;           (io.github.nasaruntime.core.evt — 通用事件抽象)
  *     ↑
  *   StreamSubscribe&lt;T, TS&gt;         (本接口 — redis stream 专属扩展)
  *     ├── RedisEventBatchListener&lt;T&gt;  (批量消费: TS = List&lt;T&gt;)
@@ -28,40 +29,46 @@ import io.github.nasaruntime.core.evt.EventListener;
  * @param <T>  消息体类型
  * @param <TS> 消费回调接收类型 (T 或 List&lt;T&gt;)
  */
-interface StreamSubscribe<T, TS> extends EventListener<T, TS>, Qualifier {
+public interface StreamSubscribe<T, TS> extends PartitionedEventListener<T, TS>, Qualifier {
 
     /**
      * 业务作用：服务于哪些 redis server (qualifier 名数组). null = 服务所有 RedisProxy。
      *
-     * @return 见上述说明。
+     * 参数说明: 无。
+     * @return 目标 RedisProxy 的 qualifier 数组；null 表示服务全部数据源。
      */
     default String[] qualifiers() {
         return null;
     }
 
     /**
-     * 业务作用：消费模式. 决定走 RedisProxy.subscribe (普通流共享 group) 还是 RedisPartition (per-partition 串行)。
+     * 业务作用：选择普通 Stream、物理分区或两种来源；PARTITION 与 BOTH 使用逐条业务和本地按键 Task。
      *
-     * @return 见上述说明。
+     * 参数说明: 无。
+     * @return 默认 PROXY；PARTITION 与 BOTH 拒绝 Batch listener，BOTH 普通来源仅提供 JVM 内顺序。
      */
     default ConsumeMode mode() {
         return ConsumeMode.PROXY;
     }
 
     /**
-     * 业务作用：stream consumer group 名. PARTITION 模式下忽略 (group 由 streamPrefix 决定)。
-     * 不填 PROXY 模式下框架自动用 ME.sequence() 当 consumer name。
+     * 业务作用：stream consumer group 名。PARTITION 模式下由物理分区组决定；PROXY 沿用既有消费组配置；
+     * BOTH 必须显式声明非空 group，并由内部 dedicated 手工确认容器使用。
      *
-     * @return 见上述说明。
+     * 参数说明: 无。
+     * @return 默认 null；BOTH 必须返回非空普通 Stream group，PARTITION 使用物理分区组命名空间。
      */
     default String group() {
         return null;
     }
 
     /**
-     * 业务作用：是否在 onEvent 成功后自动 XDEL 消息. PARTITION 模式下忽略 (用 ACK 而非 XDEL)。
+     * 业务作用：是否在业务成功并通过权威确认后删除 Stream 正文。PROXY 沿用既有语义；PARTITION
+     * 在 holder-fenced ACK 内执行；BOTH 在 consumer-fenced ACK 内执行。XDEL 对所有 group 生效，
+     * 只有确认该 Stream 正文不再服务其它消费组时才能开启。
      *
-     * @return 见上述说明。
+     * 参数说明: 无。
+     * @return 默认 false 保留正文；true 允许按对应来源的成功确认语义删除正文，影响同 Stream 的全部 group。
      */
     default boolean autoDelete() {
         return false;

@@ -14,7 +14,7 @@ import io.github.nasaruntime.core.utils.ContextUtils;
 
 /**
  * Nasa
- * 单字段查询条件 DSL，对标 Spring Data 的 Criteria
+ * 单字段查询条件 DSL，用于组合 RediSearch 字段谓词与逻辑关系。
  * <p>
  * 用法（在 {@link RsQuery} 内组装为 AND）：
  * <pre>

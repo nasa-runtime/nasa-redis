@@ -1,2 +1,3 @@
 org.springframework.aot.hint.RuntimeHintsRegistrar=\
-io.github.nasaruntime.redis.cache.NasaCacheRuntimeHints
+io.github.nasaruntime.redis.cache.NasaCacheRuntimeHints,\
+io.github.nasaruntime.redis.cache.redis.partition.StreamPartitionRuntimeHints

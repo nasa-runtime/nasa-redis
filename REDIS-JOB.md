@@ -37,10 +37,10 @@ registry 与 Fanout hash tag 和当前统一使用的 `<qualifier>:<namespace>` 
 
 当前 source-aware 公开合同包括：
 
-- `RedisJobIdentifiers` 的 scheduled/manual Run 标识计算增加 qualifier，Fanout `executionKey` 随之变化；
-- `RedisJobKeyspace` 构造参数增加 qualifier，生成的全部键和频道进入新 hash tag；
+- `RedisJobIdentifiers` 的 scheduled/manual Run 标识计算包含 qualifier，Fanout `executionKey` 同样绑定来源；
+- `RedisJobKeyspace` 构造参数包含 qualifier，生成的全部键和频道使用对应来源的 hash tag；
 - RedisJob 与 `@EnableRedis` 分离，业务必须显式使用 `@EnableRedisJob`；框架不提供默认
-  `RedisJobScheduler` Bean，编程式入口改为 `RedisJobSchedulers.scheduler(sourceId)`；
+  `RedisJobScheduler` Bean，编程式入口使用 `RedisJobSchedulers.scheduler(sourceId)`；
 - `@RedisJob.qualifier` 没有默认 source，每个注解任务都必须显式声明；
 - 不提供根级 `nasa.redis.job.qualifier`；直接构造 Scheduler 时，source id 从传入 RedisProxy 冻结，不能由
   另一份配置字段伪装成其它来源；
@@ -300,6 +300,16 @@ Handler 仍会占用本地容量和 Redis 执行槽，直到自身返回或执�
 快照只选择仍存活、`ACTIVE`、`fanoutReady=true` 且合同完全兼容的执行器，并按稳定节点身份排序。同一个
 稳定节点出现多个启动实例时只保留当前有效成员。
 
+每条执行器逻辑心跳把稳定请求 ID、状态、在途数和最后确认的 `heartbeatRevision` 冻结为同一份载荷。
+响应丢失时只能原样重发；状态变化时先确认旧请求，再用新 ID 发布目标状态，在途数变化由下一心跳周期
+重新采样，避免同一周期因任务并发起止产生额外往返。同一请求只推进一次修订号；服务端记录已过期或
+修订号已由其它权威推进时拒绝续期，调用方必须重新登记或停止当前执行器准入。
+
+Scheduler 把 Redis 权威确认作为本地准入的前置条件：启动和 `activate()` 期间先关闭普通与
+Fanout Dispatcher，只在 `ACTIVE` 心跳获得连续 revision 后才依次开放。心跳、重登记或开放任一步
+返回不确定结果时，两个本地入口立即关闭，Registry 转以 `DRAINING` 为目标状态。固定周期只负责
+取得未决请求的唯一结局并收敛关门，重新开放必须由调用方显式执行 `activate()`。
+
 `RedisJobPartitioners.balanced()` 按快照成员数生成同样数量的连续有序分片；输入少于成员数时保留空分片，
 保证分片下标、目标成员和 `seq` 一一对应。自定义 `RedisJobPartitioner` 也必须返回与成员数完全相同的列表。
 
@@ -397,6 +407,11 @@ Map<String, List<WalletSweepItem>> groups =
 `LinkedHashMap`：
 
 ```java
+/**
+ * 业务作用：处理当前 Fanout 分片的钱包条目。
+ * 参数说明: context 为分片上下文；items 为按完整泛型解码的条目。
+ * 返回: 业务执行结论，由运行时依据当前执行权收敛分片。
+ */
 @RedisJob(name = "contract-wallet-sweep-worker", qualifier = "primary",
         trigger = RedisJobTrigger.FANOUT_ONLY)
 public RedisJobResult sweepShard(RedisJobContext context, List<WalletSweepItem> items) { ... }
@@ -412,8 +427,8 @@ public RedisJobResult sweepShard(RedisJobContext context, List<WalletSweepItem> 
 
 确需动态 JSON 树时显式声明 `JsonNode`；Protobuf 或业务自定义编码使用 `rawParameter()`。
 
-当前制品没有发布 Go 或 Rust SDK。其它运行时要加入同一能力集群，必须实现相同的身份、心跳、能力合同、
-inbox、receipt、attempt fencing 和终态协议，不能只做到 JSON 解码就宣称兼容。
+其它运行时要加入同一能力集群，必须实现相同的身份、心跳、能力合同、inbox、receipt、attempt fencing
+和终态协议，不能只做到 JSON 解码就宣称兼容。
 
 ## 多数据源
 
@@ -431,10 +446,12 @@ public class Application {
 Redis 数据源：
 
 ```java
+/** 业务作用：在 primary 数据源执行结算清扫。参数说明: context 为当前 Run。返回: 当前执行的业务结论。 */
 @RedisJob(name = "settle-sweep", qualifier = "primary", cron = "0/30 * * * * *")
 public RedisJobResult onPrimary(RedisJobContext context) { ... }
 
-@RedisJob(name = "settle-sweep", qualifier = "match", cron = "0/30 * * * * *")  // 登记到 match
+/** 业务作用：在 match 数据源执行结算清扫。参数说明: context 为当前 Run。返回: 当前执行的业务结论。 */
+@RedisJob(name = "settle-sweep", qualifier = "match", cron = "0/30 * * * * *")
 public RedisJobResult onMatch(RedisJobContext context) { ... }
 ```
 
@@ -504,7 +521,7 @@ Fanout 的合同复验不能省略：能力快照冻结之后可能发生滚动�
 **已经在飞的 shard 被升级后的节点拒绝**——这是有意为之，静默用新 Schema 解码旧参数比丢一批分片
 严重得多，但它是部署行为的变更：
 
-- `REASSIGN_ON_FAILURE`：每个被拒 shard 先耗尽 `fanout-receipt-max-retries` 次重发，再重分配到尚未
+- `REASSIGN_ON_FAILURE`：每个被拒 shard 先耗尽根任务注解 `fanoutReceiptMaxRetries` 指定的重发次数，再重分配到尚未
   升级的节点；全部节点完成升级后这些 shard 找不到兼容目标，根在 `fanout-max-wait-ms` 后以
   `WAIT_TIMEOUT` 收敛为 `FAILED`。
 - `STRICT_SNAPSHOT`：不换目标，直接等到根等待超时。
@@ -538,8 +555,8 @@ rjob:{<qualifier>:<namespace>:registry}:layout
 
 ```text
 RedisJob layout mismatch for qualifier=primary namespace=settle;
-this node=1|primary|settle|32|2|redis-job-executor;
-already established=1|primary|settle|64|2|redis-job-executor
+this node=1|primary|settle|32|2|redis-job-executor|SHARDED;
+already established=1|primary|settle|64|2|redis-job-executor|SHARDED
 ```
 
 分片数不同会让同一任务落到不同分片、形成两份定义和两套调度时刻并产生重复 Run；Fanout 桶数不同会让相同
@@ -601,7 +618,7 @@ RedisJob 扫描线程、订阅或注册表成员；空 source、未知 source �
 | `renew-rtt-allowance-ms` | `1000` | 计算本地保守持权截止点时扣除的续期往返预算 |
 | `clock-drift-allowance-ms` | `1000` | 计算本地保守持权截止点时扣除的时钟偏差预算 |
 | `max-tolerated-gc-pause-ms` | `1000` | 租约安全关系允许的最大进程停顿预算 |
-| `max-run-duration-ms` | `3600000` | Handler 协作式取消、重试退避与停机等待的全局上界；不会强制中断业务线程 |
+| `max-run-duration-ms` | `3600000` | Handler 协作式取消、重试退避与首次有界停机等待的上界；不会强制中断业务线程，也不缩短 callback/`close()` 的最终资源安全边界 |
 | `visibility-timeout-ms` | `60000` | 派发消息可见性兜底，不得小于两倍租约 |
 | `heartbeat-ms` | `10000` | 执行器心跳周期 |
 | `executor-expire-ms` | `30000` | 执行器失效期限，至少覆盖两个心跳周期 |
@@ -682,9 +699,44 @@ nasa:
 启动探针应给出至少一个 `heartbeat-ms` 的宽限。停止时先 drain 注册表和派发入口，再等待本地 Handler，最后
 注销执行器；这样新 Fanout 快照不会继续选择正在退出的节点。
 
-`stop()` / `close()` 是不可逆的资源释放：它们关闭监视线程池、Dispatcher 和订阅，之后不能对同一 Scheduler
-再次 `start()`。需要临时停止领取但保留运行时，应使用 `drain()`，恢复时调用 `activate()`；需要完整停机后
-重新启动时必须重建 Spring 应用上下文和 Scheduler，不能复用旧引用。
+`stop()` / `close()` 是不可逆的资源释放：它们先提交关闭终态，再尽力关闭监视线程池、Dispatcher、
+订阅、租约续期和 Registry 成员。并发的重复调用等待同一次首次停机结果；`SmartLifecycle` 回调只在 Handler 退出且所有权资源
+完成最终收口后执行，不能让 Spring 先拆除迟到任务仍依赖的 Redis 连接；
+普通与 Fanout 回调在请求 Redis attempt 前共享在途屏障；关门后先等待回调退出，或在 Redis 已授予 attempt 时先登记为
+Handler 在途，再排空 Handler、关闭派发执行器、续租器并注销成员。共享截止到期时，有界 `stop()` 会立即发布稳定失败，并暂时保留派发控制、续租器与
+`DRAINING` 成员，不能以资源关闭成功换取无人续期的 `RUNNING`。唯一 final-cleanup continuation 继续等待 pre-start 与 Handler 归零，随后按
+普通派发、Fanout 派发、监视任务、续租器、Registry 的顺序释放资源；continuation 无法启动时由当前停机线程接管，不能遗失唯一收口权。
+最终资源边界不设置第二个超时时限，也不会把线程中断解释为资源已经结束：关闭执行器时取消尚未开始的扫描、超时和续租调度，
+已经开始的回调必须实际退出后才能注销 Registry 并发布最终完成。这个边界保证资源安全而不保证强制终止；Handler 必须协作结束，
+否则 callback/`close()` 可以超过 `max-run-duration-ms` 持续等待。最终结果不会改写已经交给调用方的首次期限失败。
+`SmartLifecycle` callback 和作为 Spring destroy method 的 `close()` 都等待最终资源边界；即使 Spring lifecycle phase 已到期限，
+也不能先销毁迟到 Handler 仍依赖的 RedisProxy。`close()` 完成等待后仍交还首次稳定失败。
+安全排空完成后的单个资源关闭失败不会跳过其它关闭步骤，最早失败会携带后续 suppressed 证据返回所有等待者。
+Stream container、Pub/Sub listener/连接与 Registry 注销分别保留未决关闭坐标；重复和 final 收口会继续调用真实底层关闭，
+只有 listener 已停止、执行器已终止且服务端成员确认不存在后才发布最终完成。关闭终态提交后，同一 Scheduler 新发起的
+`start()`、`register()`、`drain()` 和 `activate()` 都在产生定义持久化、本地接线或 ACTIVE 发布之前拒绝。已经进入 Redis
+往返的调用可以取得原请求结局，但返回后必须复验终态，不再接线 Handler、登记能力或开放本地准入。需要临时停止领取但保留运行时，
+应使用 `drain()`，恢复时调用 `activate()`；需要完整停机后重新启动时必须重建 Spring 应用上下文和 Scheduler，不能复用旧引用。
+能力登记、过期后的能力重建或删除后的能力撤销若未取得确定回包，当前 source 会永久关门并进入全量注销，不能依靠后续普通心跳
+掩盖可能已提交的 `ACTIVE` 或旧能力。Redis 已授予普通或 Fanout attempt 后，本地提交失败由当前回调同步执行到唯一完成出口，
+不会把服务端 `RUNNING` 留给租约恢复，也不会提前释放在途账目。
+容器实际托管的 `RedisJobSchedulers` 管理器在任一 source 首次排空超时时先发布稳定失败，再异步等待全部 source 的
+listener、执行器、续租器和 Registry 完成最终收口，随后执行同一完成回调；管理器 `close()` 也在全部 source 收口后才允许
+Spring 销毁下层 RedisProxy。多 source 失败和当前调用方的 callback 失败
+不改写任一 source 已发布的共享资源失败。管理器先在生命周期锁外发布单调终态并关闭当前全部
+source 的本地 Dispatcher/Fanout 准入，再取得稳定 Scheduler 快照；每个 Scheduler 从构造完成起就进入永久托管清单，
+运行期启动失败并退出公开路由的动态 source 仍必须完成 final。顺序启动中的 source 即使阻塞 Redis，
+也不能延后已经开放 source 的关门。快照生成后
+再为各 source 并行发布 `DRAINING` 并完成 pre-start 与已持权 Handler 排空。某个 source 的慢 Handler 或 Redis 超时不会延后其它
+source 的本地关门，各 source 的最长等待也不按 source 数量串行累加。本地关门使用独立于 Scheduler monitor
+和 Redis 往返的单调权威；已经进入的启动、登记或激活调用退出并复验终态后，资源阶段才继续注销。管理器把首次 source 快照、
+完成信号和资源失败保留到自身不可达；`close()` 清空公开路由后，任意并发或重复 `stop()` / `close()` 仍交还同一结果，
+底层 listener 等资源未关闭时不会出现后续成功结果。
+普通权威心跳失去确定结果时，健康状态进入 `DRAINING`，本地不再领取新任务；通信恢复并确认 Registry 已发布 DRAINING 后可显式
+调用 `activate()`。能力登记或重建失去确定结果时 source 会进入不可逆停机，必须重建应用上下文。
+调度器启动时若尚无任务定义，生命周期仍运行但准入保持 `DRAINING`；第一个动态定义取得 Registry
+登记确认后，Scheduler 再发布 ACTIVE 心跳并开放本地入口。首次动态登记与显式 `drain()` / `activate()`
+共享同一生命周期顺序；`drain()` 成功返回后，未决登记不会再用此前取得的资格重新开放准入。
 
 ### 管理入口
 

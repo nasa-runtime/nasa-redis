@@ -8,7 +8,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
@@ -28,6 +27,8 @@ final class RedisJobLeaseRenewer implements AutoCloseable {
     /**
      * 业务作用：建立独立续期控制线程，批次周期由安全租约关系约束。
      *
+     * <p>返回：创建已启动周期控制线程、尚无租约登记的续期器。
+     *
      * @param properties Job 配置
      * @param keys       键路由器
      * @param scripts    状态脚本
@@ -39,7 +40,7 @@ final class RedisJobLeaseRenewer implements AutoCloseable {
         this.keys = Objects.requireNonNull(keys, "keys must not be null");
         this.scripts = Objects.requireNonNull(scripts, "scripts must not be null");
         this.executorId = Objects.requireNonNull(executorId, "executorId must not be null");
-        this.executor = Executors.newSingleThreadScheduledExecutor(
+        this.executor = RedisJobShutdownSupport.scheduledExecutor(1,
                 Thread.ofPlatform().daemon().name("redis-job-renew-", 0).factory());
         this.executor.scheduleAtFixedRate(this::safeRenew, properties.getLeaseRenewMs(),
                 properties.getLeaseRenewMs(), TimeUnit.MILLISECONDS);
@@ -173,12 +174,45 @@ final class RedisJobLeaseRenewer implements AutoCloseable {
     }
 
     /**
-     * 业务作用：停止后续批量续期；本地上下文将按已有截止点自然失权。 返回：无返回值。
+     * 业务作用：停止后续批量续期并清除本地 lease 索引；上下文将按已有截止点自然失权。
+     *
+     * <p>参数说明: 无。
+     *
+     * <p>返回：线程池停止与本地索引清理均已尝试后返回；失败时保留最早异常。
      */
     @Override
     public void close() {
-        executor.shutdown();
-        leases.clear();
+        close(RedisJobShutdownSupport.deadlineAfterMillis(properties.getMaxRunDurationMs()));
+    }
+
+    /**
+     * 业务作用：停止后续续租并等待已经进入执行器的批量续租退出，避免 Registry 注销后仍访问 Redis。
+     *
+     * <p>返回: 无返回值；执行器与本地索引均完成收口时返回；截止前未终止或清理失败时抛出异常。
+     *
+     * @param deadlineNanos Scheduler 资源收口使用的绝对单调时钟截止
+     */
+    void close(long deadlineNanos) {
+        Throwable failure = RedisJobShutdownSupport.attempt(null, executor::shutdown);
+        // 关闭调用失败时执行器可能仍在周期续租；先复验并重试一次，再进入实际终止等待。
+        if (!executor.isShutdown()) {
+            failure = RedisJobShutdownSupport.attempt(failure, executor::shutdown);
+        }
+        failure = RedisJobShutdownSupport.attempt(failure, leases::clear);
+        failure = RedisJobShutdownSupport.attempt(failure, () -> RedisJobShutdownSupport.awaitTermination(
+                executor, deadlineNanos, "RedisJob lease renewer executor"));
+        RedisJobShutdownSupport.rethrow(failure);
+    }
+
+    /**
+     * 业务作用：确认续租执行器已经停止，避免注销成员后仍有批量续租访问 Redis。
+     *
+     * <p>参数说明: 无。
+     *
+     * @return 续租执行器实际终止时为 true。
+     */
+    boolean isTerminated() {
+        return executor.isTerminated();
     }
 
     /**
