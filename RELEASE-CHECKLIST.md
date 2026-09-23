@@ -8,6 +8,9 @@
 - 根 README 首屏准确说明组件价值、运行架构、关键安全顺序、能力边界和接入前提。
 - RedisJob 的无中心调度与 Fanout、RedisPartition 的分区认领与本地按键执行在根 README 中都有独立架构说明，
   POM 描述与对应公开 Javadoc 使用一致定位。
+- Stream 消费模式仅为 PROXY/PARTITION；PARTITION 的 source/group/stream 在 README 首屏、独立执行域章节、
+  POM 描述与 Javadoc 中含义一致，明确域数量、固定份额、跨域同 key 顺序与共享后端边界。
+- 默认 scope、显式 Runner 限制、完整拓扑预检、旧模式迁移及执行中责任排干均与配置和公开 API 一致。
 - [REDIS-JOB.md](REDIS-JOB.md) 与 [REDIS-PARTITION.md](REDIS-PARTITION.md) 的状态机、配置默认值、
   观测指标、故障语义和不提供的能力与实现一致。
 - Javadoc、示例、配置键、POM 的 `description`、依赖版本、许可证、SCM 与问题入口保持一致。
@@ -32,10 +35,10 @@ mvn -B -ntp clean verify
 
 直接检查生成的主 JAR、sources JAR 和 javadoc JAR，不以工作树文件代替归档内容。至少确认：
 
-- 坐标和版本与待上传版本一致，规范化 POM 的依赖、许可证、SCM 和开发者信息正确。
+- 坐标和版本与目标制品一致，规范化 POM 的依赖、许可证、SCM 和开发者信息正确。
 - 主 JAR 包含运行所需类、Lua、配置元数据，以及 README、组件说明、许可证、NOTICE、安全策略、贡献指南
   和本清单。
-- 直接读取主 JAR 中的公开文档与嵌入 POM，和待交付工作树逐项核对；sources JAR 的源码与运行制品对应，
+- 直接读取主 JAR 中的公开文档与嵌入 POM，和目标提交逐项核对；sources JAR 的源码与运行制品对应，
   javadoc JAR 中可以读到分区执行、PEL 恢复、确认边界和使用示例。
 - sources JAR 和 javadoc JAR 能正常读取；公开 API 文档不存在缺失入口或与签名不一致的参数、返回语义。
 - 所有归档均不包含本地质量程序及其产物、本机日志、IDE 元数据、密钥、凭据或工作目录。
@@ -49,7 +52,7 @@ mvn -B -ntp clean verify
 ## 上传顺序
 
 1. 完成目标分支提交并推送。
-2. 等待远端 CI 通过，核对远端提交 SHA、待交付提交与拟使用的 GitHub 标签目标一致。
+2. 等待远端 CI 通过，核对远端提交 SHA、目标提交与 GitHub 标签目标一致。
 3. 获得维护者对当前坐标、版本、提交及发布目标的明确授权。
 4. 上传并发布 Maven Central 归档。
 5. 从 Maven Central 回读 POM、三种 JAR、签名和元数据；重新核对归档中的 README、配置、许可证与摘要。

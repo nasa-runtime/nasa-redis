@@ -55,7 +55,7 @@ final class StreamPendingRecovery {
      *
      * @param proxy     Redis 命令来源
      * @param runtime   共享执行和确认运行时
-     * @param source    当前 holder 或 consumer epoch
+     * @param source    当前 holder
      * @param records   来源原始记录容量
      * @param batchSize 单页记录上限
      *                  返回: 不占用记录容量、尚无不确定接管的恢复上下文。
@@ -131,7 +131,7 @@ final class StreamPendingRecovery {
     /**
      * 业务作用：不受 minIdle 限制地分页复验当前 consumer PEL，并在原扫描屏障内补全未交接记录。
      *
-     * @param fence 补扫前及完整正文读取后的权威复验；物理分区必须读取真实 holder，BOTH 使用当前 consumer epoch
+     * @param fence 补扫前及完整正文读取后的权威复验；必须读取真实 holder
      * @return 当前 consumer 已无未决 PEL 时为 true；停止或失权时保留远端 PEL 并返回 false。
      */
     boolean reconcileOwned(BooleanSupplier fence) {
@@ -142,26 +142,31 @@ final class StreamPendingRecovery {
                 continue;
             }
             try {
-                if (!fence.getAsBoolean()) return false;
+                StreamSourceAuthority.Snapshot authority = records.readAuthority();
+                // 补扫与正文重读共用取得容量时的代次，迟到页不能由当前 holder 重新授权。
+                if (authority == null || !authority.allowsExecution()
+                        || !fence.getAsBoolean() || !authority.allowsExecution()) return false;
                 PendingMessages pending = Objects.requireNonNull(proxy.xPending(
                                 source.stream(), Consumer.from(source.group(), source.consumer()), batchSize),
                         "current consumer pending response");
                 records.onPollResult(pending.size());
+                if (!authority.allowsExecution()) return false;
                 // 只有明确的空结果才证明当前 consumer 不再有未交接页面，不能用超时替代这项证据。
                 if (pending.isEmpty()) return true;
                 List<PartitionRecordRef> refs = new ArrayList<>(pending.size());
-                long generation = source.authority().snapshot().generation();
                 pending.forEach(record -> refs.add(new PartitionRecordRef(
                         source.stream(), source.group(), source.consumer(), record.getIdAsString(),
                         "<unresolved>", "<unresolved>", "<unresolved>", source.sourceKind(),
-                        source.authority(), generation)));
-                while (source.allowsRecovery() && runtime.admissionOpen()) {
+                        authority.current(), authority.generation())));
+                while (source.allowsRecovery() && runtime.admissionOpen() && authority.allowsExecution()) {
                     // 先确认允许读取；完整正文返回后由恢复入口再次取得权威证据，读取前的证据不能跨越 Redis 往返。
-                    if (!fence.getAsBoolean()) return false;
-                    if (runtime.retryRouteBatch(source, refs, fence) != StreamPartitionRuntime.RetryDisposition.RETAINED)
+                    if (!fence.getAsBoolean() || !authority.allowsExecution()) return false;
+                    if (runtime.retryRouteBatch(source, refs, fence, records.readReservation(), authority)
+                            != StreamPartitionRuntime.RetryDisposition.RETAINED)
                         break;
                     if (!backoff()) return false;
                 }
+                if (!authority.allowsExecution()) return false;
             } catch (RuntimeException unavailable) {
                 if (!isTransient(unavailable)) throw unavailable;
                 // 当前 consumer 的空缺只能由明确响应证明，读取或确认超时不能解除扫描责任。

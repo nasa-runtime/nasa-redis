@@ -1,219 +1,105 @@
 package io.github.nasaruntime.redis.cache.redis.partition;
 
 import io.github.nasaruntime.core.base.Partition;
-import io.github.nasaruntime.core.base.TimingWheel;
-import io.github.nasaruntime.redis.cache.redis.ConsumeMode;
 import io.github.nasaruntime.redis.cache.redis.RedisEventSingleListener;
-
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.IdentityHashMap;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 
-/**
- * 业务作用：冻结一个 Stream listener 在本地 Partition bridge 中的路由、Runner 与 taskType 合同。
- * 运行期不得重新调用 listener.partition()，也不得在 Runner 失健康后切换执行域。
- */
+/** 业务作用：冻结物理分区订阅的业务身份；跨域执行绑定共享同一个计划顺序门禁。 */
 final class StreamSubscriptionPlan {
-
     private final long planId;
     private final RedisEventSingleListener<Object> listener;
-    private final Partition.PartitionRunner runner;
-    private final ConsumeMode mode;
-    private final TaskTypeReservation taskTypes;
+    private final Partition.PartitionRunner requestedRunner;
     private final String[] topics;
     private final String event;
-    private final String group;
     private final boolean autoDelete;
+    private volatile Map<Integer, StreamPlanExecutionBinding> bindings = Map.of();
 
     /**
-     * 业务作用：创建已经通过注册期校验的不可变消费计划。
-     *
-     * @param planId     进程内单调计划标识
-     * @param listener   单条业务 listener
-     * @param runner     当前 RedisProxy 独占、可由其多个计划共享的 PartitionRunner
-     * @param mode       消费来源模式
-     * @param taskTypes  本计划持有的两个任务类型预留
-     * @param topics     不可变主题快照
-     * @param event      事件名
-     * @param group      BOTH dedicated consumer group；PARTITION 为 null
+     * 业务作用：保存声明阶段的不可变计划，不启动 Runner 或开放消费。
+     * @param planId 当前源内唯一计划身份
+     * @param listener 业务处理器
+     * @param requestedRunner source 模式下的显式 Runner，可为空
+     * @param topics 订阅主题快照
+     * @param event 事件名
      * @param autoDelete 权威确认后是否删除正文
-     *                   返回: 构造完成的计划；全部字段在计划生命周期内保持不变。
+     * 返回: 尚未绑定执行域的计划。
      */
-    StreamSubscriptionPlan(long planId,
-                           RedisEventSingleListener<Object> listener,
-                           Partition.PartitionRunner runner,
-                           ConsumeMode mode,
-                           TaskTypeReservation taskTypes,
-                           String[] topics,
-                           String event,
-                           String group,
-                           boolean autoDelete) {
+    StreamSubscriptionPlan(long planId, RedisEventSingleListener<Object> listener,
+                           Partition.PartitionRunner requestedRunner, String[] topics,
+                           String event, boolean autoDelete) {
         this.planId = planId;
-        this.listener = Objects.requireNonNull(listener, "listener");
-        this.runner = Objects.requireNonNull(runner, "runner");
-        this.mode = Objects.requireNonNull(mode, "mode");
-        this.taskTypes = Objects.requireNonNull(taskTypes, "taskTypes");
+        this.listener = Objects.requireNonNull(listener);
+        this.requestedRunner = requestedRunner;
         this.topics = topics.clone();
         this.event = event;
-        this.group = group;
         this.autoDelete = autoDelete;
     }
 
+    /** 业务作用：标识全源共享顺序计划。参数说明: 无。返回: 唯一计划编号。 */
+    long planId() { return planId; }
+    /** 业务作用：提供业务执行入口。参数说明: 无。返回: 冻结处理器。 */
+    RedisEventSingleListener<Object> listener() { return listener; }
+    /** 业务作用：读取声明时显式选择的执行器。参数说明: 无。返回: 可为空的 Runner。 */
+    Partition.PartitionRunner requestedRunner() { return requestedRunner; }
+    /** 业务作用：保护订阅主题不被外部修改。参数说明: 无。返回: 主题副本。 */
+    String[] topics() { return topics.clone(); }
+    /** 业务作用：定位精确事件路由。参数说明: 无。返回: 冻结事件名。 */
+    String event() { return event; }
+    /** 业务作用：选择权威确认后的正文保留策略。参数说明: 无。返回: 是否删除正文。 */
+    boolean autoDelete() { return autoDelete; }
+
     /**
-     * 业务作用：为不使用普通 Stream group 的 PARTITION 计划构造兼容快照。
-     *
-     * @param planId     计划标识
-     * @param listener   单条 listener
-     * @param runner     PartitionRunner
-     * @param mode       消费模式
-     * @param taskTypes  taskType 预留
-     * @param topics     topic 快照
-     * @param event      事件名
-     * @param autoDelete 删除策略
-     *                   返回: group 为 null 的计划。
+     * 业务作用：在消费开放前一次发布全部可达执行域，防止跨组计划只绑定部分来源。
+     * @param values 已完成 Runner 和任务类型校验的执行绑定
+     * 返回: 无返回值；重复发布拒绝。
      */
-    StreamSubscriptionPlan(long planId,
-                           RedisEventSingleListener<Object> listener,
-                           Partition.PartitionRunner runner,
-                           ConsumeMode mode,
-                           TaskTypeReservation taskTypes,
-                           String[] topics,
-                           String event,
-                           boolean autoDelete) {
-        this(planId, listener, runner, mode, taskTypes, topics, event, null, autoDelete);
+    synchronized void bind(Map<Integer, StreamPlanExecutionBinding> values) {
+        if (!bindings.isEmpty() || values.isEmpty()) throw new IllegalStateException("invalid plan activation");
+        bindings = Map.copyOf(values);
     }
 
     /**
-     * 业务作用：返回进程内计划标识，用于 gate 与恢复状态隔离。参数说明: 无。返回: 正整数计划标识。
+     * 业务作用：按真实来源选取执行绑定，未知来源不得降级或借用其它域。
+     * @param domain 来源的冻结执行域
+     * @return 对应绑定；计划不可达该来源时拒绝
      */
-    long planId() {
-        return planId;
+    StreamPlanExecutionBinding binding(PartitionExecutionDomain domain) {
+        StreamPlanExecutionBinding value = bindings.get(domain.id());
+        if (value == null || value.domain() != domain) throw new IllegalStateException("plan does not belong to execution domain");
+        return value;
     }
 
-    /**
-     * 业务作用：返回单条业务 listener，Task 只通过该入口产生业务副作用。参数说明: 无。返回: 注册期冻结的 listener。
-     */
-    RedisEventSingleListener<Object> listener() {
-        return listener;
-    }
+    /** 业务作用：提供低基数执行域观测集合。参数说明: 无。返回: 不可变绑定集合。 */
+    Collection<StreamPlanExecutionBinding> bindings() { return bindings.values(); }
 
-    /**
-     * 业务作用：返回注册期冻结的 PartitionRunner，不允许运行期自动切换。参数说明: 无。返回: 计划 Runner。
-     */
-    Partition.PartitionRunner runner() {
-        return runner;
-    }
-
-    /**
-     * 业务作用：返回声明的来源模式，供注册与确认路径选择。参数说明: 无。返回: PARTITION 或 BOTH。
-     */
-    ConsumeMode mode() {
-        return mode;
-    }
-
-    /**
-     * 业务作用：返回 ordered Task 独占的 taskType。参数说明: 无。返回: 已提交的负数 taskType。
-     */
-    int orderedTaskType() {
-        return taskTypes.pair().ordered();
-    }
-
-    /**
-     * 业务作用：返回 unordered Task 独占的 taskType。参数说明: 无。返回: 已提交的负数 taskType。
-     */
-    int unorderedTaskType() {
-        return taskTypes.pair().unordered();
-    }
-
-    /**
-     * 业务作用：返回本计划持有的 taskType 预留，注册事务只能把它提交或废弃一次。
-     *
-     * <p>参数说明: 无。
-     *
-     * @return 与计划同生命周期的预留对象
-     */
-    TaskTypeReservation taskTypes() {
-        return taskTypes;
-    }
-
-    /**
-     * 业务作用：返回主题快照副本，避免调用方改变计划路由。参数说明: 无。返回: 新数组副本。
-     */
-    String[] topics() {
-        return topics.clone();
-    }
-
-    /**
-     * 业务作用：返回计划事件名。参数说明: 无。返回: 非空事件名。
-     */
-    String event() {
-        return event;
-    }
-
-    /**
-     * 业务作用：返回 BOTH dedicated consumer 的 group 快照。
-     *
-     * <p>参数说明: 无。
-     *
-     * @return BOTH 的非空 group；PARTITION 返回 null
-     */
-    String group() {
-        return group;
-    }
-
-    /**
-     * 业务作用：返回权威确认成功后是否删除 Stream 正文。参数说明: 无。返回: 计划冻结的删除策略。
-     */
-    boolean autoDelete() {
-        return autoDelete;
-    }
-
-    /**
-     * 业务作用：生成跨实例稳定且不含内部 planId 的订阅指标名，供低基数计划维度聚合。
-     *
-     * <p>参数说明: 无。
-     *
-     * @return 由排序后的 topic、event 与 group 组成的稳定名称
-     */
+    /** 业务作用：给同一业务订阅生成跨实例稳定指标名称。参数说明: 无。返回: topic/event 名称。 */
     String metricSubscription() {
-        String normalizedTopics = Arrays.stream(topics).sorted().reduce((left, right) -> left + "," + right)
-                .orElse("<none>");
-        String normalizedGroup = group == null || group.isBlank() ? "<partition>" : group;
-        return normalizedTopics + "/" + event + "/" + normalizedGroup;
+        return String.join(",", Arrays.stream(topics).sorted().toList()) + "/" + event + "/<partition>";
     }
 
     /**
-     * 业务作用：按消息体计算并冻结本次本地 Partition 路由，Number 与 Object 使用各自真实入口的 hash。
-     *
-     * @param data 已完成反序列化的业务消息
-     * @return 只在同步 submit 前短暂持有对象 key 的路由结果
+     * 业务作用：一次计算并冻结本次业务键，gate 与 Runner 使用同一有效 hash。
+     * @param data 解码后的消息
+     * @return 保持数值键与对象键入口语义的路由
      */
     ResolvedPartitionKey resolvePartitionKey(Object data) {
         return ResolvedPartitionKey.resolve(listener.partitionKey(data));
     }
+}
 
-    /**
-     * 业务作用：按依赖顺序启动本计划的 TimingWheel 与 PartitionRunner，并复验完整健康状态后才允许读消息。
-     *
-     * <p>参数说明: 无。
-     * 返回: 无返回值；依赖未形成同一完整代次时抛出 IllegalStateException。
-     */
-    void ensureRuntimeStarted() {
-        TimingWheel.TimingWheelRunner timingWheel = runner.getTimingWheel();
-        timingWheel.start();
-        if (!timingWheel.isStarted()) {
-            throw new IllegalStateException("Partition 对应的 TimingWheel 未启动: " + runner.getRunnerName());
-        }
-        runner.start();
-        if (!runner.isStarted() || !runner.isHealthy()) {
-            throw new IllegalStateException("PartitionRunner 未形成完整可用代次: " + runner.getRunnerName());
-        }
-    }
+/**
+ * 业务作用：绑定一个业务计划在指定域的两类任务身份，不改变全源计划编号。
+ * @param domain 冻结执行域
+ * @param taskTypes 本域独占的任务类型预留
+ */
+record StreamPlanExecutionBinding(PartitionExecutionDomain domain, TaskTypeReservation taskTypes) {
+    /** 业务作用：选择保序任务类型。参数说明: 无。返回: 本域内唯一类型。 */
+    int orderedTaskType() { return taskTypes.pair().ordered(); }
+    /** 业务作用：选择非保序任务类型。参数说明: 无。返回: 本域内唯一类型。 */
+    int unorderedTaskType() { return taskTypes.pair().unordered(); }
 }
 
 /**

@@ -1274,6 +1274,9 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean, S
         partTo.setHoldsCheckIntervalMs(partFrom.getHoldsCheckIntervalMs());
         partTo.setDrainTimeoutMs(partFrom.getDrainTimeoutMs());
         partTo.setKeyLayout(partFrom.getKeyLayout());
+        partTo.getExecutor().setScope(partFrom.getExecutor().getScope());
+        partTo.getExecutor().setMaxRunners(partFrom.getExecutor().getMaxRunners());
+        partTo.getExecutor().setMaxTotalPartitions(partFrom.getExecutor().getMaxTotalPartitions());
         copyLocalPartitionConsumer(partFrom.getLocalConsumer(), partTo.getLocalConsumer());
         partTo.getGroups().clear();
         partTo.getGroups().putAll(partFrom.getGroups());
@@ -1301,24 +1304,17 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean, S
                 maxBatch = Math.max(maxBatch, group.getBatchSize());
             }
         }
-        for (Map<String, NasaLettuceConfig.Group> groups : sourceStream.getGroup().values()) {
-            for (NasaLettuceConfig.Group group : groups.values()) {
-                if (group != null && group.getBatchSize() != null) {
-                    maxBatch = Math.max(maxBatch, group.getBatchSize());
-                }
-            }
-        }
         if (local.getMaxInFlightRecords() < maxBatch
-                || local.getMaxInFlightTasks() < maxBatch
+                || local.getMaxInFlightTasks() < 1
                 || local.getMaxPendingCommitRecords() < maxBatch
                 || local.getMaxBlockedKeysPerClaim() < maxBatch
                 || local.getMaxDeferredIdsPerKey() < maxBatch
-                || local.getMaxPendingUnorderedRetries() < maxBatch
-                || local.getMaxProxyLedgerRecords() < maxBatch) {
+                || local.getMaxPendingUnorderedRetries() < maxBatch) {
             throw new IllegalArgumentException("partition local consumer capacities must not be smaller than any effective batchSize");
         }
-        if (local.getMaxRouteBlockedRecords() < local.getMaxInFlightRecords()) {
-            throw new IllegalArgumentException("maxRouteBlockedRecords must not be smaller than maxInFlightRecords");
+        if (sourceStream.getPartition().getExecutor().getScope() == RedisPartitionProperties.ExecutorScope.SOURCE
+                && local.getMaxRouteBlockedRecords() < local.getMaxInFlightRecords()) {
+            throw new IllegalArgumentException("source maxRouteBlockedRecords must cover maxInFlightRecords");
         }
         if (local.getMaxPendingCommitAttempts() < 1
                 || local.getMaxInFlightRetries() < 1
@@ -1326,9 +1322,6 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean, S
                 || local.getMaxDeferredIdsPerKey() < 1
                 || local.getMaxRouteBlockedRecords() < 1
                 || local.getMaxPendingUnorderedRetries() < 1
-                || local.getMaxProxyLedgerRecords() < 1
-                || local.getMaxProxyFieldsPerRecord() < 1
-                || local.getProxyPendingMinIdleMs() < 1
                 || local.getRetryInitialDelayMs() < 1 || local.getRetryMaxDelayMs() < local.getRetryInitialDelayMs()
                 || local.getAckReconcileInitialDelayMs() < 1
                 || local.getAckReconcileMaxDelayMs() < local.getAckReconcileInitialDelayMs()) {
@@ -1356,9 +1349,6 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean, S
         target.setMaxDeferredIdsPerKey(source.getMaxDeferredIdsPerKey());
         target.setMaxRouteBlockedRecords(source.getMaxRouteBlockedRecords());
         target.setMaxPendingUnorderedRetries(source.getMaxPendingUnorderedRetries());
-        target.setMaxProxyLedgerRecords(source.getMaxProxyLedgerRecords());
-        target.setMaxProxyFieldsPerRecord(source.getMaxProxyFieldsPerRecord());
-        target.setProxyPendingMinIdleMs(source.getProxyPendingMinIdleMs());
         target.setRetryInitialDelayMs(source.getRetryInitialDelayMs());
         target.setRetryMaxDelayMs(source.getRetryMaxDelayMs());
         target.setAckReconcileInitialDelayMs(source.getAckReconcileInitialDelayMs());
@@ -1448,32 +1438,12 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean, S
         // 边扫边建会让先注册的 listener 在后续 topic 的组还没建好时就开始 XREADGROUP，读到 NOGROUP。
         Collection<Object> values = ContextUtils.getBeansOfType(Object.class).values();
         Set<String> partitionTopics = new HashSet<>();
-        Map<String, ConsumeMode> groupedRouteModes = new HashMap<>();
+        Map<StreamSubscribe<?, ?>, StreamSubscriptionDecision> streamDeclarations = new IdentityHashMap<>();
         for (Object o : values) {
             if (o instanceof StreamSubscribe ss) {
-                ConsumeMode m = ss.mode();
-                String[] qfr = ss.qualifiers();
-                boolean servesProxy = qfr == null
-                        || !ColUtils.notContains(qfr, RedisProxy::qualifierFormat, this.qualifier);
-                if (!servesProxy) continue;
-                String[] declaredTopics = ss.topics();
-                String declaredGroup = ss.group();
-                if ((m == ConsumeMode.PROXY || m == ConsumeMode.BOTH)
-                        && StringUtils.isNotBlank(declaredGroup)
-                        && declaredTopics != null) {
-                    for (String topic : declaredTopics) {
-                        String route = topic + "\u0000" + declaredGroup;
-                        ConsumeMode previous = groupedRouteModes.putIfAbsent(route, m);
-                        if (previous != null && previous != m
-                                && (previous == ConsumeMode.BOTH || m == ConsumeMode.BOTH)) {
-                            throw new IllegalStateException("legacy PROXY and BOTH cannot share stream/group: "
-                                    + topic + "/" + declaredGroup);
-                        }
-                    }
-                }
-                if (m == ConsumeMode.PARTITION || m == ConsumeMode.BOTH) {
-                    if (declaredTopics != null) Collections.addAll(partitionTopics, declaredTopics);
-                }
+                // 分流和 qualifier 命中结论与分区声明一同冻结，后续注册不能改走已经开放的普通入口。
+                StreamSubscriptionDecision decision = streamDeclarations.computeIfAbsent(ss, this::prepareStreamSubscribe);
+                partitionTopics.addAll(decision.partitionTopics());
             }
         }
 
@@ -1483,8 +1453,9 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean, S
         if (!partitionTopics.isEmpty()) {
             if (!this.stream.getPartition().isEnabled()) {
                 throw new IllegalStateException("RedisProxy[" + qualifier
-                        + "] 存在 PARTITION/BOTH listener，但 stream.partition.enabled=false");
+                        + "] 存在 PARTITION listener，但 stream.partition.enabled=false");
             }
+            RedisPartition.load(this).preflightExecution(partitionTopics);
             this.autoPreparePartitions(partitionTopics);
         }
 
@@ -1508,7 +1479,9 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean, S
             // StreamSubscribe<T,TS> 是 redis stream 订阅根接口, Batch / Single 都继承它,
             // 所以一个 instanceof 就覆盖所有 stream listener bean。
             if (o instanceof StreamSubscribe ss) {
-                this.loadStreamSubscribe(ss);
+                // 同一 bean 的多个名称只登记一次；未命中的声明也沿用首遍结论，不能在注册阶段重新加入。
+                StreamSubscriptionDecision decision = streamDeclarations.remove(ss);
+                if (decision != null) this.loadStreamSubscribe(ss, decision);
                 continue;
             }
 
@@ -1615,25 +1588,55 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean, S
     }
 
     /**
-     * 业务作用：处理一个 {@link StreamSubscribe} bean 的注册 (含 {@link RedisEventBatchListener} / {@link RedisEventSingleListener})。
+     * 业务作用：保存当前代理对一个 listener 的不可变分流结果，初始化后续阶段不再查询消费入口声明。
+     * @param servesProxy 首次 qualifier 判断是否命中本代理
+     * @param mode 首次选择的消费模式；未命中本代理时为空
+     * @param partitionTopics 已冻结分区计划的主题；非分区或未命中时为空
+     */
+    private record StreamSubscriptionDecision(boolean servesProxy, ConsumeMode mode, List<String> partitionTopics) { }
+
+    /**
+     * 业务作用：在资源准备前一次性确定 listener 的代理归属与消费模式，并冻结分区计划。
+     * @param listener 待装配的订阅 bean
+     * @return 本轮初始化独占的分流快照；不命中当前代理时不读取其模式或创建分区资源
+     */
+    private StreamSubscriptionDecision prepareStreamSubscribe(StreamSubscribe<?, ?> listener) {
+        String[] qualifiers = listener.qualifiers();
+        boolean servesProxy = qualifiers == null
+                || !ColUtils.notContains(qualifiers, RedisProxy::qualifierFormat, this.qualifier);
+        if (!servesProxy) return new StreamSubscriptionDecision(false, null, List.of());
+        ConsumeMode mode = Objects.requireNonNull(listener.mode(), "StreamSubscribe.mode()");
+        List<String> topics = mode == ConsumeMode.PARTITION
+                ? RedisPartition.load(this).declareListener(listener, mode) : List.of();
+        return new StreamSubscriptionDecision(true, mode, topics);
+    }
+
+    /**
+     * 业务作用：按首次冻结的分流决定注册订阅，分区计划只发布声明，普通订阅沿用原消费合同。
      * <p>
      * 流程:
      * <ol>
-     *   <li>qualifier 过滤 — 跳过不归本 RedisProxy 服务的 listener</li>
-     *   <li>mode 分流 — PROXY 保持既有 subscribe；PARTITION/BOTH 进入共享计划，BOTH 另建 dedicated 手工确认入口</li>
+     *   <li>复用 qualifier 结论 — 跳过首次不归本 RedisProxy 服务的 listener</li>
+     *   <li>复用 mode 结论 — PROXY 保持既有 subscribe；PARTITION 进入冻结的物理分区计划</li>
      *   <li>PROXY 路径用 FactorConsumer2 包装 listener.onEvent + autoDelete + EventMessage 回收</li>
      * </ol>
      * 一个 instanceof StreamSubscribe 就覆盖了所有 stream listener bean (Batch / Single 都继承 StreamSubscribe)。
      *
-     * @param ss 见上述说明
+     * @param ss 待注册的原订阅 bean
+     * @param decision 同一 bean 首遍扫描取得的分流快照
+     * 返回: 无返回值；分区消费仍须等待统一激活，不重读 qualifier 或 mode。
      */
     @SuppressWarnings({"rawtypes", "unchecked"})
-    private void loadStreamSubscribe(StreamSubscribe ss) {
-        // step 1: qualifier 过滤
-        String[] qfr = ss.qualifiers();
-        if (Objects.nonNull(qfr) && ColUtils.notContains(qfr, RedisProxy::qualifierFormat, this.qualifier)) {
+    private void loadStreamSubscribe(StreamSubscribe ss, StreamSubscriptionDecision decision) {
+        if (!decision.servesProxy()) return;
+        // 必须先采用首遍分流结果；重读声明可能让尚未激活的分区 listener 进入普通消费容器。
+        if (decision.mode() == ConsumeMode.PARTITION) {
+            RedisPartition partition = RedisPartition.load(this);
+            partition.registerListener(ss);
+            subscribedTopics.addAll(decision.partitionTopics());
             return;
         }
+
         String[] topics = ss.topics();
         if (ColUtils.isEmpty(topics)) return;
         String event = ss.event();
@@ -1641,15 +1644,6 @@ public class RedisProxy extends OPS implements Initialization, DisposableBean, S
             throw new NullPointerException("StreamSubscribe.event() must not be null/empty: " + ss.getClass().getName());
         }
         TypeReference reference = ss.paramType();
-        ConsumeMode mode = ss.mode();
-
-        // step 2: PARTITION/BOTH 统一进入计划注册；BOTH 不得回落到旧自动确认 subscribe 路径。
-        if (mode != ConsumeMode.PROXY) {
-            RedisPartition.load(this).registerListener(ss);
-            Collections.addAll(subscribedTopics, topics);
-            return;
-        }
-
         // step 3: PROXY 保持既有 redisProxy.subscribe 行为。
         // FactorConsumer2 把 listener 暴露给框架内部用 (识别 batch / autoDelete 等)
         String group = ss.group();

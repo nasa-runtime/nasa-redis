@@ -13,6 +13,8 @@ import java.util.Map;
  * 业务作用：承载分区认领、本地执行、PEL 恢复和确认的配置，保持各来源的容量与权威边界一致。
  * <p>
  * 这里只放分区独有的运行参数, 拉取相关 (pollTimeout / batchSize) 仍走 {@link Stream} 全局配置。
+ * {@code executor.scope} 默认 source；group/stream 按完整拓扑拆分 {@code local-consumer} 的源级数量总额，
+ * 每域保留最低批次需求后均分余量，域间不借用份额。该设置不改变 Redis 键布局，也不影响普通 PROXY 订阅。
  * <p>
  * <b>命名空间约定</b>: {@link #defaultGroup} 是所有分区组的命名空间前缀, 也是默认共享组本身的 group 名。
  * <ul>
@@ -36,6 +38,10 @@ import java.util.Map;
  *             enabled: true           # 分区消费总开关
  *             default-group: SINGLE-CONSUME  # 命名空间前缀, 也是默认共享组的 group 名
  *             count: 64               # 默认共享组的分区数
+ *             executor:
+ *               scope: source         # group 按逻辑组、stream 按物理 Stream 建立独立域
+ *               max-runners: 256
+ *               max-total-partitions: 4096  # Runner 本地槽数总和，与 Redis count 不同
  *             rebalance-ms: 3000
  *             min-idle-ms: 30000
  *             holds-check-interval-ms: 5000
@@ -81,6 +87,30 @@ public class RedisPartitionProperties {
     private PartitionKeyLayout keyLayout = PartitionKeyLayout.AUTO;
     /* 本地 Partition 执行、确认与 PEL 恢复的硬容量。 */
     private final LocalConsumer localConsumer = new LocalConsumer();
+    /** 业务作用：选择本地执行域及完整拓扑的资源上限，不改变 Redis 物理布局。 */
+    private final Executor executor = new Executor();
+
+    /** 业务作用：决定同一 Redis 源内哪些物理来源共享本地队列与容量。 */
+    public enum ExecutorScope {
+        /** 当前源共用一个执行域。 */
+        SOURCE,
+        /** 每个逻辑组使用一个执行域。 */
+        GROUP,
+        /** 每个物理 Stream 使用一个执行域。 */
+        STREAM
+    }
+
+    /** 业务作用：在消费启动前限制 Runner 总数和本地槽数，防止随拓扑无界扩张。 */
+    @Getter
+    @Setter
+    public static class Executor {
+        /** 本地资源共享范围；仅 SOURCE 允许 listener 提供显式 Runner。 */
+        private ExecutorScope scope = ExecutorScope.SOURCE;
+        /** 完整拓扑的 Runner 数量上限，允许 1..4096；未订阅的配置组仍计入 GROUP/STREAM 预算。 */
+        private int maxRunners = 256;
+        /** 全部 Runner 本地槽数总上限，槽数按 JVM 配置归一化后计入，超出时拒绝消费启动。 */
+        private int maxTotalPartitions = 4096;
+    }
     /**
      * 隔离组配置表。key = 业务逻辑短名 (不要带 defaultGroup 前缀, 框架会自动拼)。
      * 例如 key="contract:settlement" → 实际 stream 前缀 = "{defaultGroup}:contract:settlement"。
@@ -114,6 +144,18 @@ public class RedisPartitionProperties {
     @Getter
     @Setter
     public static class LocalConsumer {
+        /** 业务作用：拒绝不再支持的普通来源账本配置，避免旧配置被静默忽略。@param value 旧配置值；返回: 总是抛出迁移诊断。 */
+        @Deprecated public void setMaxProxyLedgerRecords(int value) { throw removed("max-proxy-ledger-records"); }
+        /** 业务作用：拒绝不再支持的普通来源字段配置。@param value 旧配置值；返回: 总是抛出迁移诊断。 */
+        @Deprecated public void setMaxProxyFieldsPerRecord(int value) { throw removed("max-proxy-fields-per-record"); }
+        /** 业务作用：拒绝不再支持的普通来源接管配置。@param value 旧配置值；返回: 总是抛出迁移诊断。 */
+        @Deprecated public void setProxyPendingMinIdleMs(long value) { throw removed("proxy-pending-min-idle-ms"); }
+        /** 业务作用：提供明确的旧配置错误，不建立旧消费路径。@param key 已删除配置键 @return 不支持配置异常 */
+        private static IllegalArgumentException removed(String key) {
+            return new IllegalArgumentException("BOTH is unsupported; remove stream.partition.local-consumer." + key
+                    + " and select PROXY or PARTITION explicitly");
+        }
+
 
         private int maxInFlightRecords = 8_192;
         private int maxInFlightTasks = 4_096;
@@ -124,9 +166,6 @@ public class RedisPartitionProperties {
         private int maxDeferredIdsPerKey = 1_024;
         private int maxRouteBlockedRecords = 8_192;
         private int maxPendingUnorderedRetries = 8_192;
-        private int maxProxyLedgerRecords = 8_192;
-        private int maxProxyFieldsPerRecord = 64;
-        private long proxyPendingMinIdleMs = 30_000;
         private long retryInitialDelayMs = 1_000;
         private long retryMaxDelayMs = 30_000;
         private long ackReconcileInitialDelayMs = 200;

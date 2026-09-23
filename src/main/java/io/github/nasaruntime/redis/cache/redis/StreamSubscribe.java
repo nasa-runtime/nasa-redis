@@ -42,10 +42,10 @@ public interface StreamSubscribe<T, TS> extends PartitionedEventListener<T, TS>,
     }
 
     /**
-     * 业务作用：选择普通 Stream、物理分区或两种来源；PARTITION 与 BOTH 使用逐条业务和本地按键 Task。
+     * 业务作用：选择普通 Stream 或物理分区；PARTITION 使用逐条业务和本地按键 Task。
      *
      * 参数说明: 无。
-     * @return 默认 PROXY；PARTITION 与 BOTH 拒绝 Batch listener，BOTH 普通来源仅提供 JVM 内顺序。
+     * @return 默认 PROXY；PARTITION 拒绝 Batch listener，其执行域由 stream.partition.executor.scope 选择。
      */
     default ConsumeMode mode() {
         return ConsumeMode.PROXY;
@@ -53,10 +53,9 @@ public interface StreamSubscribe<T, TS> extends PartitionedEventListener<T, TS>,
 
     /**
      * 业务作用：stream consumer group 名。PARTITION 模式下由物理分区组决定；PROXY 沿用既有消费组配置；
-     * BOTH 必须显式声明非空 group，并由内部 dedicated 手工确认容器使用。
      *
      * 参数说明: 无。
-     * @return 默认 null；BOTH 必须返回非空普通 Stream group，PARTITION 使用物理分区组命名空间。
+     * @return 默认 null；PROXY 按普通组配置运行，PARTITION 使用物理分区组命名空间。
      */
     default String group() {
         return null;
@@ -64,7 +63,7 @@ public interface StreamSubscribe<T, TS> extends PartitionedEventListener<T, TS>,
 
     /**
      * 业务作用：是否在业务成功并通过权威确认后删除 Stream 正文。PROXY 沿用既有语义；PARTITION
-     * 在 holder-fenced ACK 内执行；BOTH 在 consumer-fenced ACK 内执行。XDEL 对所有 group 生效，
+     * 在 holder-fenced ACK 内执行。XDEL 对所有 group 生效，
      * 只有确认该 Stream 正文不再服务其它消费组时才能开启。
      *
      * 参数说明: 无。

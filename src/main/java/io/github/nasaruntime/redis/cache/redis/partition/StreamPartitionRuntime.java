@@ -30,19 +30,16 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BooleanSupplier;
 
 /**
- * 业务作用：承载单个 RedisProxy 的两种 Stream 来源、Partition dispatcher、硬容量、重试、确认复验与完整排干。
+ * 业务作用：承载单个 RedisProxy 的物理 Stream 来源、分域 dispatcher、硬容量、重试、确认复验与完整排干。
  */
 final class StreamPartitionRuntime implements AutoCloseable {
 
     private final RedisProxy redisProxy;
+    private volatile PartitionExecutionPlan executionPlan;
     private final StreamSubscriptionRegistry subscriptions;
     private final OrderedKeyCoordinator orderedKeys;
-    private final PartitionRecordCapacity recordCapacity;
-    private final PartitionDispatchCapacity dispatchCapacity;
     private final StreamRuntimeStatus status = new StreamRuntimeStatus();
-    private final ProxyRecordAckLedger proxyLedger;
-    private final StreamCommitCoordinator commits;
-    private final StreamRetryCoordinator retries;
+    private final PartitionRecordExecution recordExecution = new PartitionRecordExecution();
     private final ExecutorService waitExecutor;
     private final AtomicBoolean admission = new AtomicBoolean(true);
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -51,9 +48,6 @@ final class StreamPartitionRuntime implements AutoCloseable {
     private final ConcurrentHashMap<Long, TaskTicket> inFlightTickets = new ConcurrentHashMap<>();
     private final java.util.Set<StreamSourceAuthority> uncertainRecoveries = new java.util.HashSet<>();
     private final ReentrantReadWriteLock submissionBarrier = new ReentrantReadWriteLock(true);
-    private final String processSession = UUID.randomUUID().toString();
-    private final LinkedHashMap<ProxySourceKey, ProxyBothStreamSource> proxySources = new LinkedHashMap<>();
-    private final int maxProxyFieldsPerRecord;
     private final long drainTimeoutMillis;
 
     /**
@@ -69,30 +63,33 @@ final class StreamPartitionRuntime implements AutoCloseable {
         RedisPartitionProperties.LocalConsumer config = redisProxy.getStream().getPartition().getLocalConsumer();
         this.orderedKeys = new OrderedKeyCoordinator(
                 config.getMaxBlockedKeysPerClaim(), config.getMaxDeferredIdsPerKey());
-        this.recordCapacity = new PartitionRecordCapacity(
-                config.getMaxInFlightRecords(), () -> status.failReadiness("redis_count_contract"));
-        this.dispatchCapacity = new PartitionDispatchCapacity(
-                config.getMaxInFlightTasks(),
-                config.getMaxPendingCommitAttempts(),
-                config.getMaxPendingCommitRecords());
-        this.maxProxyFieldsPerRecord = config.getMaxProxyFieldsPerRecord();
         this.drainTimeoutMillis = redisProxy.getStream().getPartition().getDrainTimeoutMs();
         ThreadFactory factory = Thread.ofVirtual()
                 .name("redis-partition-wait-" + redisProxy.getQualifier() + "-", 0)
                 .factory();
         this.waitExecutor = Executors.newThreadPerTaskExecutor(factory);
-        this.proxyLedger = new ProxyRecordAckLedger(config.getMaxProxyLedgerRecords(), status);
-        this.commits = new StreamCommitCoordinator(
-                redisProxy.getQualifier(), orderedKeys, status, waitExecutor,
-                config.getAckReconcileInitialDelayMs(), config.getAckReconcileMaxDelayMs(),
-                redisProxy::streamPartitionMetrics);
-        this.retries = new StreamRetryCoordinator(
-                this, status,
-                config.getMaxInFlightRetries(),
-                config.getMaxPendingUnorderedRetries(),
-                config.getMaxRouteBlockedRecords(),
-                config.getRetryInitialDelayMs(),
-                config.getRetryMaxDelayMs());
+
+    }
+
+    /**
+     * 业务作用：启动全部冻结域，来源开放由宿主在远端合同复验后统一完成。
+     * @param plan 完整拓扑与固定份额
+     * @param topicGroups 主题到逻辑组的映射
+     * 返回: 无返回值；失败时来源保持关闭。
+     */
+    void activate(PartitionExecutionPlan plan, Map<String, String> topicGroups) {
+        subscriptions.start(plan, topicGroups, this, orderedKeys, status);
+        executionPlan = plan;
+    }
+
+    /**
+     * 业务作用：把新 claim 永久绑定到冻结的物理来源域。
+     * @param group 逻辑组
+     * @param partition 物理编号
+     * @return 不随持锁变化的域对象
+     */
+    PartitionExecutionDomain domain(String group, int partition) {
+        return subscriptions.domains().get(executionPlan.domain(group, partition));
     }
 
     /**
@@ -133,131 +130,31 @@ final class StreamPartitionRuntime implements AutoCloseable {
     }
 
     /**
-     * 业务作用：返回进程启动会话量，BOTH 实际 consumer name 用它隔离重启前后的迟到 ACK。
-     *
-     * <p>参数说明: 无。
-     *
-     * @return 本运行时唯一会话字符串
-     */
-    String processSession() {
-        return processSession;
-    }
-
-    /**
-     * 业务作用：取得一个 BOTH stream/group 的配置快照，未声明时使用代码默认值。
-     *
-     * @param stream Stream key
-     * @param group  consumer group
-     * @return 对应 group 配置或只读默认配置
-     */
-    NasaLettuceConfig.Group groupConfig(String stream, String group) {
-        Map<String, NasaLettuceConfig.Group> groups = redisProxy.getStream().getGroup().get(stream);
-        return groups == null ? NasaLettuceConfig.Group.DEFAULT
-                : groups.getOrDefault(group, NasaLettuceConfig.Group.DEFAULT);
-    }
-
-    /**
      * 业务作用：为一个 Redis 来源创建读取前 record permit 交接状态。
      *
      * @param sourceId 来源生命周期内稳定的对象身份
      * @param wake     容量归还时缩短 runner 等待的动作
      * @return 初始不持有 record permit 的来源状态
      */
-    PartitionSourceRecordState newRecordState(Object sourceId, Runnable wake) {
-        return new PartitionSourceRecordState(recordCapacity, sourceId, wake);
-    }
-
-    /**
-     * 业务作用：在全部 listener 计划激活后，按 stream/group 合并并开放 BOTH dedicated container。
-     *
-     * <p>参数说明: 无。
-     * 返回: 无返回值；任一 container 初始化失败时已开放来源全部回滚关闭。
-     */
-    synchronized void startProxySources() {
-        if (!admission.get()) throw new IllegalStateException("Stream runtime admission is closed");
-        List<ProxyBothStreamSource> created = new ArrayList<>();
-        try {
-            for (StreamSubscriptionPlan plan : subscriptions.plans()) {
-                if (plan.mode() != ConsumeMode.BOTH) continue;
-                for (String topic : plan.topics()) {
-                    ProxySourceKey key = new ProxySourceKey(topic, plan.group());
-                    ProxyBothStreamSource source = proxySources.get(key);
-                    if (source == null) {
-                        source = new ProxyBothStreamSource(redisProxy, this, topic, plan.group());
-                        proxySources.put(key, source);
-                        created.add(source);
-                    }
-                }
-            }
-            for (ProxyBothStreamSource source : created) source.start();
-        } catch (Throwable failure) {
-            for (ProxyBothStreamSource source : created) {
-                try {
-                    source.close();
-                } catch (Throwable ignored) {
-                }
-            }
-            proxySources.values().removeAll(created);
-            throw failure;
-        }
-    }
-
-    /**
-     * 业务作用：复验 BOTH source 的全部精确路由计划 Runner 仍处于同一健康代次。
-     *
-     * @param stream Stream key
-     * @param group  consumer group
-     * @return 所有匹配计划都 started/healthy 时返回 true
-     */
-    boolean sourceHealthy(String stream, String group) {
-        boolean found = false;
-        for (StreamSubscriptionPlan plan : subscriptions.plans()) {
-            if (plan.mode() != ConsumeMode.BOTH || !Objects.equals(group, plan.group())) continue;
-            for (String topic : plan.topics()) {
-                if (!stream.equals(topic)) continue;
-                found = true;
-                if (!subscriptions.isRunnerHealthy(plan.planId())) {
-                    status.failReadiness("runner_unhealthy");
-                    return false;
-                }
-            }
-        }
-        if (found) clearRunnerReadinessIfAllHealthy();
-        return found;
+    PartitionSourceRecordState newRecordState(PartitionSource sourceId, Runnable wake) {
+        return new PartitionSourceRecordState(sourceId.authority().domain().records, sourceId, wake);
     }
 
     /**
      * 业务作用：在 RedisPartition Claim 读取前复验其物理分区组内全部精确计划，防止 Runner 失去健康后继续扩大 PEL。
      *
+     * @param source 绑定固定执行域的物理来源
      * @param plans 当前物理分区组已发布的 topic/event 计划
      * @return 至少存在一个计划且全部 Runner 健康时返回 true
      */
-    boolean partitionSourceHealthy(Iterable<StreamSubscriptionPlan> plans) {
+    boolean partitionSourceHealthy(PartitionSource source, Iterable<StreamSubscriptionPlan> plans) {
+        if (!source.authority().domain().healthy()) return false;
         boolean found = false;
-        LinkedHashSet<Long> checked = new LinkedHashSet<>();
         for (StreamSubscriptionPlan plan : plans) {
-            if (plan == null || !checked.add(plan.planId())) continue;
+            plan.binding(source.authority().domain());
             found = true;
-            if (!subscriptions.isRunnerHealthy(plan.planId())) {
-                status.failReadiness("runner_unhealthy");
-                return false;
-            }
         }
-        if (found) clearRunnerReadinessIfAllHealthy();
         return found;
-    }
-
-    /**
-     * 业务作用：只有全部已发布计划都恢复健康时才撤销共享 readiness 原因，单个健康来源不能遮蔽其它失效 Runner。
-     *
-     * <p>参数说明: 无。
-     * 返回: 无返回值。
-     */
-    private void clearRunnerReadinessIfAllHealthy() {
-        for (StreamSubscriptionPlan plan : subscriptions.plans()) {
-            if (!subscriptions.isRunnerHealthy(plan.planId())) return;
-        }
-        status.clearReadiness("runner_unhealthy");
     }
 
     /**
@@ -288,7 +185,8 @@ final class StreamPartitionRuntime implements AutoCloseable {
         if (!shutdownStarted.compareAndSet(false, true)) return;
         // 先封闭全局与容量准入，再等待已开始的 Submission 发布，停机取消才能覆盖最后一笔合法提交。
         closeAdmission();
-        retries.close();
+        // 只撤销尚未执行的恢复；在途 I/O 及原批次容量留在注册表，继续约束 Claim 的 holder 排干。
+        for (var domain : subscriptions.domains()) domain.retries.close();
         List<TaskTicket> cancelled = new ArrayList<>();
         submissionBarrier.writeLock().lock();
         try {
@@ -299,7 +197,6 @@ final class StreamPartitionRuntime implements AutoCloseable {
             submissionBarrier.writeLock().unlock();
         }
         recordCancellations(cancelled);
-        closeProxySources();
     }
 
     /**
@@ -312,8 +209,10 @@ final class StreamPartitionRuntime implements AutoCloseable {
         // 指标活动内的停机请求必须先阻止后续准入，随后才能把需要当前活动退栈的收口交给其它线程。
         admission.set(false);
         status.closeAdmission();
-        recordCapacity.closeAdmission();
-        dispatchCapacity.wakeAdmissionWaiters();
+        for (var domain : subscriptions.domains()) {
+            domain.records.closeAdmission();
+            domain.dispatch.wakeAdmissionWaiters();
+        }
     }
 
     /**
@@ -342,7 +241,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
      *                  返回: 无返回值；正在执行的恢复责任保留到真实终态以继续约束 owner 排干。
      */
     void sourceStopping(StreamSourceAuthority authority) {
-        retries.stopSource(authority);
+        authority.domain().retries.stopSource(authority);
     }
 
     /**
@@ -360,27 +259,6 @@ final class StreamPartitionRuntime implements AutoCloseable {
     }
 
     /**
-     * 业务作用：停止并移除全部 BOTH dedicated 来源，确保它们不再创建新读取。
-     *
-     * <p>参数说明: 无。
-     * 返回: 无返回值；单个来源关闭失败只影响 readiness，其它来源仍继续收口。
-     */
-    private void closeProxySources() {
-        List<ProxyBothStreamSource> sources;
-        synchronized (this) {
-            sources = List.copyOf(proxySources.values());
-            proxySources.clear();
-        }
-        for (ProxyBothStreamSource source : sources) {
-            try {
-                source.close();
-            } catch (Throwable failure) {
-                status.failReadiness("proxy_source_close_failed");
-            }
-        }
-    }
-
-    /**
      * 业务作用：将来源保护态发布为 readiness 失败，原始异常只进诊断日志而不作指标标签。
      *
      * @param source  已暂停来源
@@ -389,7 +267,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
      */
     void sourcePaused(PartitionSource source, Throwable failure) {
         status.failReadiness("source_paused");
-        dispatchCapacity.wakeAdmissionWaiters();
+        source.authority().domain().dispatch.wakeAdmissionWaiters();
     }
 
     /**
@@ -418,23 +296,16 @@ final class StreamPartitionRuntime implements AutoCloseable {
     }
 
     /**
-     * 业务作用：在来源停止或失权时撤销其 ordered gate、精确重试及接管 I/O 临时状态，后续 owner 从 PEL 重建。
+     * 业务作用：在来源失权时撤销其 ordered gate 和未执行恢复；在途调用保留原资源到返回，后续 owner 从 PEL 重建。
      *
      * @param authority 即将失效的共享来源对象
      *                  返回: 无返回值；其它来源的状态保持不变。
      */
     void authorityLost(StreamSourceAuthority authority) {
         orderedKeys.invalidateAuthority(authority);
-        retries.invalidateAuthority(authority);
+        authority.domain().retries.invalidateAuthority(authority);
         // 旧权威已经终止，临时 I/O 原因不能污染后续来源；独立的停止和暂停原因仍约束 readiness。
         recoveryUncertain(authority, false);
-    }
-
-    /**
-     * 业务作用：清除已失效 BOTH consumer epoch 的多 field 成功证据。参数说明: consumer name。返回: 无返回值。
-     */
-    void proxyConsumerLost(String consumer) {
-        proxyLedger.invalidateConsumer(consumer);
     }
 
     /**
@@ -445,14 +316,21 @@ final class StreamPartitionRuntime implements AutoCloseable {
      * @return 不携带业务 key、record id 或异常文本的固定名称数值
      */
     Map<String, Long> metrics() {
+        for (var domain : subscriptions.domains()) if (!shutdownStarted.get()) domain.healthy();
         LinkedHashMap<String, Long> metrics = new LinkedHashMap<>(status.snapshot());
-        metrics.putAll(recordCapacity.snapshot());
-        metrics.putAll(dispatchCapacity.snapshot());
+        for (var domain : subscriptions.domains()) domain.usage().forEach((key, value) ->
+                metrics.merge(key, value, key.contains("oldest") || key.contains("max_consecutive") ? Math::max : Long::sum));
         metrics.putAll(orderedKeys.snapshot());
-        metrics.putAll(retries.snapshot());
-        metrics.putAll(proxyLedger.snapshot());
-        metrics.put("pending_commit_attempts", commits.pendingAttempts());
         return Map.copyOf(metrics);
+    }
+
+    /**
+     * 业务作用：把真实已提交 Task 与读取前预留区分，域快照不把空闲预留误报为业务执行。
+     * @param domain 固定来源域
+     * @return 当前仍有终态责任的 Task 数
+     */
+    long activeTasks(PartitionExecutionDomain domain) {
+        return inFlightTickets.values().stream().filter(ticket -> ticket.authority().domain() == domain).count();
     }
 
     /**
@@ -466,7 +344,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
      * 业务作用：在线性化提交边界内复验指定来源的 Task、重试、路由恢复和确认责任均已收口。
      *
      * @param authority 来源共享权威对象
-     * @return 本来源不再持有任何可能产生业务或确认副作用的责任时返回 true
+     * @return 本来源的 Task、恢复 I/O 与确认责任均结束且长期恢复资源已归还时返回 true
      */
     boolean sourceDrained(StreamSourceAuthority authority) {
         Objects.requireNonNull(authority, "authority");
@@ -474,7 +352,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
         try {
             boolean tasksDrained = inFlightTickets.values().stream()
                     .noneMatch(ticket -> ticket.authority() == authority);
-            return tasksDrained && retries.isDrained(authority) && commits.isDrained(authority);
+            return tasksDrained && authority.domain().retries.isDrained(authority) && authority.domain().commits.isDrained(authority);
         } finally {
             submissionBarrier.writeLock().unlock();
         }
@@ -488,7 +366,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
      *                 返回: 无返回值；任一未成功坐标保留在 PEL 并以聚合异常告警。
      */
     void dispatchPartition(PartitionSource source, List<MapRecord<String, Object, Object>> rawBatch) {
-        dispatch(source, rawBatch, false, false, false);
+        dispatch(source, rawBatch, false, false);
     }
 
     /**
@@ -499,29 +377,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
      *                 返回: 无返回值；失败坐标由精确或整批恢复继续驱动，停止及失权仍拒绝投递。
      */
     void dispatchPartitionClaimed(PartitionSource source, List<MapRecord<String, Object, Object>> rawBatch) {
-        dispatch(source, rawBatch, false, false, true);
-    }
-
-    /**
-     * 业务作用：把 BOTH 普通 Stream 的完整多 field record 送入共享计划、ledger 和 consumer-fenced 确认链。
-     *
-     * @param source   dedicated consumer epoch 来源
-     * @param rawBatch 新读取取得的原始批次
-     *                 返回: 无返回值；单 record 的任一 field 失败都不确认该 record。
-     */
-    void dispatchProxy(PartitionSource source, List<MapRecord<String, Object, Object>> rawBatch) {
-        dispatch(source, rawBatch, true, false, false);
-    }
-
-    /**
-     * 业务作用：接续周期 XAUTOCLAIM 返回的多 field record，在取得执行权后复验其当前 PEL 归属。
-     *
-     * @param source   当前 dedicated consumer epoch 来源
-     * @param rawBatch 接管取得、尚未复验终态的原始批次
-     *                 返回: 无返回值；已有执行或确认责任的 record 保留给原驱动力，过期正文不重新执行。
-     */
-    void dispatchProxyClaimed(PartitionSource source, List<MapRecord<String, Object, Object>> rawBatch) {
-        dispatch(source, rawBatch, true, false, true);
+        dispatch(source, rawBatch, false, true);
     }
 
     /**
@@ -529,13 +385,20 @@ final class StreamPartitionRuntime implements AutoCloseable {
      *
      * @param source 重试坐标当前来源
      * @param ref    exact record/field 坐标
+     * @param authority 原重试责任冻结的快照
      * @return 已交给确认链、已迁移或仍需退避的结论；UNKNOWN、停止与代次变化保留原重试责任。
      */
-    RetryDisposition retryExact(PartitionSource source, PartitionRecordRef ref) {
-        StreamSourceAuthority.Snapshot authority = source.authority().snapshot();
+    RetryDisposition retryExact(PartitionSource source, PartitionRecordRef ref, StreamSourceAuthority.Snapshot authority) {
+        // 旧重试不能凭来源重新激活继续查询或提交，必须让合法代次重新取得正文。
+        if (authority.current() != source.authority() || !authority.owns(ref)
+                || !authority.allowsExecution()) return RetryDisposition.MOVED;
+        // 停机只等待已经发出的 I/O；其返回后不能继续查询正文或发起缺正文 ACK。
+        if (!admission.get() || !source.allowsRecovery()) return RetryDisposition.RETAINED;
         StreamCommitCoordinator.PendingDisposition pending = source.pending(ref.id());
+        if (!authority.allowsExecution()) return RetryDisposition.MOVED;
+        if (!admission.get() || !source.allowsRecovery()) return RetryDisposition.RETAINED;
         if (pending == StreamCommitCoordinator.PendingDisposition.ABSENT) {
-            // PEL 已无此 record，先撤销它的全部本地责任，后继才可继续使用账本容量与有序 key。
+            // PEL 已无此 record，先撤销它的全部本地责任，后继才可继续使用容量与有序 key。
             settleRemoteRecord(ref);
             return observedRecovery(source, "exact", RetryDisposition.SETTLED);
         }
@@ -545,13 +408,15 @@ final class StreamPartitionRuntime implements AutoCloseable {
             return observedRecovery(source, "exact", RetryDisposition.MOVED);
         }
         if (pending == StreamCommitCoordinator.PendingDisposition.UNKNOWN) {
-            // 缺少所有权证据时继续保留账本、门禁与重试，不能把观察失败当成远端完成。
+            // 缺少所有权证据时继续保留门禁与重试，不能把观察失败当成远端完成。
             return observedRecovery(source, "exact", RetryDisposition.RETAINED);
         }
         MapRecord<String, Object, Object> raw = source.exact(ref.id());
+        if (!authority.allowsExecution()) return RetryDisposition.MOVED;
+        if (!admission.get() || !source.allowsRecovery()) return RetryDisposition.RETAINED;
         if (raw == null) {
             status.recordPelTombstone();
-            Map<String, StreamCommitCoordinator.AckDisposition> result = source.ack(List.of(ref.id()), false);
+            Map<String, StreamCommitCoordinator.AckDisposition> result = source.ack(authority, List.of(ref.id()), false);
             StreamCommitCoordinator.AckDisposition disposition = result.get(ref.id());
             if (disposition == StreamCommitCoordinator.AckDisposition.CONFIRMED) {
                 settleRemoteRecord(ref);
@@ -570,7 +435,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
             return observedRecovery(source, "exact", RetryDisposition.RETAINED);
         }
         try {
-            dispatch(source, List.of(raw), source.sourceKind() == StreamRecordSource.PROXY_BOTH, true, true);
+            dispatch(source, List.of(raw), true, true, null, authority);
             return observedRecovery(source, "exact", RetryDisposition.SETTLED);
         } catch (PartitionDispatchException retained) {
             return observedRecovery(source, "exact", RetryDisposition.RETAINED);
@@ -578,30 +443,28 @@ final class StreamPartitionRuntime implements AutoCloseable {
     }
 
     /**
-     * 业务作用：按原批次顺序复验 PEL 与正文，取得读取后的来源实际权威证据后才接续整批业务与新读取。
-     *
-     * @param source 当前 holder 或 consumer epoch
-     * @param refs   routeBlocked 时登记的完整批次坐标
-     * @return 已接续、已迁移或仍需保留整批的结论
+     * 业务作用：使用原批次组合份额复验并接续恢复，满额时不等待自身持有的 Task 许可。
+     * @param source 原来源
+     * @param refs 完整页坐标
+     * @param fence holder 权威复验
+     * @param read 原读取预留，可为空
+     * @param authority 原批次或 PEL 补扫读取前冻结的权威
+     * @return 保留、迁移或接续结论
      */
-    RetryDisposition retryRouteBatch(PartitionSource source, List<PartitionRecordRef> refs) {
-        return retryRouteBatch(source, refs, source::revalidateRecoveryAuthority);
-    }
-
-    /**
-     * 业务作用：在整页 PEL 与正文读取完成后复验来源权威，避免把读取前的持有证据用于迟到正文的业务提交。
-     *
-     * @param source 当前 holder 或 consumer epoch
-     * @param refs   原始顺序的完整批次坐标
-     * @param fence  正文读取后的权威门禁；物理分区补扫等待真实 holder 证据，UNKNOWN 期间保留当前页
-     * @return 已接续或已迁移的结论；证据未决、停止或代次失效时保留原恢复责任。
-     */
-    RetryDisposition retryRouteBatch(PartitionSource source, List<PartitionRecordRef> refs, BooleanSupplier fence) {
-        StreamSourceAuthority.Snapshot authority = source.authority().snapshot();
+    RetryDisposition retryRouteBatch(PartitionSource source, List<PartitionRecordRef> refs, BooleanSupplier fence,
+                                     PartitionReadReservation read, StreamSourceAuthority.Snapshot authority) {
+        // 原批次身份必须覆盖全部坐标，恢复只在该代次内重读，不允许换发已有读取责任。
+        if (authority == null || authority.current() != source.authority() || !authority.allowsExecution()
+                || refs.stream().anyMatch(ref -> !authority.owns(ref))) return RetryDisposition.MOVED;
         List<MapRecord<String, Object, Object>> rawBatch = new ArrayList<>(refs.size());
         boolean observedMoved = false;
         for (PartitionRecordRef ref : refs) {
+            // 每条记录及每次 I/O 返回后都复验停止，保留 holder 只用于排干而不授予新恢复动作。
+            if (!authority.allowsExecution()) return RetryDisposition.MOVED;
+            if (!admission.get() || !source.allowsRecovery()) return RetryDisposition.RETAINED;
             StreamCommitCoordinator.PendingDisposition pending = source.pending(ref.id());
+            if (!authority.allowsExecution()) return RetryDisposition.MOVED;
+            if (!admission.get() || !source.allowsRecovery()) return RetryDisposition.RETAINED;
             // 整批只有明确结束的 record 才能释放本地责任，未决成员必须继续保留路由恢复。
             if (pending == StreamCommitCoordinator.PendingDisposition.UNKNOWN) return RetryDisposition.RETAINED;
             if (pending == StreamCommitCoordinator.PendingDisposition.ABSENT) {
@@ -614,11 +477,13 @@ final class StreamPartitionRuntime implements AutoCloseable {
                 continue;
             }
             MapRecord<String, Object, Object> raw = source.exact(ref.id());
+            if (!authority.allowsExecution()) return RetryDisposition.MOVED;
+            if (!admission.get() || !source.allowsRecovery()) return RetryDisposition.RETAINED;
             if (raw == null) {
                 status.recordPelTombstone();
-                Map<String, StreamCommitCoordinator.AckDisposition> result = source.ack(List.of(ref.id()), false);
+                Map<String, StreamCommitCoordinator.AckDisposition> result = source.ack(authority, List.of(ref.id()), false);
                 StreamCommitCoordinator.AckDisposition disposition = result.get(ref.id());
-                // 缺失或不明确的确认结果不能解除顺序与账本责任，必须保留原恢复驱动力。
+                // 缺失或不明确的确认结果不能解除顺序责任，必须保留原恢复驱动力。
                 if (disposition != StreamCommitCoordinator.AckDisposition.CONFIRMED
                         && disposition != StreamCommitCoordinator.AckDisposition.MOVED
                         && disposition != StreamCommitCoordinator.AckDisposition.LOST_AUTHORITY) {
@@ -643,7 +508,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
             return observedRecovery(source, "route", RetryDisposition.RETAINED);
         }
         try {
-            dispatch(source, rawBatch, source.sourceKind() == StreamRecordSource.PROXY_BOTH, true, true);
+            dispatch(source, rawBatch, true, true, read, authority);
             return observedRecovery(source, "route", RetryDisposition.SETTLED);
         } catch (PartitionDispatchException retained) {
             return observedRecovery(source, "route",
@@ -668,19 +533,13 @@ final class StreamPartitionRuntime implements AutoCloseable {
     }
 
     /**
-     * 业务作用：在远端终态明确后收敛本地 record 责任，使唯一重试驱动力退出前归还账本容量并释放有序门禁。
+     * 业务作用：在远端终态明确或原代次失效后撤销该精确坐标的本地门禁，不改变其它代次与来源的顺序责任。
      *
      * @param ref 已确认不存在、迁移或本地失权的冻结 Redis 坐标
-     *            返回: 无返回值；BOTH 清理整条物理 record，其它来源仅清理 exact field。
+     *            返回: 无返回值；只清理当前来源代次的精确坐标。
      */
-    private void settleRemoteRecord(PartitionRecordRef ref) {
-        if (ref.source() == StreamRecordSource.PROXY_BOTH) {
-            // BOTH 的所有 field 共用一条 PEL 与 ledger；先归还该代次容量，再开放它阻挡的后继。
-            proxyLedger.recordSettled(ref);
-            orderedKeys.proxyRecordSettled(ref);
-        } else {
-            orderedKeys.recordSettled(ref);
-        }
+    void settleRemoteRecord(PartitionRecordRef ref) {
+        orderedKeys.recordSettled(ref);
     }
 
     /**
@@ -700,26 +559,53 @@ final class StreamPartitionRuntime implements AutoCloseable {
     }
 
     /**
-     * 业务作用：执行两种来源共用的批次所有权流程，证据不确定、解析失败或恢复容量暂满时保留整批恢复责任。
+     * 业务作用：在原批次向后继步骤交接前拒绝缺失或失效权威，禁止为旧正文换发当前代次。
+     * @param source 原始读取来源
+     * @param authority 建立读取所有权时冻结的快照
+     * 返回: 无返回值；不匹配或已失效时保留 PEL 并终止本批提交
+     */
+    private void requireBatchAuthority(PartitionSource source, StreamSourceAuthority.Snapshot authority) {
+        // 身份证据缺失或过期时不能读取当前权威补齐，后继合法代次必须重新取得正文。
+        if (authority == null || authority.current() != source.authority() || !authority.allowsExecution()) {
+            throw new PartitionDispatchException("Stream batch authority is stale", List.of(), false);
+        }
+    }
+
+    /**
+     * 业务作用：执行物理分区的批次所有权流程，证据不确定、解析失败或恢复容量暂满时保留整批恢复责任。
      *
      * @param source     Redis 来源
      * @param rawBatch   原始批次
-     * @param proxy      true 表示 BOTH 多 field record
      * @param recovery   是否已有精确或整批重试责任，已有责任不能被本次尝试重复登记或提前注销
      * @param historical 正文是否来自历史 PEL，采用恢复准入，并在取得 record 执行权后重新核对 PEL
      *                   返回: 无返回值；批次资源只在 Task/ACK/PEL 决策完成后释放。
      */
     private void dispatch(PartitionSource source,
                           List<MapRecord<String, Object, Object>> rawBatch,
-                          boolean proxy,
                           boolean recovery,
                           boolean historical) {
+        dispatch(source, rawBatch, recovery, historical, source.readReservation(), source.readAuthority());
+    }
+
+    /**
+     * 业务作用：按原域预留完成执行、确认和失败责任转移；读取后的任何拒绝都保留 PEL。
+     * @param source 固定来源
+     * @param rawBatch 实际正文
+     * @param recovery 是否由原恢复状态驱动
+     * @param historical 是否需要逐条 PEL 复验
+     * @param read 原批次完整预留
+     * @param authority 建立读取所有权时冻结的唯一快照
+     * 返回: 无返回值；失败交回恢复责任。
+     */
+    private void dispatch(PartitionSource source, List<MapRecord<String, Object, Object>> rawBatch,
+                          boolean recovery, boolean historical, PartitionReadReservation read,
+                          StreamSourceAuthority.Snapshot authority) {
         if (rawBatch == null || rawBatch.isEmpty()) return;
         // 接管取得的页属于恢复准入，但尚无重试责任；准入与责任是否已登记必须分别判断。
-        StreamSourceAuthority.Snapshot authority = source.authority().snapshot();
+        requireBatchAuthority(source, authority);
         boolean recoveryAdmission = recovery || historical;
         boolean sourceAllowed = recoveryAdmission ? source.allowsRecovery() : source.allowsAdmission();
-        if (!admission.get() || !sourceAllowed) {
+        if (!admission.get() || !sourceAllowed || !authority.allowsExecution()) {
             throw new IllegalStateException("Stream Partition dispatcher admission is closed");
         }
         // 来源检查之后仍可能并发停机，批次责任必须与全局关闭在同一门禁内裁决。
@@ -732,23 +618,23 @@ final class StreamPartitionRuntime implements AutoCloseable {
                 source.sourceKind(), "records", recovery, rawBatch.size());
         List<RecycleLinkedMap<String, Object>> pooledPassthrough = new ArrayList<>();
         Preparation preparation = null;
-        ProxyPreparation proxyPreparation = null;
-        ProxyRecordAckLedger.ExecutionBatch execution = null;
-        ProxyRecordAckLedger.OpenBatch ledgerBatch = null;
+        PartitionRecordExecution.Batch execution = null;
         boolean retainedAdmission = false;
         List<Throwable> failures = new ArrayList<>();
         try {
-            List<PartitionRecordRef> refs = unresolvedCoordinates(source, rawBatch);
+            List<PartitionRecordRef> refs = unresolvedCoordinates(source, rawBatch, authority);
+            requireBatchAuthority(source, authority);
             // 所有来源先取得逐 record 执行权；句柄覆盖 Task 处理及重试或确认责任的交接，避免重复发布窗口。
-            execution = proxyLedger.tryBeginExecution(refs);
+            execution = recordExecution.begin(refs);
             List<MapRecord<String, Object, Object>> admitted = new ArrayList<>(rawBatch.size());
             for (int index = 0; index < refs.size(); index++) {
                 PartitionRecordRef ref = refs.get(index);
-                if (!execution.owns(ref) || commits.ownsConfirmation(source, ref)) {
+                if (!execution.owns(ref) || source.authority().domain().commits.ownsConfirmation(source, ref)) {
                     retainedAdmission = true;
                     continue;
                 }
                 if (historical) {
+                    requireBatchAuthority(source, authority);
                     // 正文可能早于原 Task 的 ACK 取回；互斥权内再查询 PEL，已结束的 record 不得重新发布。
                     StreamCommitCoordinator.PendingDisposition pending;
                     try {
@@ -757,9 +643,10 @@ final class StreamPartitionRuntime implements AutoCloseable {
                         if (!StreamPendingRecovery.isTransient(unavailable)) throw unavailable;
                         pending = StreamCommitCoordinator.PendingDisposition.UNKNOWN;
                     }
+                    requireBatchAuthority(source, authority);
                     if (pending == StreamCommitCoordinator.PendingDisposition.UNKNOWN) {
                         // 未分类前序可能与后继同 key；保留完整页及 raw 容量，不能先发布本页其它 Task。
-                        retainHistoricalBatch(source, refs, recovery);
+                        retainHistoricalBatch(source, refs, recovery, authority);
                         throw new PartitionDispatchException("Stream batch PEL 所有权暂不可确认", List.of(), true);
                     }
                     if (pending != StreamCommitCoordinator.PendingDisposition.OWNED) {
@@ -777,35 +664,33 @@ final class StreamPartitionRuntime implements AutoCloseable {
             }
             // PEL 往返也可能跨越停止或实际 holder 移交；最终证据有效前不解析或发布任何业务。
             if (historical && !recoveryAllowedAfterRead(source, authority, source::revalidateRecoveryAuthority)) {
-                retainHistoricalBatch(source, refs, recovery);
+                retainHistoricalBatch(source, refs, recovery, authority);
                 throw new PartitionDispatchException("Stream batch 恢复权威暂不可确认", List.of(), true);
             }
             try {
-                if (proxy) {
-                    proxyPreparation = prepareProxyBatch(source, rawBatch, pooledPassthrough);
-                    preparation = proxyPreparation.provisional();
-                } else {
-                    preparation = preparePartitionBatch(source, rawBatch, pooledPassthrough);
-                }
+                preparation = preparePartitionBatch(source, rawBatch, pooledPassthrough, authority);
             } catch (Throwable routeFailure) {
                 if (routeFailure instanceof Error fatal) throw fatal;
                 if (!recovery) {
                     PartitionRecordCapacity.Permit permit = source.retainActiveBatch();
-                    retries.registerRouteBlocked(source, unresolvedCoordinates(source, rawBatch), permit);
+                    source.authority().domain().retries.registerRouteBlocked(source, unresolvedCoordinates(source, rawBatch, authority), permit, authority);
                 }
                 throw new PartitionDispatchException("Stream batch route blocked", List.of(routeFailure), true);
             }
 
+            requireBatchAuthority(source, authority);
             int taskDemand = taskDemand(preparation.prepared());
-            try (PartitionDispatchCapacity.Reservation capacity = dispatchCapacity.acquire(
+            PartitionDispatchCapacity.Reservation prepaid = read == null ? null : read.take(taskDemand, rawBatch.size());
+            if (prepaid == null && recovery) {
+                // 不能占住唯一恢复执行槽等待另一保留批次的份额，否则原批次永远无法续接。
+                prepaid = source.authority().domain().dispatch.tryReserve(taskDemand, rawBatch.size());
+                if (prepaid == null) throw new PartitionDispatchException("recovery capacity unavailable", List.of(), true);
+            }
+            try (PartitionDispatchCapacity.Reservation capacity = prepaid != null ? prepaid : source.authority().domain().dispatch.acquire(
                     taskDemand, rawBatch.size(),
-                    () -> admission.get() && (recoveryAdmission ? source.allowsRecovery() : source.allowsAdmission()))) {
-                if (proxy) {
-                    // 组合容量先于全局 ledger 发布，准备失败不会占住无 Task 负责的 record 条目。
-                    ledgerBatch = openProxyLedgers(proxyPreparation);
-                    preparation = publishProxyLedgers(proxyPreparation, ledgerBatch);
-                }
-                List<StreamDispatchUnit> units = buildUnits(preparation.prepared());
+                    () -> admission.get() && authority.allowsExecution()
+                            && (recoveryAdmission ? source.allowsRecovery() : source.allowsAdmission()))) {
+                List<StreamDispatchUnit> units = buildUnits(preparation.prepared(), source.authority().domain());
                 redisProxy.streamPartitionMetrics().batch(
                         source.sourceKind(), "tasks", recovery, units.size());
                 for (StreamDispatchUnit unit : units) {
@@ -815,12 +700,12 @@ final class StreamPartitionRuntime implements AutoCloseable {
                     }
                 }
                 capacity.releaseUnusedTasks(taskDemand - units.size());
-                SubmissionBatch submitted = submitUnits(source, units, failures, recoveryAdmission, ledgerBatch);
+                SubmissionBatch submitted = submitUnits(source, units, failures, recoveryAdmission, authority);
                 capacity.releaseUnusedTasks(submitted.blockedUnits());
                 boolean capacityRetained = false;
                 for (DeferredUnit deferred : submitted.deferred()) {
                     for (PartitionRecordRef ref : deferred.unit().refs()) {
-                        if (!retries.register(source, ref, deferred.unit().route().ordered())) capacityRetained = true;
+                        if (!source.authority().domain().retries.register(source, ref, deferred.unit().route().ordered(), read, authority)) capacityRetained = true;
                     }
                 }
                 if (recovery && !submitted.deferred().isEmpty()) {
@@ -828,16 +713,17 @@ final class StreamPartitionRuntime implements AutoCloseable {
                     failures.add(new IllegalStateException("ordered key remains deferred during exact recovery"));
                 }
                 awaitOutcomes(submitted.tickets());
-                capacityRetained |= settle(source, preparation, submitted.tickets(), capacity, failures);
+                capacityRetained |= settle(source, submitted.tickets(), capacity, failures, read);
                 if (capacityRetained) {
                     // 已提交 Task 和 ACK 先完整交接，再保留整批坐标；退避不占 Task/确认配额，前序恢复才能释放容量。
-                    retainHistoricalBatch(source, unresolvedCoordinates(source, rawBatch), recovery);
+                    retainHistoricalBatch(source, unresolvedCoordinates(source, rawBatch, authority), recovery, authority);
                     throw new PartitionDispatchException("Stream batch 等待恢复容量", failures, true);
                 }
             } catch (PartitionDispatchCapacity.OversizedBatchException oversized) {
                 failures.add(oversized);
                 status.failReadiness("dispatch_capacity_oversized");
-                source.pause(oversized);
+                // 旧批次的容量错误不能暂停后来取得的来源，当前代次仍有效时才关闭其读取。
+                if (authority.allowsExecution()) source.pause(oversized);
             }
             if (!failures.isEmpty()) {
                 for (Throwable failure : failures) if (failure instanceof Error fatal) throw fatal;
@@ -847,16 +733,16 @@ final class StreamPartitionRuntime implements AutoCloseable {
                 // 尚未接续的 record 不能让整批路由恢复提前注销；已经完成的成员由各自确认链收口。
                 throw new PartitionDispatchException("Stream record 等待已有执行或确认责任", List.of(), true);
             }
-        } catch (ProxyRecordAckLedger.LedgerCapacityException | OrderedKeyCoordinator.OrderedGateCapacityException capacity) {
-            // 账本或门禁在任何 Task 之前原子拒绝；保留当前 epoch 的成功证据及整批读取容量，等待前序恢复归还额度。
-            retainHistoricalBatch(source, unresolvedCoordinates(source, rawBatch), recovery);
-            throw new PartitionDispatchException("Stream batch 等待账本或门禁容量", List.of(capacity), true);
+        } catch (OrderedKeyCoordinator.OrderedGateCapacityException capacity) {
+            // 顺序门禁在任何 Task 之前原子拒绝；保留当前 epoch 的成功证据及整批读取容量，等待前序恢复归还额度。
+            retainHistoricalBatch(source, unresolvedCoordinates(source, rawBatch, authority), recovery, authority);
+            throw new PartitionDispatchException("Stream batch 等待顺序门禁容量", List.of(capacity), true);
         } catch (PartitionDispatchException retained) {
             throw retained;
         } catch (Throwable infrastructureFailure) {
             if (infrastructureFailure instanceof Error fatal) throw fatal;
             // 未归类基础设施异常不能让同一来源继续越过当前 PEL；停止后由新 owner 重新建立完整责任。
-            source.pause(infrastructureFailure);
+            if (authority.allowsExecution()) source.pause(infrastructureFailure);
             throw new PartitionDispatchException(
                     "Stream Partition batch 基础设施收口失败", List.of(infrastructureFailure), false);
         } finally {
@@ -864,7 +750,6 @@ final class StreamPartitionRuntime implements AutoCloseable {
                 for (PreparedRecord record : preparation.prepared()) record.route().releaseObjectKeyAfterSubmit();
             }
             for (RecycleLinkedMap<String, Object> passthrough : pooledPassthrough) passthrough.recycle();
-            if (ledgerBatch != null) ledgerBatch.close();
             if (execution != null) execution.close();
             batchDrain.close();
         }
@@ -876,13 +761,15 @@ final class StreamPartitionRuntime implements AutoCloseable {
      * @param source   当前消费来源
      * @param refs     当前完整页的冻结坐标，包括仍由其它执行或确认责任持有的成员
      * @param recovery 当前调用是否已经由原重试状态持有完整责任
+     * @param authority 原读取的唯一权威快照
      *                 返回: 无返回值；已有责任继续退避，新批次交接 raw 容量；停止或失权由重试协调器交回 PEL。
      */
-    private void retainHistoricalBatch(PartitionSource source, List<PartitionRecordRef> refs, boolean recovery) {
+    private void retainHistoricalBatch(PartitionSource source, List<PartitionRecordRef> refs, boolean recovery,
+                                       StreamSourceAuthority.Snapshot authority) {
         if (!recovery) {
             // 先交接完整批次再释放本次执行权，容量暂满或 UNKNOWN 都不得留下无人驱动的 PEL。
             PartitionRecordCapacity.Permit permit = source.retainActiveBatch();
-            retries.registerRouteBlocked(source, refs, permit);
+            source.authority().domain().retries.registerRouteBlocked(source, refs, permit, authority);
         }
     }
 
@@ -892,16 +779,19 @@ final class StreamPartitionRuntime implements AutoCloseable {
      * @param source            物理 Claim 来源
      * @param rawBatch          原始批次
      * @param pooledPassthrough 批次末统一回收的 passthrough
+     * @param authority 本批读取前冻结的身份与代次
      * @return 全部记录已冻结计划和路由的准备结果
      */
     private Preparation preparePartitionBatch(PartitionSource source,
                                               List<MapRecord<String, Object, Object>> rawBatch,
-                                              List<RecycleLinkedMap<String, Object>> pooledPassthrough) {
+                                              List<RecycleLinkedMap<String, Object>> pooledPassthrough,
+                                              StreamSourceAuthority.Snapshot authority) {
         List<PreparedRecord> prepared = new ArrayList<>(rawBatch.size());
         for (MapRecord<String, Object, Object> raw : rawBatch) {
-            prepared.add(preparePartitionRecord(source, raw, pooledPassthrough));
+            requireBatchAuthority(source, authority);
+            prepared.add(preparePartitionRecord(source, raw, pooledPassthrough, authority));
         }
-        return new Preparation(List.copyOf(prepared), Map.of(), Map.of());
+        return new Preparation(List.copyOf(prepared));
     }
 
     /**
@@ -910,152 +800,35 @@ final class StreamPartitionRuntime implements AutoCloseable {
      * @param source            物理 Claim 来源
      * @param raw               原始 MapRecord
      * @param pooledPassthrough 批次统一回收列表
+     * @param authority 本批读取前冻结的身份与代次
      * @return 单 field 准备记录
      */
     private PreparedRecord preparePartitionRecord(PartitionSource source,
                                                   MapRecord<String, Object, Object> raw,
-                                                  List<RecycleLinkedMap<String, Object>> pooledPassthrough) {
+                                                  List<RecycleLinkedMap<String, Object>> pooledPassthrough,
+                                                  StreamSourceAuthority.Snapshot authority) {
         String id = raw.getId().getValue();
         Object wrapped = raw.getValue().get(RedisPartition.DATA_FIELD);
-        DecodedEnvelope envelope = decodeEnvelope(wrapped, null, null, raw.getStream(), id, pooledPassthrough);
+        DecodedEnvelope envelope = decodeEnvelope(wrapped, raw.getStream(), id, pooledPassthrough);
         StreamSubscriptionPlan plan = subscriptions.partitionPlan(envelope.topic(), envelope.event());
         if (plan == null) {
             throw new IllegalStateException("Redis Partition 没有精确 listener route topic="
                     + envelope.topic() + " event=" + envelope.event() + " id=" + id);
         }
-        ensurePlanHealthy(plan);
+        ensurePlanHealthy(plan, source.authority().domain());
         Object data = deserializeForPlan(plan, envelope.data());
         PartitionRecordRef ref = new PartitionRecordRef(
                 raw.getStream(), source.group(), source.consumer(), id,
                 envelope.topic(), envelope.event(), RedisPartition.DATA_FIELD, StreamRecordSource.REDIS_PARTITION,
-                source.authority(), source.authority().snapshot().generation());
+                authority.current(), authority.generation());
         DecodedPartitionRecord decoded = new DecodedPartitionRecord(redisProxy, ref, data, envelope.passthrough());
-        return new PreparedRecord(plan, decoded, resolvePartitionKey(plan, data), null);
+        return new PreparedRecord(plan, decoded, resolvePartitionKey(plan, data));
     }
 
     /**
-     * 业务作用：先完整校验每条 BOTH record 的 field 数、路由、包装与 autoDelete 合同，再创建 ledger 和 Task 记录。
-     *
-     * @param source            dedicated consumer epoch 来源
-     * @param rawBatch          原始多 field 批次
-     * @param pooledPassthrough 批次统一回收列表
-     * @return 未成功 field 准备记录与物理 record ledger 关联
-     */
-    private ProxyPreparation prepareProxyBatch(PartitionSource source,
-                                               List<MapRecord<String, Object, Object>> rawBatch,
-                                               List<RecycleLinkedMap<String, Object>> pooledPassthrough) {
-        List<ProxyParsedRecord> parsedRecords = new ArrayList<>(rawBatch.size());
-        for (MapRecord<String, Object, Object> raw : rawBatch) {
-            int fields = raw.getValue().size();
-            if (fields < 1 || fields > maxProxyFieldsPerRecord) {
-                throw new IllegalArgumentException("BOTH record field count exceeds configured limit stream="
-                        + raw.getStream() + " id=" + raw.getId().getValue() + " fields=" + fields);
-            }
-            List<ProxyParsedField> parsedFields = new ArrayList<>(fields);
-            Boolean autoDelete = null;
-            for (Map.Entry<Object, Object> entry : raw.getValue().entrySet()) {
-                String field = Objects.toString(entry.getKey(), null);
-                if (StringUtils.isBlank(field)) throw new IllegalArgumentException("BOTH record contains blank field");
-                StreamSubscriptionPlan plan = subscriptions.proxyPlan(raw.getStream(), source.group(), field);
-                if (plan == null) {
-                    throw new IllegalStateException("BOTH dedicated group has no exact route stream="
-                            + raw.getStream() + " group=" + source.group() + " field=" + field);
-                }
-                ensurePlanHealthy(plan);
-                if (autoDelete != null && autoDelete != plan.autoDelete()) {
-                    throw new IllegalStateException("BOTH fields in one physical record must share autoDelete policy");
-                }
-                autoDelete = plan.autoDelete();
-                DecodedEnvelope envelope = decodeEnvelope(
-                        entry.getValue(), raw.getStream(), field,
-                        raw.getStream(), raw.getId().getValue(), pooledPassthrough);
-                Object data = deserializeForPlan(plan, envelope.data());
-                PartitionRecordRef ref = new PartitionRecordRef(
-                        raw.getStream(), source.group(), source.consumer(), raw.getId().getValue(),
-                        raw.getStream(), field, field, StreamRecordSource.PROXY_BOTH,
-                        source.authority(), source.authority().snapshot().generation());
-                parsedFields.add(new ProxyParsedField(
-                        field, plan, data, envelope.passthrough(), resolvePartitionKey(plan, data), ref));
-            }
-            parsedRecords.add(new ProxyParsedRecord(raw, List.copyOf(parsedFields), Boolean.TRUE.equals(autoDelete)));
-        }
-        List<PreparedRecord> provisional = new ArrayList<>();
-        for (ProxyParsedRecord record : parsedRecords) {
-            for (ProxyParsedField field : record.fields()) {
-                DecodedPartitionRecord decoded = new DecodedPartitionRecord(
-                        redisProxy, field.ref(), field.data(), field.passthrough());
-                provisional.add(new PreparedRecord(field.plan(), decoded, field.route(), null));
-            }
-        }
-        return new ProxyPreparation(
-                List.copyOf(parsedRecords),
-                new Preparation(List.copyOf(provisional), Map.of(), Map.of()));
-    }
-
-    /**
-     * 业务作用：在组合容量已经取得后暂存整批 BOTH 账本，后续 gate 容量拒绝可撤销本批新条目。
-     *
-     * @param preparation 完整解析但尚未发布 ledger 的批次
-     * @return 持有本批新增账本责任的可撤销句柄
-     */
-    private ProxyRecordAckLedger.OpenBatch openProxyLedgers(ProxyPreparation preparation) {
-        List<ProxyRecordAckLedger.OpenRequest> requests = new ArrayList<>(preparation.records().size());
-        for (ProxyParsedRecord record : preparation.records()) {
-            requests.add(new ProxyRecordAckLedger.OpenRequest(
-                    record.fields().getFirst().ref(),
-                    record.fields().stream().map(ProxyParsedField::field).toList()));
-        }
-
-        return proxyLedger.openBatch(requests);
-    }
-
-    /**
-     * 业务作用：关联整批 BOTH 账本与实际 Task 输入，排除当前 epoch 已成功的 field；调用方在门禁预留后接管新条目。
-     *
-     * @param preparation 完整解析的批次
-     * @param opened 可在首个 Task 发布前撤销新条目的账本句柄
-     * @return 与全局账本建立精确关联的实际 Task 输入；此步骤不提交新条目所有权
-     */
-    private Preparation publishProxyLedgers(ProxyPreparation preparation, ProxyRecordAckLedger.OpenBatch opened) {
-        LinkedHashMap<RecordFieldKey, PreparedRecord> provisionalByField = new LinkedHashMap<>();
-        for (PreparedRecord record : preparation.provisional().prepared()) {
-            provisionalByField.put(RecordFieldKey.of(record.decoded().ref()), record);
-        }
-        LinkedHashMap<RecordFieldKey, ProxyRecordAckLedger.Entry> ledgerByField = new LinkedHashMap<>();
-        LinkedHashMap<ProxyRecordAckLedger.Entry, Boolean> ledgerPolicies = new LinkedHashMap<>();
-        List<PreparedRecord> prepared = new ArrayList<>();
-        for (int index = 0; index < preparation.records().size(); index++) {
-            ProxyParsedRecord record = preparation.records().get(index);
-            ProxyRecordAckLedger.BatchEntry openedRecord = opened.entries().get(index);
-            ProxyRecordAckLedger.Entry ledger = openedRecord.entry();
-            Set<String> execute = Set.copyOf(openedRecord.fieldsToExecute());
-            ledgerPolicies.put(ledger, record.autoDelete());
-            for (ProxyParsedField field : record.fields()) {
-                RecordFieldKey key = RecordFieldKey.of(field.ref());
-                PreparedRecord provisional = provisionalByField.get(key);
-                if (provisional == null) {
-                    throw new IllegalStateException("BOTH field has no provisional record");
-                }
-                ledgerByField.put(key, ledger);
-                if (execute.contains(field.field())) {
-                    prepared.add(new PreparedRecord(
-                            provisional.plan(), provisional.decoded(), provisional.route(), ledger));
-                } else {
-                    provisional.route().releaseObjectKeyAfterSubmit();
-                }
-            }
-        }
-        Preparation published = new Preparation(
-                List.copyOf(prepared), Map.copyOf(ledgerByField), Map.copyOf(ledgerPolicies));
-        return published;
-    }
-
-    /**
-     * 业务作用：拆解 Partition 或 Proxy publish 包装，同时把池化 passthrough 交给批次唯一回收者。
+     * 业务作用：拆解 Partition publish 包装，同时把池化 passthrough 交给批次唯一回收者。
      *
      * @param wrapped           原始 hash value
-     * @param proxyTopic        BOTH 路径的 Stream key；物理分区为 null
-     * @param proxyEvent        BOTH 路径的 hash field；物理分区为 null
      * @param stream            诊断 Stream key
      * @param id                诊断 record id
      * @param pooledPassthrough 批次回收列表
@@ -1063,8 +836,6 @@ final class StreamPartitionRuntime implements AutoCloseable {
      */
     @SuppressWarnings("rawtypes")
     private DecodedEnvelope decodeEnvelope(Object wrapped,
-                                           String proxyTopic,
-                                           String proxyEvent,
                                            String stream,
                                            String id,
                                            List<RecycleLinkedMap<String, Object>> pooledPassthrough) {
@@ -1073,14 +844,14 @@ final class StreamPartitionRuntime implements AutoCloseable {
         Object data;
         Map<String, Object> passthrough;
         if (wrapped instanceof PooledEvtData message) {
-            topic = proxyTopic == null ? message.getTopic() : proxyTopic;
-            event = proxyEvent == null ? message.getEvent() : proxyEvent;
+            topic = message.getTopic();
+            event = message.getEvent();
             data = message.getData();
             passthrough = message.getPassthrough();
             message.recycle();
         } else if (wrapped instanceof Map<?, ?> message) {
-            topic = proxyTopic == null ? MapUtils.getString(message, PooledEvtData.FIELD_TOPIC) : proxyTopic;
-            event = proxyEvent == null ? MapUtils.getString(message, PooledEvtData.FIELD_EVENT) : proxyEvent;
+            topic = MapUtils.getString(message, PooledEvtData.FIELD_TOPIC);
+            event = MapUtils.getString(message, PooledEvtData.FIELD_EVENT);
             data = message.get(PooledEvtData.FIELD_DATA);
             passthrough = MapUtils.getObject(message, PooledEvtData.FIELD_PASSTHROUGH);
         } else {
@@ -1137,22 +908,24 @@ final class StreamPartitionRuntime implements AutoCloseable {
     }
 
     /**
-     * 业务作用：复验计划 Runner 仍健康，不自动切换执行域。参数说明: 计划。返回: 无返回值；不健康时拒绝路由。
+     * 业务作用：复验计划的原执行域仍健康，不自动切换 Runner。
+     * @param plan 业务计划
+     * @param domain 物理来源冻结的执行域
+     * 返回: 无返回值；绑定不存在或执行域不健康时拒绝路由。
      */
-    private void ensurePlanHealthy(StreamSubscriptionPlan plan) {
-        if (!plan.runner().isStarted() || !plan.runner().isHealthy()) {
-            status.failReadiness("runner_unhealthy");
-            throw new IllegalStateException("PartitionRunner 不健康: " + plan.runner().getRunnerName());
-        }
+    private void ensurePlanHealthy(StreamSubscriptionPlan plan, PartitionExecutionDomain domain) {
+        plan.binding(domain);
+        if (!domain.healthy()) throw new IllegalStateException("Partition execution domain unhealthy: " + domain.id());
     }
 
     /**
      * 业务作用：把 ordered 的同 plan/有效 hash 记录按 Redis 遇见顺序合并，null key 保持一条一个非保序 Task。
      *
      * @param prepared 已完成整条解析的记录
+     * @param domain 物理来源冻结的执行域
      * @return 用于 gate 与 Partition submit 的执行单元
      */
-    private List<StreamDispatchUnit> buildUnits(List<PreparedRecord> prepared) {
+    private List<StreamDispatchUnit> buildUnits(List<PreparedRecord> prepared, PartitionExecutionDomain domain) {
         Map<UnitKey, List<PreparedRecord>> buckets = new LinkedHashMap<>();
         long unorderedSequence = 0L;
         for (PreparedRecord record : prepared) {
@@ -1167,15 +940,15 @@ final class StreamPartitionRuntime implements AutoCloseable {
             PreparedRecord first = bucket.getFirst();
             List<DecodedPartitionRecord> records = bucket.stream().map(PreparedRecord::decoded).toList();
             for (int index = 1; index < bucket.size(); index++) bucket.get(index).route().releaseObjectKeyAfterSubmit();
-            units.add(new StreamDispatchUnit(first.plan(), first.route(), records));
+            units.add(new StreamDispatchUnit(first.plan(), first.plan().binding(domain), first.route(), records));
         }
         return List.copyOf(units);
     }
 
     /**
-     * 业务作用：在不释放对象路由 key 的前提下计算整批最大 Task 需求，供 ledger 发布前取得组合容量。
+     * 业务作用：在不释放对象路由 key 的前提下计算整批最大 Task 需求，供 任务发布前取得组合容量。
      *
-     * @param prepared 已完成路由解析的全部 field
+     * @param prepared 已完成路由解析的全部物理记录
      * @return ordered bucket 与逐条 unordered Task 的总数
      */
     private int taskDemand(List<PreparedRecord> prepared) {
@@ -1197,22 +970,24 @@ final class StreamPartitionRuntime implements AutoCloseable {
      * @param units    待提交执行单元
      * @param failures 批次基础设施失败列表
      * @param recovery 是否按来源恢复准入规则复验本批执行单元
-     * @param ledgerBatch BOTH 本批可撤销账本，物理分区为 null
+     * @param authority 本批读取前冻结且贯穿解析的唯一快照
      * @return 已提交 ticket、blocked 数及 deferred 单元
      */
     private SubmissionBatch submitUnits(PartitionSource source,
                                         List<StreamDispatchUnit> units,
                                         List<Throwable> failures,
-                                        boolean recovery,
-                                        ProxyRecordAckLedger.OpenBatch ledgerBatch) {
+                                        boolean recovery, StreamSourceAuthority.Snapshot authority) {
+        requireBatchAuthority(source, authority);
+        // 一致性必须在任一 gate 或 Task 发布前成立，不能等业务成功之后才拒绝确认。
+        if (units.stream().flatMap(unit -> unit.refs().stream()).anyMatch(ref -> !authority.owns(ref))) {
+            throw new PartitionDispatchException("Stream batch record authority mismatch", List.of(), false);
+        }
         List<TaskTicket> tickets = new ArrayList<>(units.size());
         List<DeferredUnit> deferred = new ArrayList<>();
         int blocked = 0;
-        StreamSourceAuthority.Snapshot authority = source.authority().snapshot();
         // Task/确认配额与整批 gate 先于业务提交；单元间发生容量拒绝时不留下半批执行或半批门禁。
         var reservations = orderedKeys.reserveBatch(
                 units.stream().filter(unit -> unit.route().ordered()).toList(), authority).iterator();
-        if (ledgerBatch != null) ledgerBatch.commit();
         for (StreamDispatchUnit unit : units) {
             OrderedKeyCoordinator.GateToken token = null;
             if (unit.route().ordered()) {
@@ -1240,17 +1015,18 @@ final class StreamPartitionRuntime implements AutoCloseable {
                 throw new IllegalStateException("Partition task ticket id exhausted");
             }
             TaskTicket ticket = new TaskTicket(
-                    ticketId, source.authority(), unit, token, future, taskDrain);
+                    ticketId, authority, unit, token, future, taskDrain);
             inFlightTickets.put(ticketId, ticket);
             try {
                 submissionBarrier.readLock().lock();
                 try {
                     // 准入复验与句柄发布必须共用读锁，停机写锁只能在完整提交之后取消尚未运行的任务。
                     if (!admission.get()
-                            || !(recovery ? source.allowsRecovery() : source.allowsAdmission())) {
+                            || !(recovery ? source.allowsRecovery() : source.allowsAdmission())
+                            || !authority.allowsExecution()) {
                         throw new IllegalStateException("Partition source admission closed");
                     }
-                    submission = submitByKey(unit.plan().runner(), unit.route(), task);
+                    submission = submitByKey(unit.binding().domain().runner, unit.route(), task);
                     ticket.publishSubmission(submission);
                 } finally {
                     submissionBarrier.readLock().unlock();
@@ -1267,7 +1043,10 @@ final class StreamPartitionRuntime implements AutoCloseable {
                     redisProxy.streamPartitionMetrics().submission(
                             unit.plan(), unit.route().ordered(), "rejected");
                     task.definitelyNotSubmitted(submitFailure);
-                } else source.pause(submitFailure);
+                } else if (authority.allowsExecution()) {
+                    // 不确定提交仍由原代次承担；来源已重获时不能用旧提交异常暂停新读取。
+                    source.pause(submitFailure);
+                }
             }
             tickets.add(ticket);
         }
@@ -1299,36 +1078,35 @@ final class StreamPartitionRuntime implements AutoCloseable {
     }
 
     /**
-     * 业务作用：合并 Task outcome、BOTH ledger 与 exact gate 依赖，在 Redis I/O 前发布 CommitAttempt 所有权。
+     * 业务作用：合并 Task outcome 与 exact gate 依赖，在 Redis I/O 前发布 CommitAttempt 所有权。
      *
      * @param source      当前 Redis 来源
-     * @param preparation 准备记录与 ledger 关联
      * @param tickets     已取得真实终态的 ticket
      * @param capacity    批次组合容量
      * @param failures    需要保留 PEL 的原因列表
+     * @param read        原读取的失败承接预留；source 模式可为空
      * @return 存在未取得精确重试额度的坐标时返回 true，调用方须保留整批；UNKNOWN 由 CommitAttempt 在批次外继续持有
      */
     private boolean settle(PartitionSource source,
-                        Preparation preparation,
                         List<TaskTicket> tickets,
                         PartitionDispatchCapacity.Reservation capacity,
-                        List<Throwable> failures) {
+                        List<Throwable> failures, PartitionReadReservation read) {
         LinkedHashMap<String, MutableCommitRecord> candidates = new LinkedHashMap<>();
-        LinkedHashSet<ProxyRecordAckLedger.Entry> touchedLedgers =
-                new LinkedHashSet<>(preparation.ledgerPolicies().keySet());
         boolean capacityRetained = false;
         try {
             for (TaskTicket ticket : tickets) {
                 ConsumeTaskOutcome outcome = ticket.future().join();
-                if (!ticket.authority().isActive()) status.recordLateTaskOutcome();
-                if (source.sourceKind() == StreamRecordSource.PROXY_BOTH) {
-                    mergeProxyOutcome(preparation, ticket, outcome);
-                } else {
-                    for (PartitionRecordRef ref : outcome.successfulPrefix()) {
-                        MutableCommitRecord candidate = candidates.computeIfAbsent(
-                                ref.id(), ignored -> new MutableCommitRecord(ref.id(), ticket.unit().plan().autoDelete()));
-                        candidate.addGate(ticket.gateToken());
+                if (!ticket.authoritySnapshot().allowsExecution()) status.recordLateTaskOutcome();
+                for (PartitionRecordRef ref : outcome.successfulPrefix()) {
+                    // 成功事实只能携带业务执行时的权威，交接期间重获来源不能替旧结果取得确认权限。
+                    if (ref.authority() != ticket.authority()
+                            || ref.sourceGeneration() != ticket.authoritySnapshot().generation()) {
+                        throw new IllegalStateException("successful record authority differs from Task authority");
                     }
+                    MutableCommitRecord candidate = candidates.computeIfAbsent(
+                            ref.id(), ignored -> new MutableCommitRecord(ref.id(), ticket.unit().plan().autoDelete(),
+                                    ticket.authoritySnapshot()));
+                    candidate.addGate(ticket.gateToken());
                 }
                 if (outcome.status() != ConsumeStatus.SUCCESS) {
                     List<PartitionRecordRef> retained = new ArrayList<>();
@@ -1336,25 +1114,12 @@ final class StreamPartitionRuntime implements AutoCloseable {
                     retained.addAll(outcome.deferredTail());
                     if (retained.isEmpty()) retained.addAll(ticket.unit().refs());
                     for (PartitionRecordRef ref : retained) {
-                        if (!retries.register(source, ref, ticket.unit().route().ordered())) capacityRetained = true;
+                        if (!source.authority().domain().retries.register(source, ref, ticket.unit().route().ordered(), read,
+                                ticket.authoritySnapshot())) capacityRetained = true;
                     }
                     failures.add(outcome.cause() == null
                             ? new IllegalStateException("Partition Task did not succeed: " + outcome.status())
                             : outcome.cause());
-                }
-            }
-            if (source.sourceKind() == StreamRecordSource.PROXY_BOTH) {
-                for (ProxyRecordAckLedger.Entry ledger : touchedLedgers) {
-                    if (!proxyLedger.ackReady(ledger)) continue;
-                    List<OrderedKeyCoordinator.GateToken> gates = proxyLedger.gates(ledger);
-                    String id = ledgerRecordId(preparation, ledger);
-                    for (OrderedKeyCoordinator.GateToken gate : gates) orderedKeys.proxyAckReady(gate, id);
-                    MutableCommitRecord candidate = new MutableCommitRecord(
-                            id, preparation.ledgerPolicies().getOrDefault(ledger, false));
-                    for (OrderedKeyCoordinator.GateToken gate : gates) candidate.addGate(gate);
-                    candidate.confirmed(() -> proxyLedger.confirmed(ledger));
-                    candidate.moved(() -> proxyLedger.moved(ledger));
-                    candidates.put(id, candidate);
                 }
             }
             if (candidates.isEmpty()) {
@@ -1362,7 +1127,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
             } else {
                 capacity.shrinkCommitRecords(candidates.size());
                 PartitionDispatchCapacity.CommitLease lease = capacity.transferCommitCapacity(candidates.size());
-                commits.commit(source, candidates.values().stream().map(MutableCommitRecord::freeze).toList(), lease);
+                source.authority().domain().commits.commit(source, candidates.values().stream().map(MutableCommitRecord::freeze).toList(), lease);
             }
             return capacityRetained;
         } finally {
@@ -1374,42 +1139,6 @@ final class StreamPartitionRuntime implements AutoCloseable {
                 }
             }
         }
-    }
-
-    /**
-     * 业务作用：把 BOTH Task 的成功前缀与未成功尾部发布到同 consumer epoch ledger，不在此阶段产生 record ACK。
-     *
-     * @param preparation 批次 ledger 关联
-     * @param ticket      当前 Task ticket
-     * @param outcome     Task 真实结果
-     *                    返回: 无返回值。
-     */
-    private void mergeProxyOutcome(Preparation preparation, TaskTicket ticket, ConsumeTaskOutcome outcome) {
-        boolean gateDecisionAccepted = true;
-        if (ticket.gateToken() != null) {
-            List<PartitionRecordRef> failed = new ArrayList<>();
-            if (outcome.failed() != null) failed.add(outcome.failed());
-            failed.addAll(outcome.deferredTail());
-            gateDecisionAccepted = orderedKeys.proxyTaskOutcome(
-                    ticket.gateToken(), outcome.successfulPrefix(), List.copyOf(failed));
-        }
-        Set<PartitionRecordRef> successes = Set.copyOf(outcome.successfulPrefix());
-        for (PartitionRecordRef ref : ticket.unit().refs()) {
-            ProxyRecordAckLedger.Entry ledger = preparation.ledgerByField().get(RecordFieldKey.of(ref));
-            if (ledger == null) throw new IllegalStateException("BOTH field has no proxy ledger entry");
-            if (successes.contains(ref)) proxyLedger.succeeded(ledger, ref.field(), ticket.gateToken());
-            else if (gateDecisionAccepted) proxyLedger.failed(ledger, ref.field(), ticket.gateToken());
-        }
-    }
-
-    /**
-     * 业务作用：从批次 field 关联中取得物理 record id。参数说明: 准备结果与 ledger。返回: 对应 record id。
-     */
-    private String ledgerRecordId(Preparation preparation, ProxyRecordAckLedger.Entry ledger) {
-        for (Map.Entry<RecordFieldKey, ProxyRecordAckLedger.Entry> entry : preparation.ledgerByField().entrySet()) {
-            if (entry.getValue() == ledger) return entry.getKey().id();
-        }
-        throw new IllegalStateException("proxy ledger entry has no record coordinate");
     }
 
     /**
@@ -1438,10 +1167,12 @@ final class StreamPartitionRuntime implements AutoCloseable {
      *
      * @param source   当前 Redis 来源
      * @param rawBatch 原始批次
+     * @param authority 原始读取的唯一身份与代次
      * @return 保持 Redis 遇见顺序的坐标列表
      */
     private List<PartitionRecordRef> unresolvedCoordinates(
-            PartitionSource source, List<MapRecord<String, Object, Object>> rawBatch) {
+            PartitionSource source, List<MapRecord<String, Object, Object>> rawBatch,
+            StreamSourceAuthority.Snapshot authority) {
         List<PartitionRecordRef> result = new ArrayList<>(rawBatch.size());
         for (MapRecord<String, Object, Object> raw : rawBatch) {
             String field = raw.getValue().isEmpty()
@@ -1449,7 +1180,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
             result.add(new PartitionRecordRef(
                     raw.getStream(), source.group(), source.consumer(), raw.getId().getValue(),
                     "<unresolved>", "<unresolved>", field, source.sourceKind(),
-                    source.authority(), source.authority().snapshot().generation()));
+                    authority.current(), authority.generation()));
         }
         return List.copyOf(result);
     }
@@ -1464,7 +1195,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
     public void close() {
         if (!closed.compareAndSet(false, true)) return;
         beginShutdown();
-        commits.closeAndDrain(drainTimeoutMillis);
+        for (var domain : subscriptions.domains()) domain.commits.closeAndDrain(drainTimeoutMillis);
         boolean drained = status.awaitDrained(drainTimeoutMillis);
         if (!drained) {
             // 预算耗尽不能中断仍持有 Task 数据或 Redis I/O 的 waiter；责任实际归零后才封闭执行器。
@@ -1496,7 +1227,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
     enum RetryDisposition {SETTLED, MOVED, RETAINED}
 
     private record PreparedRecord(StreamSubscriptionPlan plan, DecodedPartitionRecord decoded,
-                                  ResolvedPartitionKey route, ProxyRecordAckLedger.Entry ledger) {
+                                  ResolvedPartitionKey route) {
     }
 
     private record UnitKey(long planId, int effectiveHash, long unorderedSequence) {
@@ -1507,7 +1238,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
      */
     private static final class TaskTicket implements AutoCloseable {
         private final long id;
-        private final StreamSourceAuthority authority;
+        private final StreamSourceAuthority.Snapshot authority;
         private final StreamDispatchUnit unit;
         private final OrderedKeyCoordinator.GateToken gateToken;
         private final CompletableFuture<ConsumeTaskOutcome> future;
@@ -1516,10 +1247,10 @@ final class StreamPartitionRuntime implements AutoCloseable {
         private boolean closed;
 
         /**
-         * 业务作用：在调用 Partition submit 之前发布可见 ticket。参数说明: 标识、来源、单元、门禁、Future 与排干令牌。返回: 未绑定句柄的 ticket。
+         * 业务作用：在调用 Partition submit 之前发布可见 ticket。参数说明: 标识、提交时的权威快照、单元、门禁、Future 与排干令牌。返回: 未绑定句柄且固定来源代次的 ticket。
          */
         private TaskTicket(long id,
-                           StreamSourceAuthority authority,
+                           StreamSourceAuthority.Snapshot authority,
                            StreamDispatchUnit unit,
                            OrderedKeyCoordinator.GateToken gateToken,
                            CompletableFuture<ConsumeTaskOutcome> future,
@@ -1543,6 +1274,11 @@ final class StreamPartitionRuntime implements AutoCloseable {
          * 业务作用：返回提交来源权威。参数说明: 无。返回: 共享权威。
          */
         StreamSourceAuthority authority() {
+            return authority.current();
+        }
+
+        /** 业务作用：将业务执行的原权威交给确认链。参数说明: 无。返回: Task 提交时冻结的身份与代次。 */
+        StreamSourceAuthority.Snapshot authoritySnapshot() {
             return authority;
         }
 
@@ -1609,56 +1345,28 @@ final class StreamPartitionRuntime implements AutoCloseable {
     private record SubmissionBatch(List<TaskTicket> tickets, int blockedUnits, List<DeferredUnit> deferred) {
     }
 
-    private record Preparation(List<PreparedRecord> prepared,
-                               Map<RecordFieldKey, ProxyRecordAckLedger.Entry> ledgerByField,
-                               Map<ProxyRecordAckLedger.Entry, Boolean> ledgerPolicies) {
-    }
-
-    private record ProxyPreparation(List<ProxyParsedRecord> records, Preparation provisional) {
+    private record Preparation(List<PreparedRecord> prepared) {
     }
 
     private record DecodedEnvelope(String topic, String event, Object data, Map<String, Object> passthrough) {
     }
 
-    private record ProxyParsedField(String field, StreamSubscriptionPlan plan, Object data,
-                                    Map<String, Object> passthrough, ResolvedPartitionKey route,
-                                    PartitionRecordRef ref) {
-    }
-
-    private record ProxyParsedRecord(MapRecord<String, Object, Object> raw,
-                                     List<ProxyParsedField> fields, boolean autoDelete) {
-    }
-
-    private record RecordFieldKey(String stream, String id, String field) {
-        /**
-         * 业务作用：从 exact Redis 坐标提取物理 record/field 账本键。参数说明: 消息坐标。返回: 三元键。
-         */
-        static RecordFieldKey of(PartitionRecordRef ref) {
-            return new RecordFieldKey(ref.stream(), ref.id(), ref.field());
-        }
-    }
-
-    private record ProxySourceKey(String stream, String group) {
-    }
-
     /**
-     * 业务作用：在 CommitAttempt 发布前合并同 record id 的 exact gate 与 ledger 回调。
+     * 业务作用：在 CommitAttempt 发布前合并同 record id 的 exact gate 依赖。
      */
     private static final class MutableCommitRecord {
         private final String id;
         private final boolean autoDelete;
+        private final StreamSourceAuthority.Snapshot authority;
         private final LinkedHashSet<OrderedKeyCoordinator.GateToken> gates = new LinkedHashSet<>();
-        private Runnable confirmed = () -> {
-        };
-        private Runnable moved = () -> {
-        };
 
         /**
-         * 业务作用：建立批次私有确认依赖。参数说明: id 与删除策略。返回: 可变构造器。
+         * 业务作用：建立批次私有确认依赖。参数说明: id、删除策略与 Task 冻结权威。返回: 固定原代次的可变构造器。
          */
-        private MutableCommitRecord(String id, boolean autoDelete) {
+        private MutableCommitRecord(String id, boolean autoDelete, StreamSourceAuthority.Snapshot authority) {
             this.id = id;
             this.autoDelete = autoDelete;
+            this.authority = authority;
         }
 
         /**
@@ -1669,29 +1377,15 @@ final class StreamPartitionRuntime implements AutoCloseable {
         }
 
         /**
-         * 业务作用：设置明确确认后的 ledger 回调。参数说明: 回调。返回: 无返回值。
-         */
-        void confirmed(Runnable action) {
-            confirmed = action;
-        }
-
-        /**
-         * 业务作用：设置明确迁移后的 ledger 回调。参数说明: 回调。返回: 无返回值。
-         */
-        void moved(Runnable action) {
-            moved = action;
-        }
-
-        /**
          * 业务作用：冻结为可跨批次复验的 CommitRecord。参数说明: 无。返回: 不可变依赖。
          */
         StreamCommitCoordinator.CommitRecord freeze() {
-            return new StreamCommitCoordinator.CommitRecord(id, List.copyOf(gates), confirmed, moved, autoDelete);
+            return new StreamCommitCoordinator.CommitRecord(id, List.copyOf(gates), autoDelete, authority);
         }
     }
 
     /**
-     * 业务作用：由 RedisPartition Claim 或 BOTH source 提供共享权威、精确 fencing ACK 与 PEL 复验入口。
+     * 业务作用：由 RedisPartition Claim 提供共享权威、精确 fencing ACK 与 PEL 复验入口。
      */
     interface PartitionSource extends StreamCommitCoordinator.CommitSource {
         /**
@@ -1711,7 +1405,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
         boolean allowsRecovery();
 
         /**
-         * 业务作用：取得恢复提交所需的来源权威证据；物理分区覆盖此入口查询实际 Redis holder，BOTH 保留 consumer epoch 与逐 record PEL 复验。
+         * 业务作用：取得恢复提交所需的来源权威证据；物理分区覆盖此入口查询实际 Redis holder。
          * 参数说明: 无。
          *
          * @return 明确允许恢复时为 true；UNKNOWN 返回 false 并保留权威，明确失权的来源同时撤销本地执行权威。
@@ -1735,6 +1429,16 @@ final class StreamPartitionRuntime implements AutoCloseable {
          */
         PartitionRecordCapacity.Permit retainActiveBatch();
 
+        /** 业务作用：定位当前正文的原组合预留。参数说明: 无。返回: 当前预留；无活动读取时为 null。 */
+        PartitionReadReservation readReservation();
+
+        /**
+         * 业务作用：提供实际 Redis 读取前冻结的批次身份，不允许由调用方临时重建。
+         * 参数说明: 无。
+         * @return 当前读取责任的原权威快照；没有读取责任时为空
+         */
+        StreamSourceAuthority.Snapshot readAuthority();
+
         /**
          * 业务作用：暂停来源并关闭 readiness。参数说明: 失败原因。返回: 无返回值。
          */
@@ -1756,7 +1460,7 @@ final class StreamPartitionRuntime implements AutoCloseable {
         String group();
 
         /**
-         * 业务作用：返回 holder 或 consumer epoch 标识。参数说明: 无。返回: 来源身份。
+         * 业务作用：返回 holder 来源标识。参数说明: 无。返回: 来源身份。
          */
         String consumer();
 

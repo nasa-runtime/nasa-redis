@@ -11,9 +11,14 @@ Stream 派发和 `XAUTOCLAIM` 完成故障恢复；根任务还可以按实际�
 另一项核心能力是 [RedisPartition](REDIS-PARTITION.md)：按稳定业务键把消息路由到固定 Redis Stream 分区，
 以每分区独占锁、Redis 服务端时间成员心跳、通知加周期再平衡、`XAUTOCLAIM` 和 ACK fencing，保证集群中
 同一分区任一时刻只有一个有效消费 owner；Redis 批量读取后按单条消息的 `partitionKey` 进入本地 Partition
-Task，Future 真实结束后再以 holder/consumer-fenced Lua 原子确认。批量传输与单条业务事务分开，
+Task，Future 真实结束后再以 holder-fenced Lua 原子确认。批量传输与单条业务事务分开，
 本地逐记录执行权协调正常消费、PEL 接管、精确重试和确认责任；ACK 未决时只推进确认，迟到接管正文在重新
 查询 PEL 后才可执行。节点扩缩容、进程退出或租约失效后由其它实例接管未确认消息，业务仍须按至少一次交付实现幂等。
+
+消费模式只有 `PROXY`（普通 Stream）和 `PARTITION`（持权物理分区）。PARTITION 支持 `source`、`group`、
+`stream` 三种本地执行域，默认 `source`；后两种为不同逻辑组或物理 Stream 分配独立 Runner、数量份额与确认重试队列，
+使不同业务键在共享后端可用时独立推进，局部执行器故障只关闭所属域的新准入。跨域同计划同 key 仍保持本地串行；
+共享 Redis、CPU、连接池和全局停机仍会影响多个域，数量份额不等于内存或外部服务隔离。
 
 组件同时提供 `RedisProxy` 命令代理及面向余额、额度等资金字段的 nonce 幂等计数，默认在 7 天窗口内保证
 同一业务事件最多改变一次计数；此外还包括轻量分布式锁、RediSearch 查询 DSL、显式批量 Pipeline、
@@ -23,7 +28,7 @@ Task，Future 真实结束后再以 holder/consumer-fenced Lua 原子确认。�
 <dependency>
     <groupId>io.github.nasa-runtime</groupId>
     <artifactId>nasa-redis</artifactId>
-    <version>2.0.1</version>
+    <version>2.0.2</version>
 </dependency>
 ```
 
@@ -42,7 +47,8 @@ Spring 应用实例
 ├─ @EnableRedis ─────▶ RedisProxy（命令、Pipeline、Search、nonce、锁）
 ├─ @EnableRedisJob ──▶ 按 qualifier 隔离的 Scheduler
 │                      定义/Run/租约 ─▶ Dispatch Stream ─▶ attempt fencing
-└─ RedisPartition ───▶ Stream 分区与独占 owner ─▶ 按键 Partition Task ─▶ Future ─▶ ACK fencing
+└─ RedisPartition ───▶ Stream 分区与独占 owner ─▶ 按 scope 绑定本地域
+                                              └─▶ 按键 Task ─▶ Future ─▶ ACK fencing
 
 Redis Cluster
 ├─ Redis TIME：租约、心跳与过期判断的统一时间依据
@@ -502,6 +508,18 @@ try {
 - 未取得锁的线程共享释放频道订阅，收到解锁通知后立即重试，并以剩余 TTL 作为通知丢失时的等待上限；
 - 看门狗任务名包含 Redis 数据源、锁入口会话、完整 key、公开句柄和 holder，多数据源同名锁不会覆盖续期任务。
 
+### Stream 消费模式选择
+
+| 消费模式 | 来源与执行方式 | 适用边界 |
+| --- | --- | --- |
+| `PROXY`（默认） | 普通 Stream，按 consumer group 配置消费；支持 Single/Batch listener | 使用普通订阅、并发和 ACK/NOACK 合同，不创建 RedisPartition Runner |
+| `PARTITION` | 通过分区发布入口写入物理 Stream；只有持权 owner 可以消费，Single listener 按业务键进入 Task | 需要分区故障接管、按键本地串行、成功后 holder-fenced ACK |
+
+同一 RedisProxy 可以同时登记两种模式的独立 listener。每个 listener 选择一种模式，各自使用对应发布入口；
+两种入口之间没有顺序屏障或确认协调。`executor.scope` 只影响 PARTITION，普通 Stream 的执行方式不会随它改变。
+旧 `BOTH` 及其专用配置不受支持，转换入口前须处理旧 Stream、PEL 和在途责任，详见
+[消费模式迁移边界](REDIS-PARTITION.md#旧消费模式迁移)。
+
 ### Stream 分区消费 —— 独占认领、按键执行与故障接管
 
 Java 入口为 `io.github.nasaruntime.redis.cache.redis.partition.RedisPartition`；分区配置由同包的
@@ -539,11 +557,12 @@ RedisPartition 的物理键协议固定使用 Spring UTF-8 `StringRedisSerialize
 `partitionKey`。Redis 仍按批拉取，框架按计划和有效 hash 分桶；单条 listener 调用承担业务事务边界。
 这里的 Future 表示框架 Partition Task 的真实终态，不等待回调自行派发的异步工作；`onEvent` 应在这条消息的
 业务处理完成后返回，不能先返回成功再执行持久副作用。
-每个 RedisProxy 只对应一个独立的 `RedisPartition` 和一个 `PartitionRunner`，其全部 listener 共用这套执行域；不同
-Redis 数据源不会共享队列、taskType 状态或故障门禁。首个 listener 显式返回的 Runner 会永久绑定到当前 RedisProxy，
-后续 listener 只能复用同一对象；其它代理复用该对象会在启动和 Redis 副作用前被拒绝。
-单个 listener 登记失败不会停止同代理已经承载其它计划的 Runner；`RedisPartition` 关闭时会先排干来源与本地任务，
-再停止自己独占的 Runner 及其 TimingWheel，不需要应用另行管理这套内部执行域。
+每个 RedisProxy 对应独立的 `RedisPartition`，本地资源由 `stream.partition.executor.scope` 确定归属。
+登记 listener 时收集声明，`startAllGroups()` 才冻结完整拓扑、启动所有执行域、复验远端路由并开放读取。
+自动装配在首遍扫描按 bean 对象冻结 `mode()` 和 `qualifiers()` 的分流决定，后续注册不因返回值变化切换消费入口或重新匹配代理。
+停机先通知全部来源，再排干 Task、确认与恢复，最后逐域停止 Runner 及其 TimingWheel。
+排队恢复可以取消；正在执行的恢复 I/O 保留注册责任和原容量，实际返回并完成清理后才计为来源排空。
+确认责任同样保留到 ACK/PEL I/O 返回、确认容量与排干令牌全部归还；关闭超时只封闭后续确认，不提前注销执行中的责任。
 分区 stream 与消费组由 `RedisProxy` 在初始化阶段按 listener 声明的 topic 自动建好，业务侧不需要显式调
 `init` / `isolate`：
 
@@ -573,9 +592,9 @@ public class SettlementListener implements RedisEventSingleListener<Order> {
 redisProxy.partition("contract:settlement", "open-position", uid, order);
 ```
 
-`PARTITION` 和 `BOTH` 注册期拒绝 Batch listener；`PROXY` 保持既有 Single/Batch 行为。`partitionKey` 返回
+`PARTITION` 注册期拒绝 Batch listener；`PROXY` 保持既有 Single/Batch 行为。`partitionKey` 返回
 `null` 时逐条走非保序 Task，任意 `Number` 按 `longValue()` 走 Partition 的 long 入口，其它对象原样走 Object
-入口且 `hashCode()` 必须跨反序列化、重启和 PEL 重投保持稳定。成功确认使用 holder-fenced 或 consumer-fenced
+入口且 `hashCode()` 必须跨反序列化、重启和 PEL 重投保持稳定。成功确认使用 holder-fenced
 Lua 原子完成；`autoDelete=true` 只删除本次实际 XACK 成功的正文，并会影响该 Stream 的其它 group。
 
 节点身份由应用名、节点序号和每次运行生成的 UUID 组成，同机多进程与同一 JVM 的多个应用上下文不会合并成
@@ -583,9 +602,55 @@ Lua 原子完成；`autoDelete=true` 只删除本次实际 XACK 成功的正文�
 上线、释放和优雅下线通知用于立即唤醒再平衡，周期任务负责在 Pub/Sub 通知不可达时继续收敛。进程突然退出时，
 成员通常在三个再平衡周期后被剔除，但真正接管仍必须等待原分区锁租期失效。
 
+#### source/group/stream 执行域与固定容量
+
+分区组决定 Redis 中的路由和锁命名空间，执行域决定本进程内哪些来源共享 Runner、容量和确认重试驱动。
+只给慢 topic 配置独立分区组，在默认 `source` 下仍共享本地资源；需要组间独立份额时，应同时选择 `group`。
+
+| scope | 每个 RedisProxy 的域与 Runner 数量 | 资源边界 |
+| --- | --- | --- |
+| `source`（默认） | 全部 PARTITION 来源共用 1 个 | 共享数量预算；允许显式 Runner |
+| `group` | 默认组与每个隔离组各 1 个 | 同组共享，不同组有独立份额与驱动 |
+| `stream` | 完整拓扑中所有组的分区数之和 | 同组不同物理 Stream 也有独立份额与驱动 |
+
+配置示例：
+
+```yaml
+nasa:
+  redis:
+    properties:
+      primary:
+        stream:
+          partition:
+            executor:
+              scope: group
+              max-runners: 256
+              max-total-partitions: 4096
+```
+
+`local-consumer` 的七项容量是源级总额：raw record、Task、commit attempt、commit record、并行 retry、
+unordered retry 和 routeBlocked。group/stream 先为每域保留最大批次所需的最低容量，再按稳定域序均分余量，
+其中 commit attempt 和并行 retry 每域至少各 1 个，其余五项各覆盖该域最大批次。空闲份额不借出；
+完整拓扑包含未订阅的配置组，但不会因此认领无人订阅的分区。纯发布或纯 PROXY 不创建这些 Runner。
+启动前核对所有最低需求、Runner 数及槽数预算，任一项不足就拒绝消费启动。
+`max-total-partitions` 限制的是全部 Runner 本地槽数之和；槽数由 JVM 参数 `-Dnasa.partition.partitions=N`
+控制并向上归一化为二次幂，与 Redis 物理分区数 `count` 不同。
+
+只有 source 允许 listener 的 `partition()` 返回显式 Runner，后续计划只能返回 null 或同一对象，Runner 不允许
+跨代理复用。永久归属在物理组校验与远端只读预检通过、声明提交时建立；未提交声明失败且没有其它声明依赖时，
+撤销候选 Runner 和 scope，允许纠正配置后重试。已发布计划的归属在停机后仍保留。
+
+同一 listener 跨 topic/组仍是一个计划，所有域共享 `(planId, effectiveHash)` 顺序门禁。跨域同 key 必须等待
+前序业务、失败头和确认责任收口；不同 key 也可能因 hash 碰撞串行。每域有独立 Runner、TimingWheel 和确认重试
+协调器，但仍共享后端和进程资源，不承诺内存字节或 CPU 隔离。域与份额在启动时冻结，重认领不会改变它们；
+scope 变更需要重新创建运行时，不修改 Redis key、consumer group、锁或持久协议。
+
 #### 本地执行、恢复与确认的衔接
 
 ```text
+准备或接续批次容量（group/stream 在读取前取得完整预留）
+              │
+              ▼
 XREADGROUP / XAUTOCLAIM / 精确重试
               │
               ▼
@@ -595,14 +660,17 @@ XREADGROUP / XAUTOCLAIM / 精确重试
 历史 PEL 复验 + 实际 holder 复验
               │
               ▼
-完整解析计划与业务键 ─▶ 预留容量 ─▶ Partition Task ─▶ Future 真实终态
+完整解析计划与业务键 ─▶ 落实执行额度 ─▶ Partition Task ─▶ Future 真实终态
                                                         │
                                   ┌─────────────────────┴──────────────────┐
                                   ▼                                        ▼
                              失败坐标重试                      CommitAttempt ─▶ 原子 fencing ACK
 ```
 
-执行权按 Stream、group、consumer、record ID 和来源代次隔离，覆盖业务执行以及向重试或确认链的交接。
+物理记录执行权按 Stream、group 和 record ID 互斥；Task 与确认继续携带原来源代次，覆盖业务执行以及向重试或确认链的交接。
+来源的 holder、generation 与准入状态作为一个不可变值原子发布；即使同一 holder 重获分区，旧代次也不会重新获得业务执行权限。
+每批数据在 Redis 读取前冻结权威快照，坐标、解码、路由、Task 与恢复都沿用该快照；任何中途失权都会阻止旧正文获得新代次的业务执行权限。
+成功结果向确认链交接时继续携带 Task 的原权威快照，不能借新代次 ACK；失效结果保留在 PEL，由合法代次按至少一次语义接续。
 `min-idle-ms` 只决定 Redis 接管资格，耗时较长的本地消费也可能达到阈值；接管页不能据此重新提交已有责任的记录。
 取得执行权后再次查询历史 PEL，已经缺席的记录不再调用 listener。ACK 超时或断线时，成功业务交给确认链复验
 PEL 并重试 XACK；PEL 或 holder 证据不确定时保留完整页和恢复容量，关闭该来源的新读取。
@@ -611,11 +679,9 @@ PEL 并重试 XACK；PEL 或 holder 证据不确定时保留完整页和恢复�
 无法解析路由时保留整批，避免未知前序被后继越过。raw record、Task、确认与重试均有硬容量。容量暂满时暂停
 对应来源的新读取，已有重试与确认继续推进；受阻批次保留 PEL 坐标和读取配额，容量归还并接续该批次后自动恢复
 读取，无需重启或更换 consumer/holder。单批需求超过总上限、停止或明确失权仍关闭来源，不驱逐未决责任。
-配置位于 `stream.partition.local-consumer`。
+配置位于 `stream.partition.local-consumer`；这些值是源总额，group/stream 按完整拓扑固定分配。
 
-`BOTH` 的普通 Stream 侧使用独立的手工确认容器和唯一 consumer epoch。多 event field 共用一个 record 的 PEL，
-只有全部 field 成功才确认；当前 epoch 内保留成功 field 的证据。它仅提供 JVM 内顺序，不能代替物理分区的集群
-holder 权威；进程退出或 consumer epoch 改变后仍可能整条重放。
+每域最低容量、全部配置默认值与变更边界见 [RedisPartition 运行指南](REDIS-PARTITION.md)。
 
 停机先关闭读取与提交，再等待 Task、Future、确认和恢复责任收口。Claim 排干预算耗尽时，来源代次失效并把未决
 PEL 留给后续 owner；迟到 Task 不得确认消息，但其外部副作用仍由业务幂等约束。`stop()` 及完成回调等待本地资源
@@ -626,6 +692,9 @@ PEL 留给后续 owner；迟到 Task 不得确认消息，但其外部副作用�
 classpath 存在 Micrometer 且应用提供 `MeterRegistry` 时，组件自动登记低基数指标。重点观察
 `stream_partition_runtime` 的 readiness、raw/Task/commit/retry 使用量、ACK UNKNOWN 和 routeBlocked，
 并结合组级 PEL 数量、最老 idle、锁自检和 owner 收敛时间判断处理是否停滞。采集读取缓存，不执行 Redis I/O。
+`RedisPartition.executionDomains()` 提供包括零流量域在内的固定份额、占用和健康快照，域指标使用稳定物理拓扑标签。
+Runner 或 TimingWheel 失健康后锁存所属域故障，关闭该域新读取与业务提交，保留在途责任直到实际排干。
+源级 readiness 会汇总为失败，健康域在没有同 key 等待且共享后端可用时仍可推进；故障域不会自动迁移或重新开放。
 没有指标后端也不改变消费语义；配置默认值、容量关系、指标名称及排干边界见 [REDIS-PARTITION.md](REDIS-PARTITION.md)。
 
 ### 普通 Stream 消费与保留期

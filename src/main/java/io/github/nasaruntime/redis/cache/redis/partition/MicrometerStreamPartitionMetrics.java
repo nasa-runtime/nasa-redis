@@ -60,7 +60,7 @@ final class MicrometerStreamPartitionMetrics implements StreamPartitionMetrics {
     private final Map<MeterRegistry, Map<MetricKey, Meter>> eventMeters = new IdentityHashMap<>();
     private final Map<MeterRegistry, Set<MetricKey>> skippedEventMeters = new IdentityHashMap<>();
     private RedisPartition partition;
-    private boolean runtimeBound;
+    private final Set<String> boundRuntimeFields = new LinkedHashSet<>();
     /**
      * 关闭开始前发布的不可逆终态；volatile 供高频事件入口快速拒绝，所有 meter 创建仍在当前实例 monitor 内复验。
      */
@@ -272,6 +272,7 @@ final class MicrometerStreamPartitionMetrics implements StreamPartitionMetrics {
         requireTopologyStable();
         this.partition = Objects.requireNonNull(partition, "partition");
         bindRuntime();
+        bindDomains();
         if (closed) return;
         for (String groupName : partition.metricGroupNames()) groupAvailable(partition, groupName);
         if (closed) return;
@@ -332,7 +333,7 @@ final class MicrometerStreamPartitionMetrics implements StreamPartitionMetrics {
         if (closed) return;
         requireTopologyStable();
         if (this.partition == null) this.partition = partition;
-        if (this.partition != partition || !boundPlans.add(plan.planId())) return;
+        if (this.partition != partition || plan.bindings().isEmpty() || !boundPlans.add(plan.planId())) return;
         for (boolean ordered : new boolean[]{false, true}) {
             for (ConsumeStatus outcome : ConsumeStatus.values()) {
                 Tags planTags = planTags(plan);
@@ -486,12 +487,12 @@ final class MicrometerStreamPartitionMetrics implements StreamPartitionMetrics {
      * 业务作用：把运行时硬容量、门禁、确认、重试和延迟快照登记为一个固定 result 维度的低基数指标族。
      *
      * <p>参数说明: 无。
-     * 返回: 无返回值；每个桥接器只登记一次。
+     * 返回: 无返回值；每个字段只登记一次，执行域激活后补齐延迟出现的字段。
      */
     private void bindRuntime() {
-        if (closed || runtimeBound || partition == null) return;
-        runtimeBound = true;
+        if (closed || partition == null) return;
         for (String result : partition.runtimeMetrics().keySet()) {
+            if (!boundRuntimeFields.add(result)) continue;
             if (closed) return;
             Tags tags = Tags.of(
                     "qualifier", partition.metricQualifier(),
@@ -547,15 +548,45 @@ final class MicrometerStreamPartitionMetrics implements StreamPartitionMetrics {
                                  String result,
                                  ToDoubleFunction<io.github.nasaruntime.core.base.Partition.PartitionRunner> value) {
         if (closed) return;
-        Tags tags = planTags(plan).and("runner", plan.runner().getRunnerName(), "result", result);
-        for (MeterRegistry registry : registries) {
-            if (closed) return;
-            registerOwnedMeter(registry, gaugeDefinition(
-                    "stream_partition_runner",
-                    tags,
-                    "Partition Runner health",
-                    plan.runner(),
-                    value));
+        for (var binding : plan.bindings()) {
+            var domain = binding.domain();
+            Tags tags = domainTags(domain.snapshot()).and("result", result);
+            for (MeterRegistry registry : registries) {
+                if (closed) return;
+                registerOwnedMeter(registry, gaugeDefinition("stream_partition_runner", tags,
+                        "Partition Runner health", domain.runner, value));
+            }
+        }
+    }
+
+    /**
+     * 业务作用：统一域指标标签，不让计划或进程身份改变同一物理拓扑的基数。
+     * @param domain 冻结域快照
+     * @return qualifier、scope 和物理域身份标签
+     */
+    private Tags domainTags(PartitionExecutionDomainSnapshot domain) {
+        return Tags.of("qualifier", partition.metricQualifier(), "scope", domain.scope().name().toLowerCase(Locale.ROOT),
+                "domain", Integer.toString(domain.domainId()), "group", domain.logicalGroup() == null ? "<source>" : domain.logicalGroup(),
+                "partition", domain.partition() == null ? "<none>" : domain.partition().toString());
+    }
+
+    /** 业务作用：按完整物理拓扑登记域份额与占用，每域仅计一次且不使用进程身份标签。参数说明: 无。返回: 无返回值。 */
+    private void bindDomains() {
+        for (var domain : partition.executionDomains()) {
+            Tags tags = domainTags(domain);
+            for (String field : domain.usage().keySet()) for (MeterRegistry registry : registries) {
+                registerOwnedMeter(registry, gaugeDefinition("stream_partition_domain", tags.and("result", field),
+                        "Execution domain resource usage", partition,
+                        current -> current.metricDomain(domain.domainId()).usage().getOrDefault(field, 0L).doubleValue()));
+            }
+            for (String field : domain.quotas().keySet()) for (MeterRegistry registry : registries) {
+                registerOwnedMeter(registry, gaugeDefinition("stream_partition_domain_quota", tags.and("resource", field),
+                        "Execution domain fixed quota", domain, current -> current.quotas().get(field).doubleValue()));
+            }
+            for (MeterRegistry registry : registries) {
+                registerOwnedMeter(registry, gaugeDefinition("stream_partition_domain_health", tags, "Execution domain health", partition,
+                        current -> current.metricDomain(domain.domainId()).runnerHealthy() ? 1D : 0D));
+            }
         }
     }
 
@@ -567,7 +598,7 @@ final class MicrometerStreamPartitionMetrics implements StreamPartitionMetrics {
         if (runtimeTags == null) return null;
         return runtimeTags.and(
                 "subscription", plan.metricSubscription(),
-                "mode", plan.mode().name().toLowerCase(Locale.ROOT));
+                "mode", "partition");
     }
 
     /**
@@ -1267,7 +1298,7 @@ final class MicrometerStreamPartitionMetrics implements StreamPartitionMetrics {
         boundGroups.clear();
         boundPlans.clear();
         partition = null;
-        runtimeBound = false;
+        boundRuntimeFields.clear();
     }
 
     /**

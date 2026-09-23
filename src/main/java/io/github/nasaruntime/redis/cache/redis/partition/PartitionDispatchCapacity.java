@@ -79,6 +79,32 @@ final class PartitionDispatchCapacity {
     }
 
     /**
+     * 业务作用：在读取前非阻塞取得最坏逐条 Task 和确认份额，失败不保留任何部分资源。
+     * @param count 最大物理记录数
+     * @return 完整预留，容量暂满时为 null
+     */
+    Reservation tryReserveRead(int count) { return tryReserve(count, count); }
+
+    /**
+     * 业务作用：恢复执行不持有重试槽等待其它恢复的预留，完整容量不可得时返回退避。
+     * @param tasks 实际任务数
+     * @param records 最大确认数量
+     * @return 完整预留或 null
+     */
+    Reservation tryReserve(int tasks, int records) {
+        if (tasks > totalTasks || records > totalCommitRecords)
+            throw new OversizedBatchException(tasks, records, totalTasks, totalCommitRecords);
+        if (!lock.tryLock()) return null;
+        try {
+            if (availableTasks < tasks || availableCommitAttempts < 1 || availableCommitRecords < records) return null;
+            availableTasks -= tasks;
+            availableCommitAttempts--;
+            availableCommitRecords -= records;
+            return new Reservation(this, tasks, 1, records, false);
+        } finally { lock.unlock(); }
+    }
+
+    /**
      * 业务作用：归还一笔组合配额并唤醒公平等待队列重新评估完整需求。
      *
      * @param tasks      归还的 Task 数

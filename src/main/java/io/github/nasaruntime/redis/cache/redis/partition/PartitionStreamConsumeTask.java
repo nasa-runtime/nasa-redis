@@ -105,7 +105,7 @@ final class PartitionStreamConsumeTask implements Partition.Task, ObjectPool.Rec
      */
     @Override
     public int taskType() {
-        return unit.route().ordered() ? unit.plan().orderedTaskType() : unit.plan().unorderedTaskType();
+        return unit.route().ordered() ? unit.binding().orderedTaskType() : unit.binding().unorderedTaskType();
     }
 
     /**
@@ -159,8 +159,7 @@ final class PartitionStreamConsumeTask implements Partition.Task, ObjectPool.Rec
             rethrow = outcome.cause();
         } catch (Throwable infrastructureFailure) {
             if (gateToken != null) {
-                if (unit.proxyBoth()) orderedKeys.proxyRecordDecision(gateToken, unit.refs());
-                else orderedKeys.blocked(gateToken, unit.refs());
+                orderedKeys.blocked(gateToken, unit.refs());
             }
             outcome = ConsumeTaskOutcome.partitionFailed(unit.refs(), infrastructureFailure);
             rethrow = infrastructureFailure;
@@ -250,8 +249,7 @@ final class PartitionStreamConsumeTask implements Partition.Task, ObjectPool.Rec
                     blocked.add(record.ref());
                     blocked.addAll(deferred);
                     // BLOCKED 必须先于 Future 可见，后继批次才能可靠观察失败门禁。
-                    if (unit.proxyBoth()) orderedKeys.proxyRecordDecision(gateToken, unit.refs());
-                    else orderedKeys.listenerFailed(gateToken, successful, blocked);
+                    orderedKeys.listenerFailed(gateToken, successful, blocked);
                 }
                 return ConsumeTaskOutcome.listenerFailed(
                         List.copyOf(successful), record.ref(), deferred, listenerFailure);
@@ -260,8 +258,7 @@ final class PartitionStreamConsumeTask implements Partition.Task, ObjectPool.Rec
             }
         }
         if (gateToken != null) {
-            if (unit.proxyBoth()) orderedKeys.proxyRecordDecision(gateToken, unit.refs());
-            else orderedKeys.awaitingAck(gateToken, unit.refs());
+            orderedKeys.awaitingAck(gateToken, unit.refs());
         }
         return ConsumeTaskOutcome.success(List.copyOf(successful));
     }
@@ -275,7 +272,8 @@ final class PartitionStreamConsumeTask implements Partition.Task, ObjectPool.Rec
      */
     private ConsumeTaskOutcome revokedBeforeListener(int index, List<PartitionRecordRef> successful) {
         ConsumeStatus status;
-        if (!authority.allowsExecution()) {
+        // 坐标与批次必须属于同一原代次；即使传入的快照仍有效，也不能授权来自其它代次的正文。
+        if (!authority.owns(unit.records().get(index).ref()) || !authority.allowsExecution()) {
             status = ConsumeStatus.STALE_AUTHORITY;
             if (gateToken != null) orderedKeys.invalidate(gateToken);
         } else if (gateToken != null && !orderedKeys.ownsExecution(gateToken)) {
@@ -485,7 +483,7 @@ record PartitionRecordRef(String stream,
      *
      * @param stream           Stream key
      * @param group            consumer group；物理分区可为 null
-     * @param consumer         consumer epoch 名；物理分区可为 null
+     * @param consumer         物理来源的 consumer 名
      * @param id               record id
      * @param topic            业务 topic
      * @param event            计划事件名
@@ -505,7 +503,7 @@ record PartitionRecordRef(String stream,
     }
 }
 
-enum StreamRecordSource {REDIS_PARTITION, PROXY_BOTH}
+enum StreamRecordSource {REDIS_PARTITION}
 
 record DecodedPartitionRecord(RedisProxy redisProxy,
                               PartitionRecordRef ref,
@@ -514,6 +512,7 @@ record DecodedPartitionRecord(RedisProxy redisProxy,
 }
 
 record StreamDispatchUnit(StreamSubscriptionPlan plan,
+                          StreamPlanExecutionBinding binding,
                           ResolvedPartitionKey route,
                           List<DecodedPartitionRecord> records) {
 
@@ -530,16 +529,5 @@ record StreamDispatchUnit(StreamSubscriptionPlan plan,
     List<PartitionRecordRef> refsFrom(int fromIndex) {
         if (fromIndex >= records.size()) return List.of();
         return records.subList(fromIndex, records.size()).stream().map(DecodedPartitionRecord::ref).toList();
-    }
-
-    /**
-     * 业务作用：判断本单元是否来自 BOTH 的普通 Stream dedicated consumer。
-     *
-     * <p>参数说明: 无。
-     *
-     * @return 首条坐标标记为 PROXY_BOTH 时返回 true
-     */
-    boolean proxyBoth() {
-        return !records.isEmpty() && records.getFirst().ref().source() == StreamRecordSource.PROXY_BOTH;
     }
 }

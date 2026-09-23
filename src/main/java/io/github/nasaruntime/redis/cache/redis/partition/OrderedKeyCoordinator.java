@@ -56,8 +56,7 @@ final class OrderedKeyCoordinator {
                 if (previous.containsKey(key)) continue;
                 KeyGate gate = gates.get(key);
                 previous.put(key, gate == null ? null : new KeyGate(gate.token(), gate.business(), gate.commit(),
-                        gate.holdReason(), gate.active(), new ArrayList<>(gate.deferred()),
-                        gate.proxyWaitingCoordinates(), gate.pendingCommitCoordinates()));
+                        gate.holdReason(), gate.active(), new ArrayList<>(gate.deferred()), gate.pendingCommitCoordinates()));
                 previousSince.put(key, gateSinceNanos.get(key));
                 previousFailures.put(key, consecutiveFailures.get(key));
             }
@@ -123,17 +122,14 @@ final class OrderedKeyCoordinator {
                         GateHoldReason.NONE,
                         List.copyOf(records),
                         new ArrayList<>(),
-                        Set.of(),
                         Set.of()));
                 return GateReservation.acquired(token);
             }
-            // Task 结果尚待物理 record 合并时不能再次取得 gate 代次，后继仍须等待当前 head 收口。
+            // 成功前缀尚待确认时不能再次取得 gate 代次，后继仍须等待当前 head 收口。
             if ((current.business() == BusinessPhase.BLOCKED
                     || current.business() == BusinessPhase.INVALIDATING)
                     && current.commit() == CommitPhase.NONE
-                    && current.holdReason() != GateHoldReason.PROXY_RECORD_DECISION
                     && current.pendingCommitCoordinates().isEmpty()
-                    && waitingBelongsToFailedRecords(current)
                     && sameHead(current.active(), records)) {
                 List<PartitionRecordRef> remaining = remainingAfterReservation(
                         current.active(), current.deferred(), records);
@@ -147,15 +143,12 @@ final class OrderedKeyCoordinator {
                         GateHoldReason.NONE,
                         List.copyOf(records),
                         remaining,
-                        Set.of(),
                         Set.of()));
                 return GateReservation.acquired(token);
             }
-            // 执行、等待其它 field 或确认中的坐标都已有人负责，不能把自己再次登记为自己的后继。
+            // 执行或确认中的坐标都已有人负责，不能把自己再次登记为自己的后继。
             List<PartitionRecordRef> additions = records.stream()
                     .filter(candidate -> current.active().stream()
-                            .noneMatch(existing -> sameCoordinate(existing, candidate)))
-                    .filter(candidate -> current.proxyWaitingCoordinates().stream()
                             .noneMatch(existing -> sameCoordinate(existing, candidate)))
                     .filter(candidate -> current.pendingCommitCoordinates().stream()
                             .noneMatch(existing -> sameCoordinate(existing, candidate)))
@@ -212,7 +205,6 @@ final class OrderedKeyCoordinator {
                 result.put("gate_commit_" + phase.name().toLowerCase(), 0L);
             }
             long deferred = 0L;
-            long waiting = 0L;
             long pending = 0L;
             long oldestBlockedMillis = 0L;
             long maximumConsecutiveFailures = 0L;
@@ -223,7 +215,6 @@ final class OrderedKeyCoordinator {
                 result.put(business, result.get(business) + 1L);
                 result.put(commit, result.get(commit) + 1L);
                 deferred += gate.deferred().size();
-                waiting += gate.proxyWaitingCoordinates().size();
                 pending += gate.pendingCommitCoordinates().size();
                 if (gate.business() == BusinessPhase.BLOCKED
                         || gate.business() == BusinessPhase.INVALIDATING) {
@@ -235,7 +226,6 @@ final class OrderedKeyCoordinator {
                         consecutiveFailures.getOrDefault(gate.token().key(), 0L));
             }
             result.put("gate_deferred_coordinates", deferred);
-            result.put("gate_proxy_waiting_coordinates", waiting);
             result.put("gate_pending_commit_coordinates", pending);
             result.put("gate_oldest_blocked_age_ms", oldestBlockedMillis);
             result.put("gate_max_consecutive_failures", maximumConsecutiveFailures);
@@ -265,7 +255,6 @@ final class OrderedKeyCoordinator {
                     GateHoldReason.NONE,
                     List.copyOf(records),
                     gate.deferred(),
-                    Set.of(),
                     coordinates(records)));
         } finally {
             lock.unlock();
@@ -306,114 +295,7 @@ final class OrderedKeyCoordinator {
                     GateHoldReason.LISTENER_RETRY,
                     List.copyOf(failedAndTail),
                     gate.deferred(),
-                    Set.of(),
                     coordinates(successfulPrefix)));
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
-     * 业务作用：在 BOTH 单 field Task 结束时进入物理 record 决策保护态，不允许 field 单独形成 ACK PENDING。
-     *
-     * @param token   当前执行令牌
-     * @param records 该 Task 已发布业务结果的 exact field 坐标
-     *                返回: 无返回值；物理 record 账本决议前 commit 保持 NONE。
-     */
-    void proxyRecordDecision(GateToken token, List<PartitionRecordRef> records) {
-        lock.lock();
-        try {
-            KeyGate gate = gates.get(token.key());
-            if (!matchesExecuting(gate, token)) return;
-            gates.put(token.key(), new KeyGate(
-                    token,
-                    BusinessPhase.BLOCKED,
-                    CommitPhase.NONE,
-                    GateHoldReason.PROXY_RECORD_DECISION,
-                    List.copyOf(records),
-                    gate.deferred(),
-                    coordinates(records),
-                    Set.of()));
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
-     * 业务作用：在 BOTH Task Future 可见后发布成功 record 的 ledger 等待集合与失败头，防止单 field 先开放同 key。
-     *
-     * @param token            当前执行令牌
-     * @param successfulPrefix 已完成 listener、仍等待整条 record 决议的 field 坐标
-     * @param failedAndTail    失败头及未执行尾部
-     * @return 仅当当前 gate 仍是该 Task 发布的完整 PROXY_RECORD_DECISION 时返回 true
-     */
-    boolean proxyTaskOutcome(GateToken token,
-                             List<PartitionRecordRef> successfulPrefix,
-                             List<PartitionRecordRef> failedAndTail) {
-        lock.lock();
-        try {
-            KeyGate gate = gates.get(token.key());
-            List<PartitionRecordRef> decided = new ArrayList<>(successfulPrefix.size() + failedAndTail.size());
-            decided.addAll(successfulPrefix);
-            decided.addAll(failedAndTail);
-            if (gate == null
-                    || !gate.token().equals(token)
-                    || gate.business() != BusinessPhase.BLOCKED
-                    || gate.commit() != CommitPhase.NONE
-                    || gate.holdReason() != GateHoldReason.PROXY_RECORD_DECISION
-                    || !sameCoordinates(gate.active(), decided)
-                    || !gate.proxyWaitingCoordinates().equals(coordinates(decided))) {
-                return false;
-            }
-            if (!failedAndTail.isEmpty()) consecutiveFailures.merge(token.key(), 1L, Long::sum);
-            else consecutiveFailures.put(token.key(), 0L);
-            gates.put(token.key(), new KeyGate(
-                    token,
-                    failedAndTail.isEmpty() ? BusinessPhase.OPEN : BusinessPhase.BLOCKED,
-                    CommitPhase.NONE,
-                    failedAndTail.isEmpty()
-                            ? GateHoldReason.PROXY_RECORD_DECISION : GateHoldReason.LISTENER_RETRY,
-                    List.copyOf(failedAndTail),
-                    gate.deferred(),
-                    coordinates(successfulPrefix),
-                    Set.of()));
-            return true;
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
-     * 业务作用：在 BOTH ledger 证明一条物理 record 的全部 field 成功后，把该 id 从 ledger 等待转入 ACK 等待。
-     *
-     * @param token 该 record field 对应的 gate 令牌
-     * @param id    已满足整条 record 成功条件的物理 id
-     *              返回: 无返回值；其它同 Task record 尚未决时继续保持门禁。
-     */
-    void proxyAckReady(GateToken token, String id) {
-        lock.lock();
-        try {
-            KeyGate gate = gates.get(token.key());
-            if (gate == null || !gate.token().equals(token) || id == null) return;
-            LinkedHashSet<PartitionRecordRef> waiting =
-                    new LinkedHashSet<>(gate.proxyWaitingCoordinates());
-            LinkedHashSet<PartitionRecordRef> pending =
-                    new LinkedHashSet<>(gate.pendingCommitCoordinates());
-            List<PartitionRecordRef> promoted = waiting.stream()
-                    .filter(ref -> id.equals(ref.id()))
-                    .toList();
-            if (promoted.isEmpty() && pending.stream().noneMatch(ref -> id.equals(ref.id()))) return;
-            waiting.removeAll(promoted);
-            pending.addAll(promoted);
-            gates.put(token.key(), new KeyGate(
-                    token,
-                    gate.business(),
-                    CommitPhase.PENDING,
-                    gate.holdReason(),
-                    gate.active(),
-                    gate.deferred(),
-                    Set.copyOf(waiting),
-                    Set.copyOf(pending)));
         } finally {
             lock.unlock();
         }
@@ -437,8 +319,7 @@ final class OrderedKeyCoordinator {
                     new LinkedHashSet<>(gate.pendingCommitCoordinates());
             boolean pendingChanged = pending.removeIf(ref -> id.equals(ref.id()));
             if (!pendingChanged) return;
-            settleAfterRemote(token, gate, gate.active(), gate.deferred(),
-                    gate.proxyWaitingCoordinates(), Set.copyOf(pending));
+            settleAfterRemote(token, gate, gate.active(), gate.deferred(), Set.copyOf(pending));
         } finally {
             lock.unlock();
         }
@@ -456,8 +337,7 @@ final class OrderedKeyCoordinator {
             KeyGate gate = gates.get(token.key());
             if (gate == null || !gate.token().equals(token)
                     || (gate.commit() != CommitPhase.PENDING && gate.commit() != CommitPhase.UNKNOWN)) return;
-            settleAfterRemote(token, gate, gate.active(), gate.deferred(),
-                    gate.proxyWaitingCoordinates(), Set.of());
+            settleAfterRemote(token, gate, gate.active(), gate.deferred(), Set.of());
         } finally {
             lock.unlock();
         }
@@ -481,7 +361,6 @@ final class OrderedKeyCoordinator {
                         gate.holdReason(),
                         gate.active(),
                         gate.deferred(),
-                        gate.proxyWaitingCoordinates(),
                         gate.pendingCommitCoordinates()));
             }
         } finally {
@@ -490,7 +369,7 @@ final class OrderedKeyCoordinator {
     }
 
     /**
-     * 业务作用：在 consumer-fenced ACK 证明 record 已迁移时，移除当前令牌来源代次下该 record 的门禁责任，保留其它记录的顺序约束。
+     * 业务作用：在 PEL 或确认结论证明 record 已迁移时，移除当前令牌来源代次下该 record 的门禁责任，保留其它记录的顺序约束。
      *
      * <p>返回: 无返回值；令牌失效或没有匹配坐标时保持状态不变，否则根据剩余依赖更新门禁。
      *
@@ -507,18 +386,14 @@ final class OrderedKeyCoordinator {
                     .filter(record -> !matchesTokenRecord(record, token, id)).toList();
             List<PartitionRecordRef> deferred = gate.deferred().stream()
                     .filter(record -> !matchesTokenRecord(record, token, id)).toList();
-            LinkedHashSet<PartitionRecordRef> waiting =
-                    new LinkedHashSet<>(gate.proxyWaitingCoordinates());
             LinkedHashSet<PartitionRecordRef> pending =
                     new LinkedHashSet<>(gate.pendingCommitCoordinates());
             boolean activeChanged = active.size() != gate.active().size();
             boolean deferredChanged = deferred.size() != gate.deferred().size();
-            boolean waitingChanged = waiting.removeIf(record -> matchesTokenRecord(record, token, id));
             boolean pendingChanged = pending.removeIf(record -> matchesTokenRecord(record, token, id));
-            boolean changed = activeChanged || deferredChanged || waitingChanged || pendingChanged;
+            boolean changed = activeChanged || deferredChanged || pendingChanged;
             if (changed) {
-                settleAfterRemote(token, gate, active, new ArrayList<>(deferred),
-                        Set.copyOf(waiting), Set.copyOf(pending));
+                settleAfterRemote(token, gate, active, new ArrayList<>(deferred), Set.copyOf(pending));
             }
         } finally {
             lock.unlock();
@@ -534,16 +409,6 @@ final class OrderedKeyCoordinator {
      */
     void recordSettled(PartitionRecordRef ref) {
         settleCoordinates(current -> sameCoordinate(current, ref));
-    }
-
-    /**
-     * 业务作用：物理 BOTH record 已在远端结束时，释放该来源代次下全部 field 的有序门禁责任。
-     *
-     * @param ref 已取得远端终态证据的冻结 record 坐标，field 不限制清理范围
-     *            返回: 无返回值；无关 record 和较新来源代次保持不变。
-     */
-    void proxyRecordSettled(PartitionRecordRef ref) {
-        settleCoordinates(current -> sameRecord(current, ref));
     }
 
     /**
@@ -563,18 +428,14 @@ final class OrderedKeyCoordinator {
                         .filter(settled.negate()).toList();
                 List<PartitionRecordRef> deferred = gate.deferred().stream()
                         .filter(settled.negate()).toList();
-                LinkedHashSet<PartitionRecordRef> waiting =
-                        new LinkedHashSet<>(gate.proxyWaitingCoordinates());
                 LinkedHashSet<PartitionRecordRef> pending =
                         new LinkedHashSet<>(gate.pendingCommitCoordinates());
                 boolean activeChanged = active.size() != gate.active().size();
                 boolean deferredChanged = deferred.size() != gate.deferred().size();
-                boolean waitingChanged = waiting.removeIf(settled);
                 boolean pendingChanged = pending.removeIf(settled);
-                boolean changed = activeChanged || deferredChanged || waitingChanged || pendingChanged;
+                boolean changed = activeChanged || deferredChanged || pendingChanged;
                 if (!changed) continue;
-                settleAfterRemote(gate.token(), gate, active, new ArrayList<>(deferred),
-                        Set.copyOf(waiting), Set.copyOf(pending));
+                settleAfterRemote(gate.token(), gate, active, new ArrayList<>(deferred), Set.copyOf(pending));
             }
         } finally {
             lock.unlock();
@@ -606,7 +467,7 @@ final class OrderedKeyCoordinator {
      * 业务作用：来源代次整体失效时只剔除该 authority 的坐标；active 失权时保留其它来源的遇见顺序并关闭新执行。
      *
      * @param authority 已停止或失权的来源对象
-     *                  返回: 无返回值；其它 Claim 与 BOTH consumer 的 gate 不受影响。
+     *                  返回: 无返回值；其它 Claim 的 gate 不受影响。
      */
     void invalidateAuthority(StreamSourceAuthority authority) {
         lock.lock();
@@ -631,8 +492,7 @@ final class OrderedKeyCoordinator {
                     // 仅清理失权来源的 deferred，不能打断仍有效来源正在执行或等待 ACK 的 active/head。
                     gates.put(key, new KeyGate(
                             gate.token(), gate.business(), gate.commit(), gate.holdReason(),
-                            gate.active(), new ArrayList<>(deferred),
-                            gate.proxyWaitingCoordinates(), gate.pendingCommitCoordinates()));
+                            gate.active(), new ArrayList<>(deferred), gate.pendingCommitCoordinates()));
                 }
             }
         } finally {
@@ -659,11 +519,9 @@ final class OrderedKeyCoordinator {
         for (PartitionRecordRef ref : gate.deferred()) {
             if (!discarded.test(ref)) addCoordinateIfAbsent(retained, ref);
         }
-        LinkedHashSet<PartitionRecordRef> waiting = new LinkedHashSet<>(gate.proxyWaitingCoordinates());
-        waiting.removeIf(discarded);
         LinkedHashSet<PartitionRecordRef> pending = new LinkedHashSet<>(gate.pendingCommitCoordinates());
         pending.removeIf(discarded);
-        if (retained.isEmpty() && waiting.isEmpty() && pending.isEmpty()) {
+        if (retained.isEmpty() && pending.isEmpty()) {
             gates.remove(key);
             gateSinceNanos.remove(key);
             consecutiveFailures.remove(key);
@@ -674,7 +532,7 @@ final class OrderedKeyCoordinator {
                 gate.token(), BusinessPhase.INVALIDATING,
                 pending.isEmpty() ? CommitPhase.NONE : gate.commit(),
                 GateHoldReason.NOT_EXECUTED_RETRY,
-                List.copyOf(retained), new ArrayList<>(), Set.copyOf(waiting), Set.copyOf(pending)));
+                List.copyOf(retained), new ArrayList<>(), Set.copyOf(pending)));
     }
 
     /**
@@ -729,7 +587,7 @@ final class OrderedKeyCoordinator {
      *
      * @param gate      当前 gate
      * @param authority 待核对的来源代次
-     * @return 任一 active、deferred、ledger waiting 或 pending-confirm 坐标属于该来源代次时返回 true；没有来源引用的坐标按 gate token 归属判断
+     * @return 任一 active、deferred 或 pending-confirm 坐标属于该来源代次时返回 true；没有来源引用的坐标按 gate token 归属判断
      */
     private static boolean containsSource(KeyGate gate, StreamSourceAuthority.Snapshot authority) {
         // 未携带来源引用的坐标按 gate token 确定归属；具有完整来源信息的坐标须独立匹配来源代次。
@@ -737,12 +595,10 @@ final class OrderedKeyCoordinator {
                 && gate.token().generation() == authority.generation()
                 && (gate.active().stream().anyMatch(ref -> ref.authority() == null)
                 || gate.deferred().stream().anyMatch(ref -> ref.authority() == null)
-                || gate.proxyWaitingCoordinates().stream().anyMatch(ref -> ref.authority() == null)
                 || gate.pendingCommitCoordinates().stream().anyMatch(ref -> ref.authority() == null));
         return legacyTokenMembership
                 || gate.active().stream().anyMatch(ref -> belongsToSource(ref, authority))
                 || gate.deferred().stream().anyMatch(ref -> belongsToSource(ref, authority))
-                || gate.proxyWaitingCoordinates().stream().anyMatch(ref -> belongsToSource(ref, authority))
                 || gate.pendingCommitCoordinates().stream().anyMatch(ref -> belongsToSource(ref, authority));
     }
 
@@ -769,27 +625,18 @@ final class OrderedKeyCoordinator {
      * @param previous 远端结论前的 gate
      * @param active   当前业务头的剩余坐标；是否仍需重试由原业务阶段决定
      * @param deferred 尚未取得执行权的后继坐标
-     * @param waiting  仍等待 BOTH ledger 整条成功的 exact 坐标
      * @param pending  已产生业务成功事实、仍等待 ACK 明确的 exact 坐标
      */
     private void settleAfterRemote(GateToken token,
                                    KeyGate previous,
                                    List<PartitionRecordRef> active,
                                    List<PartitionRecordRef> deferred,
-                                   Set<PartitionRecordRef> waiting,
                                    Set<PartitionRecordRef> pending) {
         // 业务成功不等于远端确认完成；尚有 ACK 责任时必须保留门禁，避免后继越过不确定提交。
         if (!pending.isEmpty()) {
             gates.put(token.key(), new KeyGate(
                     token, previous.business(), previous.commit(), previous.holdReason(),
-                    List.copyOf(active), deferred, Set.copyOf(waiting), Set.copyOf(pending)));
-            return;
-        }
-        // BOTH 的其它 field 尚未全部成功时不能按单个 field 的远端结论开放顺序执行。
-        if (!waiting.isEmpty()) {
-            gates.put(token.key(), new KeyGate(
-                    token, previous.business(), CommitPhase.NONE, previous.holdReason(),
-                    List.copyOf(active), deferred, Set.copyOf(waiting), Set.of()));
+                    List.copyOf(active), deferred, Set.copyOf(pending)));
             return;
         }
         // 确认依赖已清空且业务头无需重试后，已登记的后继仍须先成为接管头，防止新消息插队。
@@ -802,14 +649,14 @@ final class OrderedKeyCoordinator {
                 gates.put(token.key(), new KeyGate(
                         token, BusinessPhase.BLOCKED, CommitPhase.NONE,
                         GateHoldReason.NOT_EXECUTED_RETRY,
-                        List.copyOf(deferred), new ArrayList<>(), Set.of(), Set.of()));
+                        List.copyOf(deferred), new ArrayList<>(), Set.of()));
             }
             return;
         }
         // 已确认的成功前缀不再占用 ACK 阶段，但失败头仍须阻挡后继，等待自身重试。
         gates.put(token.key(), new KeyGate(
                 token, BusinessPhase.BLOCKED, CommitPhase.NONE, previous.holdReason(),
-                List.copyOf(active), deferred, Set.of(), Set.of()));
+                List.copyOf(active), deferred, Set.of()));
     }
 
     /**
@@ -851,34 +698,6 @@ final class OrderedKeyCoordinator {
     }
 
     /**
-     * 业务作用：复验 Task outcome 覆盖的完整有序坐标仍与其决策快照一致，远端已经收敛过的坐标不得被迟到结果恢复。
-     *
-     * @param expected gate 当前保存的决策坐标
-     * @param actual   Task outcome 重新组合的成功前缀与未成功尾部
-     * @return 数量、顺序与完整来源坐标均相同时返回 true
-     */
-    private static boolean sameCoordinates(List<PartitionRecordRef> expected,
-                                           List<PartitionRecordRef> actual) {
-        if (expected.size() != actual.size()) return false;
-        for (int index = 0; index < expected.size(); index++) {
-            if (!sameCoordinate(expected.get(index), actual.get(index))) return false;
-        }
-        return true;
-    }
-
-    /**
-     * 业务作用：仅允许失败头重试接管与它属于同一物理 record 的 ledger 等待，禁止越过更早成功但尚未确认的 record。
-     *
-     * @param gate 当前 blocked gate
-     * @return 没有 ledger 等待，或每个等待坐标都与失败坐标中的某条记录具有相同物理记录身份和来源代次时返回 true
-     */
-    private static boolean waitingBelongsToFailedRecords(KeyGate gate) {
-        if (gate.proxyWaitingCoordinates().isEmpty()) return true;
-        return gate.proxyWaitingCoordinates().stream().allMatch(waiting -> gate.active().stream()
-                .anyMatch(active -> sameRecord(active, waiting)));
-    }
-
-    /**
      * 业务作用：限定 consumer 迁移只能剔除当前 gate 来源代次内的 record，不能按裸 id 影响其它来源的 deferred 坐标。
      *
      * @param record gate 保存的 exact 坐标
@@ -890,22 +709,6 @@ final class OrderedKeyCoordinator {
         return id.equals(record.id())
                 && record.authority() == token.authority()
                 && record.sourceGeneration() == token.generation();
-    }
-
-    /**
-     * 业务作用：判断两个 field 是否属于同一来源代次的同一物理 record，供 ledger 等待与失败头建立关联。
-     *
-     * @param left  第一坐标
-     * @param right 第二坐标
-     * @return stream/group/consumer/id 与来源代次一致时返回 true
-     */
-    private static boolean sameRecord(PartitionRecordRef left, PartitionRecordRef right) {
-        return Objects.equals(left.stream(), right.stream())
-                && Objects.equals(left.group(), right.group())
-                && Objects.equals(left.consumer(), right.consumer())
-                && Objects.equals(left.id(), right.id())
-                && left.authority() == right.authority()
-                && left.sourceGeneration() == right.sourceGeneration();
     }
 
     /**
@@ -929,7 +732,7 @@ final class OrderedKeyCoordinator {
 
     enum CommitPhase {NONE, PENDING, UNKNOWN}
 
-    enum GateHoldReason {NONE, LISTENER_RETRY, NOT_EXECUTED_RETRY, PROXY_RECORD_DECISION}
+    enum GateHoldReason {NONE, LISTENER_RETRY, NOT_EXECUTED_RETRY}
 
     private record OrderedKeyId(long planId, int effectiveHash) {}
 
@@ -939,7 +742,6 @@ final class OrderedKeyCoordinator {
                            GateHoldReason holdReason,
                            List<PartitionRecordRef> active,
                            List<PartitionRecordRef> deferred,
-                           Set<PartitionRecordRef> proxyWaitingCoordinates,
                            Set<PartitionRecordRef> pendingCommitCoordinates) {
     }
 

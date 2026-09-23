@@ -24,6 +24,8 @@ final class StreamPartitionRuntimeHints implements RuntimeHintsRegistrar {
                 RedisPartitionProperties.class,
                 RedisPartitionProperties.PartitionGroup.class,
                 RedisPartitionProperties.LocalConsumer.class,
+                RedisPartitionProperties.Executor.class,
+                RedisPartitionProperties.ExecutorScope.class,
                 RedisPartitionProperties.PartitionKeyLayout.class,
                 RedisPartitionProperties.PoisonPolicy.class,
                 RedisPartition.class,

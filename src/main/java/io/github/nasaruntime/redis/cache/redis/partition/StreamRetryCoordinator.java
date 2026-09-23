@@ -29,10 +29,12 @@ final class StreamRetryCoordinator implements AutoCloseable {
     private final AtomicBoolean accepting = new AtomicBoolean(true);
     private final ReentrantLock registrationLock = new ReentrantLock();
     private int pendingUnordered;
+    private int reservedUnordered;
+    private int reservedRoutes;
     private int routeBlockedRecords;
 
     /**
-     * 业务作用：建立一个代理级精确重试域，所有进入执行的回放共享固定 permit 上限。
+     * 业务作用：建立当前执行域的精确重试协调器，本域回放共享固定 permit 上限。
      *
      * @param runtime             共享 dispatcher
      * @param status              排干与运行指标
@@ -86,6 +88,8 @@ final class StreamRetryCoordinator implements AutoCloseable {
             return Map.ofEntries(
                     Map.entry("pending_exact_retries", (long) retries.size()),
                     Map.entry("pending_unordered_retries", (long) pendingUnordered),
+                    Map.entry("retry_reserved_unordered", (long) reservedUnordered),
+                    Map.entry("retry_reserved_routes", (long) reservedRoutes),
                     Map.entry("retry_oldest_age_ms", oldestMillis),
                     Map.entry("retry_max_consecutive_failures", consecutiveFailures),
                     Map.entry("route_blocked_batches", (long) routeBatches.size()),
@@ -98,10 +102,56 @@ final class StreamRetryCoordinator implements AutoCloseable {
     }
 
     /**
+     * 业务作用：在 Redis 读取前预留 null-key 与未知路由最坏承接量，失败不改变任何份额。
+     * @param count 最大物理记录数
+     * @return 完整预留，容量或并发登记暂不可用时为 null
+     */
+    SuccessorReservation reserveRead(int count) {
+        if (!registrationLock.tryLock()) return null;
+        try {
+            if (!accepting.get() || count > maxPendingUnordered - pendingUnordered - reservedUnordered
+                    || count > maxRouteBlocked - routeBlockedRecords - reservedRoutes) return null;
+            reservedUnordered += count;
+            reservedRoutes += count;
+            return new SuccessorReservation(count);
+        } finally { registrationLock.unlock(); }
+    }
+
+    /** 业务作用：保存读取已经取得的失败承接量，登记失败坐标时按原域转移而非重复申请。 */
+    final class SuccessorReservation implements AutoCloseable {
+        private int unordered;
+        private int routes;
+        /** 业务作用：接管已扣减份额。@param count 数量；返回: 未交接的预留。 */
+        SuccessorReservation(int count) { unordered = count; routes = count; }
+        /** 业务作用：归还未读取的后继位置。@param count 实际记录数；返回: 无返回值。 */
+        void shrink(int count) {
+            registrationLock.lock();
+            try {
+                int u = Math.min(unordered, count), r = Math.min(routes, count);
+                reservedUnordered -= unordered - u;
+                reservedRoutes -= routes - r;
+                unordered = u; routes = r;
+            } finally { registrationLock.unlock(); }
+        }
+        /** 业务作用：原子转交一条非保序责任；调用方持有登记锁。参数说明: 无。返回: 有原额度时为 true。 */
+        boolean takeUnordered() {
+            if (unordered == 0) return false;
+            unordered--; reservedUnordered--; return true;
+        }
+        /** 业务作用：原子转交整页责任；调用方持有登记锁。@param count 页数量 @return 有完整原额度时为 true */
+        boolean takeRoutes(int count) {
+            if (routes < count) return false;
+            routes -= count; reservedRoutes -= count; return true;
+        }
+        /** 业务作用：归还未交接的承接量，已有重试负责其独立终态。参数说明: 无。返回: 重复关闭幂等。 */
+        @Override public void close() { shrink(0); }
+    }
+
+    /**
      * 业务作用：判断指定来源是否仍持有 exact retry 或 route recovery 责任，owner 释放前必须等待这些状态收口。
      *
      * @param authority 来源共享权威对象
-     * @return 该来源既无精确重试也无整批路由恢复时返回 true
+     * @return 该来源恢复调用已退出且对应长期资源已归还、注册表无剩余责任时返回 true
      */
     boolean isDrained(StreamSourceAuthority authority) {
         Objects.requireNonNull(authority, "authority");
@@ -123,22 +173,31 @@ final class StreamRetryCoordinator implements AutoCloseable {
      * @param source  当前 Redis 来源
      * @param ref     需要重建的 record/field 坐标
      * @param ordered 是否已由 ordered gate 保护
+     * @param read    原读取的失败承接预留；精确重试及 source 模式可为空
+     * @param authority 原 Task 或读取批次的冻结快照
      * @return 已登记、已存在或来源已停止时返回 true；容量暂满返回 false，调用方不得丢弃尚未交接的批次
      */
     boolean register(StreamPartitionRuntime.PartitionSource source,
                   PartitionRecordRef ref,
-                  boolean ordered) {
-        RetryKey key = RetryKey.of(source, ref);
+                  boolean ordered, PartitionReadReservation read, StreamSourceAuthority.Snapshot authority) {
+        RetryKey key = RetryKey.of(ref);
         RetryState created = null;
         boolean capacityRejected = false;
         registrationLock.lock();
         try {
+            // 原责任只在原代次内重试；来源重获后由新读取建立责任，不能从旧坐标换发重试。
+            if (authority.current() != source.authority() || !authority.owns(ref)) return true;
+            if (!authority.allowsExecution()) {
+                runtime.settleRemoteRecord(ref);
+                return true;
+            }
             if (!accepting.get() || !runtime.admissionOpen() || !source.allowsRecovery()) return true;
             if (retries.containsKey(key)) return true;
-            if (!ordered && pendingUnordered >= maxPendingUnordered) {
+            boolean prepaid = !ordered && read != null && read.successor.takeUnordered();
+            if (!ordered && !prepaid && pendingUnordered + reservedUnordered >= maxPendingUnordered) {
                 capacityRejected = true;
             } else {
-                created = new RetryState(source, ref, ordered, initialDelayMillis);
+                created = new RetryState(source, ref, ordered, initialDelayMillis, authority);
                 // admission、容量预留与 Map 发布属于同一事务，关闭扫描不会遗漏已通过检查的状态。
                 RetryState previous = retries.putIfAbsent(key, created);
                 if (previous != null) return true;
@@ -161,31 +220,40 @@ final class StreamRetryCoordinator implements AutoCloseable {
      * @param source  受阻断的 Redis 来源
      * @param records 该原始批次的全部坐标
      * @param permit  原始 poll batch 转交的 record 容量，可为空
+     * @param authority 该批读取前冻结且不会重新解释的快照
      *                返回: 无返回值；超过硬上限时关闭来源 readiness。
      */
     void registerRouteBlocked(StreamPartitionRuntime.PartitionSource source,
                               List<PartitionRecordRef> records,
-                              PartitionRecordCapacity.Permit permit) {
+                              PartitionRecordCapacity.Permit permit, StreamSourceAuthority.Snapshot authority) {
         List<PartitionRecordRef> immutableRecords = List.copyOf(records);
-        StreamSourceAuthority.Snapshot snapshot = source.authority().snapshot();
+        // 失效或混合代次的正文只能交回 PEL，不能建立新代次的阻断状态或重复持有原容量。
+        if (immutableRecords.isEmpty() || authority.current() != source.authority()
+                || !authority.allowsExecution() || immutableRecords.stream().anyMatch(ref -> !authority.owns(ref))) {
+            if (permit != null) permit.release();
+            return;
+        }
+        PartitionRecordRef first = immutableRecords.getFirst();
         RouteBatchKey key = new RouteBatchKey(
-                source.authority(), snapshot.generation(), source.stream(), source.group(), source.consumer());
+                authority.current(), authority.generation(), first.stream(), first.group(), first.consumer());
         RouteBatchState created = null;
         boolean releasePermit = false;
         boolean capacityRejected = false;
         registrationLock.lock();
         try {
-            if (!accepting.get() || !runtime.admissionOpen() || !source.allowsRecovery()) {
+            if (!accepting.get() || !runtime.admissionOpen() || !source.allowsRecovery() || !authority.allowsExecution()) {
                 releasePermit = true;
             } else if (routeBatches.containsKey(key)) {
                 releasePermit = true;
-            } else if (immutableRecords.size() > maxRouteBlocked - routeBlockedRecords) {
+            } else if (!(permit != null && permit.downstream != null
+                    && permit.downstream.successor.takeRoutes(immutableRecords.size()))
+                    && immutableRecords.size() > maxRouteBlocked - routeBlockedRecords - reservedRoutes) {
                 releasePermit = true;
                 capacityRejected = true;
             } else {
                 StreamRuntimeStatus.DrainToken drain = status.enter(StreamRuntimeStatus.Resource.RETRY);
                 created = new RouteBatchState(
-                        source, immutableRecords, permit, drain, initialDelayMillis);
+                        source, immutableRecords, permit, drain, initialDelayMillis, authority);
                 try {
                     // 坐标额度和长期 DrainToken 与状态一起发布，任何失败分支都会通过 state.close() 归还。
                     RouteBatchState previous = routeBatches.putIfAbsent(key, created);
@@ -229,12 +297,12 @@ final class StreamRetryCoordinator implements AutoCloseable {
      *              返回: 无返回值。
      */
     private void scheduleRoute(RouteBatchKey key, RouteBatchState state) {
-        boolean discard = false;
         registrationLock.lock();
         try {
             if (routeBatches.get(key) != state) return;
-            if (!accepting.get() || !state.source().allowsRecovery()) {
-                discard = removeRouteLocked(key, state);
+            // 调度与执行都复验原快照，失效责任不能借来源的新代次继续推进。
+            if (!accepting.get() || !state.authority.allowsExecution() || !state.source().allowsRecovery()) {
+                removeRouteLocked(key, state);
             } else {
                 if (!state.schedule()) return;
                 long delay = state.nextDelay(maxDelayMillis);
@@ -249,13 +317,12 @@ final class StreamRetryCoordinator implements AutoCloseable {
                     });
                 } catch (Throwable rejected) {
                     state.unschedule();
-                    discard = removeRouteLocked(key, state);
+                    removeRouteLocked(key, state);
                 }
             }
         } finally {
             registrationLock.unlock();
         }
-        if (discard) closeRouteState(state, false);
     }
 
     /**
@@ -266,12 +333,12 @@ final class StreamRetryCoordinator implements AutoCloseable {
      *              返回: 无返回值。
      */
     private void schedule(RetryKey key, RetryState state) {
-        boolean discard = false;
         registrationLock.lock();
         try {
             if (retries.get(key) != state) return;
-            if (!accepting.get() || !state.source().allowsRecovery()) {
-                discard = removeExactLocked(key, state);
+            // 调度与执行都复验原快照，失效责任不能借来源的新代次继续推进。
+            if (!accepting.get() || !state.authority.allowsExecution() || !state.source().allowsRecovery()) {
+                removeExactLocked(key, state);
             } else {
                 if (!state.schedule()) return;
                 long delay = state.nextDelay(maxDelayMillis);
@@ -286,13 +353,12 @@ final class StreamRetryCoordinator implements AutoCloseable {
                     });
                 } catch (Throwable rejected) {
                     state.unschedule();
-                    discard = removeExactLocked(key, state);
+                    removeExactLocked(key, state);
                 }
             }
         } finally {
             registrationLock.unlock();
         }
-        if (discard) state.close();
     }
 
     /**
@@ -308,21 +374,18 @@ final class StreamRetryCoordinator implements AutoCloseable {
             return;
         }
         boolean execute = false;
-        boolean discard = false;
         registrationLock.lock();
         try {
             if (retries.get(key) != state) return;
-            if (!accepting.get() || !state.source().allowsRecovery()) {
-                discard = removeExactLocked(key, state);
+            // 调度与执行都复验原快照，失效责任不能借来源的新代次继续推进。
+            if (!accepting.get() || !state.authority.allowsExecution() || !state.source().allowsRecovery()) {
+                removeExactLocked(key, state);
             } else {
                 execute = state.beginExecution();
             }
         } finally {
             registrationLock.unlock();
-            if (!execute) {
-                if (discard) state.close();
-                executionPermits.release();
-            }
+            if (!execute) executionPermits.release();
         }
         if (!execute) return;
         StreamRuntimeStatus.DrainToken drain = null;
@@ -331,17 +394,22 @@ final class StreamRetryCoordinator implements AutoCloseable {
             drain = status.enter(StreamRuntimeStatus.Resource.RETRY);
             status.recordRetry();
             state.executionAttempt();
-            StreamPartitionRuntime.RetryDisposition disposition = runtime.retryExact(state.source(), state.ref());
+            StreamPartitionRuntime.RetryDisposition disposition = runtime.retryExact(state.source(), state.ref(), state.authority);
             settled = disposition == StreamPartitionRuntime.RetryDisposition.SETTLED
                     || disposition == StreamPartitionRuntime.RetryDisposition.MOVED;
         } catch (Throwable ignored) {
         } finally {
-            // 先结束当前执行权，再决定注销或发布下一轮；时间轮回调不能与上一轮业务恢复重叠。
-            state.endExecution();
-            if (settled || !state.source().allowsRecovery()) finishExact(key, state);
-            else schedule(key, state);
-            if (drain != null) drain.close();
-            executionPermits.release();
+            registrationLock.lock();
+            try {
+                // 恢复调用已返回；先归还执行资源，再在同一边界解除执行权并注销或调度，排空检查不能越过清理。
+                if (drain != null) drain.close();
+                executionPermits.release();
+                state.endExecution();
+                if (settled || !state.authority.allowsExecution() || !state.source().allowsRecovery()) finishExact(key, state);
+                else schedule(key, state);
+            } finally {
+                registrationLock.unlock();
+            }
         }
     }
 
@@ -358,21 +426,18 @@ final class StreamRetryCoordinator implements AutoCloseable {
             return;
         }
         boolean execute = false;
-        boolean discard = false;
         registrationLock.lock();
         try {
             if (routeBatches.get(key) != state) return;
-            if (!accepting.get() || !state.source().allowsRecovery()) {
-                discard = removeRouteLocked(key, state);
+            // 调度与执行都复验原快照，失效责任不能借来源的新代次继续推进。
+            if (!accepting.get() || !state.authority.allowsExecution() || !state.source().allowsRecovery()) {
+                removeRouteLocked(key, state);
             } else {
                 execute = state.beginExecution();
             }
         } finally {
             registrationLock.unlock();
-            if (!execute) {
-                if (discard) closeRouteState(state, false);
-                executionPermits.release();
-            }
+            if (!execute) executionPermits.release();
         }
         if (!execute) return;
         StreamRuntimeStatus.DrainToken execution = null;
@@ -382,18 +447,24 @@ final class StreamRetryCoordinator implements AutoCloseable {
             status.recordRetry();
             state.executionAttempt();
             StreamPartitionRuntime.RetryDisposition disposition =
-                    runtime.retryRouteBatch(state.source(), state.records());
+                    runtime.retryRouteBatch(state.source(), state.records(), state.source()::revalidateRecoveryAuthority,
+                            state.permit == null ? null : state.permit.downstream, state.authority);
             settled = disposition == StreamPartitionRuntime.RetryDisposition.SETTLED
                     || disposition == StreamPartitionRuntime.RetryDisposition.MOVED;
         } catch (Throwable ignored) {
         } finally {
-            // route 状态同样在解除执行权后才建立未来驱动力，避免 raw record permit 留在无执行者状态。
-            state.endExecution();
-            if (settled) finishRoute(key, state, true);
-            else if (!state.source().allowsRecovery()) finishRoute(key, state, false);
-            else scheduleRoute(key, state);
-            if (execution != null) execution.close();
-            executionPermits.release();
+            registrationLock.lock();
+            try {
+                // 原批次及长期容量留到恢复调用返回；执行令牌与注册责任在同一临界区内依次收口。
+                if (execution != null) execution.close();
+                executionPermits.release();
+                state.endExecution();
+                if (settled) finishRoute(key, state, true);
+                else if (!state.authority.allowsExecution() || !state.source().allowsRecovery()) finishRoute(key, state, false);
+                else scheduleRoute(key, state);
+            } finally {
+                registrationLock.unlock();
+            }
         }
     }
 
@@ -409,8 +480,9 @@ final class StreamRetryCoordinator implements AutoCloseable {
         registrationLock.lock();
         try {
             if (!removeRouteLocked(key, state)) return;
-            // 删除旧责任与重新开放来源不可分割，新 route 批次只能在开放动作完成后再建立自己的保护态。
-            closeRouteState(state, reopen);
+            // 停机不能因迟到的成功结论重新开放读取；原代次和全局准入都有效时才解除保护。
+            if (reopen && accepting.get() && runtime.admissionOpen()
+                    && state.authority.allowsExecution() && state.source().allowsRecovery()) state.source().clearRouteBlock();
         } finally {
             registrationLock.unlock();
         }
@@ -424,141 +496,108 @@ final class StreamRetryCoordinator implements AutoCloseable {
      *              返回: 无返回值；状态已被其它线程收口时保持幂等。
      */
     private void finishExact(RetryKey key, RetryState state) {
-        boolean removed;
         registrationLock.lock();
         try {
-            removed = removeExactLocked(key, state);
+            removeExactLocked(key, state);
         } finally {
             registrationLock.unlock();
         }
-        if (removed) state.close();
     }
 
     /**
-     * 业务作用：在注册锁内删除 exact 状态并归还对应硬容量。
+     * 业务作用：在注册锁内取消已退出执行的 exact 状态，再注销坐标及其硬容量。
      *
      * @param key   去重坐标
      * @param state 期望状态
-     * @return 本调用删除状态时返回 true
+     * @return 本调用完成注销时返回 true；执行中的状态继续保留到执行栈收口
      */
     private boolean removeExactLocked(RetryKey key, RetryState state) {
-        if (!retries.remove(key, state)) return false;
+        // 停止或失权不能提前抹去执行责任；只有执行线程解除标记后才允许归还容量。
+        if (state.isExecuting() || retries.get(key) != state) return false;
+        state.close();
+        retries.remove(key, state);
+        // 失效恢复不再驱动旧坐标，清理仅匹配原代次的门禁，避免阻挡合法新读取。
+        if (!state.authority.allowsExecution()) runtime.settleRemoteRecord(state.ref());
         if (!state.ordered()) pendingUnordered--;
         return true;
     }
 
     /**
-     * 业务作用：在注册锁内删除 route recovery 并按实际坐标数归还硬容量。
+     * 业务作用：在注册锁内先归还 route recovery 的长期资源，再注销原批次及其坐标容量。
      *
      * @param key   来源代次键
      * @param state 期望状态
-     * @return 本调用删除状态时返回 true
+     * @return 本调用完成注销时返回 true；执行中的原批次不能被关闭路径提前释放
      */
     private boolean removeRouteLocked(RouteBatchKey key, RouteBatchState state) {
-        if (!routeBatches.remove(key, state)) return false;
+        // Map 存续到 retained permit 和 DrainToken 实际释放，来源排空检查不能先于资源终态。
+        if (state.isExecuting() || routeBatches.get(key) != state) return false;
+        state.close();
+        routeBatches.remove(key, state);
+        // 整页责任退出时只撤销原坐标，后继代次及其它来源的顺序事实继续保留。
+        if (!state.authority.allowsExecution()) state.records().forEach(runtime::settleRemoteRecord);
         routeBlockedRecords -= state.records().size();
+        if (routeBatches.isEmpty()) status.clearReadiness("route_blocked");
         return true;
     }
 
     /**
-     * 业务作用：在 route 状态退出注册表后取消时间轮、释放长期资源，并按明确恢复结论重新开放来源。
-     *
-     * @param state  已删除的 route 状态
-     * @param reopen 是否重新开放来源读取
-     *               返回: 无返回值；状态自身保证资源只释放一次。
-     */
-    private void closeRouteState(RouteBatchState state, boolean reopen) {
-        TimingWheel.cancel(state.timingTaskName());
-        if (reopen && state.source().allowsRecovery()) state.source().clearRouteBlock();
-        state.close();
-        registrationLock.lock();
-        try {
-            if (routeBatches.isEmpty()) status.clearReadiness("route_blocked");
-        } finally {
-            registrationLock.unlock();
-        }
-    }
-
-    /**
-     * 业务作用：来源失权时删除其本地重试责任，新 owner 从 PEL 重建。
+     * 业务作用：来源失权后取消尚未执行的恢复，已开始的调用保留原容量直到返回，新 owner 从 PEL 重建。
      *
      * @param authority 失效的共享来源权威
-     *                  返回: 无返回值。
+     * 返回: 无返回值；执行中责任仍参与原来源排空判断。
      */
     void invalidateAuthority(StreamSourceAuthority authority) {
-        discardSource(authority, true);
+        discardSource(authority);
     }
 
     /**
      * 业务作用：来源主动停止时封闭其新恢复发布，并取消尚未开始执行的 retry/route 状态。
      *
      * @param authority 已停止读取但仍可完成既有业务与 ACK 的来源权威
-     *                  返回: 无返回值；正在执行的状态继续留在注册表，直到实际执行收口。
+     * 返回: 无返回值；正在执行的状态继续留在注册表，直到实际执行收口。
      */
     void stopSource(StreamSourceAuthority authority) {
-        discardSource(authority, false);
+        discardSource(authority);
     }
 
     /**
-     * 业务作用：在注册锁内收口一个来源的本地恢复责任，使停止动作与并发登记形成单一先后关系。
+     * 业务作用：在注册锁内撤销一个来源尚未执行的恢复，保留仍在使用原批次的执行责任。
      *
-     * @param authority        来源共享权威对象
-     * @param includeExecuting 是否连同已取得执行权的状态一起交回 PEL
-     *                         返回: 无返回值；所有移除状态的容量、时间轮和排干资源都会恰好释放一次。
+     * @param authority 来源共享权威对象
+     * 返回: 无返回值；资源归还先于注销，执行中的状态由原执行栈唯一收口。
      */
-    private void discardSource(StreamSourceAuthority authority, boolean includeExecuting) {
-        List<RetryState> exactStates = new java.util.ArrayList<>();
-        List<RouteBatchState> routeStates = new java.util.ArrayList<>();
+    private void discardSource(StreamSourceAuthority authority) {
         registrationLock.lock();
         try {
             for (Map.Entry<RetryKey, RetryState> entry : retries.entrySet()) {
-                RetryState state = entry.getValue();
-                if (state.source().authority() == authority
-                        && (includeExecuting || !state.isExecuting())
-                        && removeExactLocked(entry.getKey(), state)) {
-                    exactStates.add(state);
-                }
+                if (entry.getValue().source().authority() == authority) removeExactLocked(entry.getKey(), entry.getValue());
             }
             for (Map.Entry<RouteBatchKey, RouteBatchState> entry : routeBatches.entrySet()) {
-                RouteBatchState state = entry.getValue();
-                if (state.source().authority() == authority
-                        && (includeExecuting || !state.isExecuting())
-                        && removeRouteLocked(entry.getKey(), state)) {
-                    routeStates.add(state);
-                }
+                if (entry.getValue().source().authority() == authority) removeRouteLocked(entry.getKey(), entry.getValue());
             }
         } finally {
             registrationLock.unlock();
         }
-        for (RetryState state : exactStates) state.close();
-        for (RouteBatchState state : routeStates) closeRouteState(state, false);
     }
 
     /**
-     * 业务作用：停止新重试登记，取消本组件的时间轮任务，并将队列中坐标交回 PEL。
+     * 业务作用：永久关闭新登记并取消尚未执行的恢复，保留执行中状态、计数及原批次容量直到调用返回。
      *
-     * <p>参数说明: 无。
-     * 返回: 无返回值；重复关闭保持幂等。
+     * 参数说明: 无。
+     * 返回: 无返回值；不等待或中断恢复 I/O，重复关闭幂等，来源排空必须继续检查存续状态。
      */
     @Override
     public void close() {
-        List<RetryState> exactStates;
-        List<RouteBatchState> routeStates;
         registrationLock.lock();
         try {
             if (!accepting.compareAndSet(true, false)) return;
-            // 封 admission 与完整责任快照处于同一临界区，close 返回后不可能再发布新状态。
-            exactStates = List.copyOf(retries.values());
-            routeStates = List.copyOf(routeBatches.values());
-            retries.clear();
-            routeBatches.clear();
-            pendingUnordered = 0;
-            routeBlockedRecords = 0;
+            // 先在登记边界关闭准入；执行权已授予的状态继续约束 holder，不能用清空 Map 代替真实排干。
+            for (Map.Entry<RetryKey, RetryState> entry : retries.entrySet()) removeExactLocked(entry.getKey(), entry.getValue());
+            for (Map.Entry<RouteBatchKey, RouteBatchState> entry : routeBatches.entrySet()) removeRouteLocked(entry.getKey(), entry.getValue());
         } finally {
             registrationLock.unlock();
         }
-        for (RetryState state : exactStates) state.close();
-        for (RouteBatchState state : routeStates) closeRouteState(state, false);
     }
 
     private record RouteBatchKey(StreamSourceAuthority authority,
@@ -578,15 +617,13 @@ final class StreamRetryCoordinator implements AutoCloseable {
         /**
          * 业务作用：按来源代次与 exact Redis 坐标建立去重键。
          *
-         * @param source 当前来源
-         * @param ref    record/field 坐标
+         * @param ref    原来源代次的 record/field 坐标
          * @return 不持有消息体的重试键
          */
-        static RetryKey of(StreamPartitionRuntime.PartitionSource source, PartitionRecordRef ref) {
-            StreamSourceAuthority.Snapshot snapshot = source.authority().snapshot();
-            String field = source.sourceKind() == StreamRecordSource.PROXY_BOTH ? null : ref.field();
+        static RetryKey of(PartitionRecordRef ref) {
+            String field = ref.field();
             return new RetryKey(
-                    source.authority(), snapshot.generation(), ref.stream(), ref.group(), ref.consumer(),
+                    ref.authority(), ref.sourceGeneration(), ref.stream(), ref.group(), ref.consumer(),
                     ref.id(), field);
         }
     }
@@ -596,6 +633,7 @@ final class StreamRetryCoordinator implements AutoCloseable {
      */
     private static final class RetryState {
 
+        private final StreamSourceAuthority.Snapshot authority;
         private final StreamPartitionRuntime.PartitionSource source;
         private final PartitionRecordRef ref;
         private final boolean ordered;
@@ -614,12 +652,14 @@ final class StreamRetryCoordinator implements AutoCloseable {
          * @param ref         exact 坐标
          * @param ordered     是否由 ordered gate 保护
          * @param delayMillis 首次退避
+         * @param authority 原读取或 Task 冻结的权威
          *                    返回: 尚未进入定时队列的状态。
          */
         private RetryState(StreamPartitionRuntime.PartitionSource source,
                            PartitionRecordRef ref,
                            boolean ordered,
-                           long delayMillis) {
+                           long delayMillis, StreamSourceAuthority.Snapshot authority) {
+            this.authority = authority;
             this.source = source;
             this.ref = ref;
             this.ordered = ordered;
@@ -732,6 +772,7 @@ final class StreamRetryCoordinator implements AutoCloseable {
      */
     private static final class RouteBatchState {
 
+        private final StreamSourceAuthority.Snapshot authority;
         private final StreamPartitionRuntime.PartitionSource source;
         private final List<PartitionRecordRef> records;
         private final PartitionRecordCapacity.Permit permit;
@@ -744,13 +785,14 @@ final class StreamRetryCoordinator implements AutoCloseable {
         private long delayMillis;
 
         /**
-         * 业务作用：冻结原批次恢复责任。参数说明: 来源、坐标、容量、排干令牌与首次退避。返回: 未调度状态。
+         * 业务作用：冻结原批次恢复责任。参数说明: 来源、坐标、容量、排干令牌、首次退避与原权威快照。返回: 固定原代次的未调度状态。
          */
         private RouteBatchState(StreamPartitionRuntime.PartitionSource source,
                                 List<PartitionRecordRef> records,
                                 PartitionRecordCapacity.Permit permit,
                                 StreamRuntimeStatus.DrainToken drain,
-                                long delayMillis) {
+                                long delayMillis, StreamSourceAuthority.Snapshot authority) {
+            this.authority = authority;
             this.source = source;
             this.records = records;
             this.permit = permit;

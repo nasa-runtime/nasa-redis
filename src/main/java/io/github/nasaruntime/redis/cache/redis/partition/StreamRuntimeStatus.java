@@ -31,7 +31,6 @@ final class StreamRuntimeStatus {
     private final AtomicLong commitUnknown = new AtomicLong();
     private final AtomicLong routeBlocked = new AtomicLong();
     private final AtomicLong pelTombstones = new AtomicLong();
-    private final AtomicLong proxyLedgerEntries = new AtomicLong();
     private final AtomicLong drainTimeouts = new AtomicLong();
     private final AtomicLong lateTaskOutcomes = new AtomicLong();
     private final AtomicLongArray listenerLatency = new AtomicLongArray(LISTENER_LATENCY_BUCKETS_MILLIS.length);
@@ -192,7 +191,6 @@ final class StreamRuntimeStatus {
         result.put("commit_unknown", commitUnknown.get());
         result.put("route_blocked", routeBlocked.get());
         result.put("pel_tombstones", pelTombstones.get());
-        result.put("proxy_ledger_entries", proxyLedgerEntries.get());
         result.put("drain_timeouts", drainTimeouts.get());
         result.put("late_task_outcomes", lateTaskOutcomes.get());
         long listenerObservations = listenerObservations();
@@ -249,13 +247,6 @@ final class StreamRuntimeStatus {
      */
     void recordPelTombstone() {
         pelTombstones.incrementAndGet();
-    }
-
-    /**
-     * 业务作用：更新 BOTH 多 field record 账本当前条目数。参数说明: 当前数量。返回: 无返回值。
-     */
-    void proxyLedgerEntries(long count) {
-        proxyLedgerEntries.set(count);
     }
 
     /**

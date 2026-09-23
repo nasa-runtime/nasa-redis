@@ -40,7 +40,7 @@ final class StreamCommitCoordinator implements AutoCloseable {
     private final ReentrantReadWriteLock admissionBarrier = new ReentrantReadWriteLock();
 
     /**
-     * 业务作用：建立一个代理级确认注册表，以共享时间轮触发退避，并把 Redis 复验转交专用虚拟等待执行域。
+     * 业务作用：建立当前执行域的确认注册表，以共享时间轮触发退避，并把 Redis 复验转交虚拟等待执行域。
      *
      * @param qualifier          用于诊断线程名的数据源名
      * @param orderedKeys        ordered key 确认阶段协调器
@@ -93,12 +93,12 @@ final class StreamCommitCoordinator implements AutoCloseable {
     }
 
     /**
-     * 业务作用：先发布不可变确认坐标及容量所有权，再执行首次 fencing ACK。
+     * 业务作用：以 Task 原权威发布不可变确认坐标及容量所有权，再执行首次 fencing ACK，失效成功证据交回 PEL。
      *
      * @param source   来源权威与 Redis 确认入口
      * @param records  按 Redis 顺序排列的确认单元
      * @param capacity 已从批次转交的 attempt/record 容量
-     * @return 首次 Redis 观察后的逐 id 结论；UNKNOWN 已由注册表接管
+     * @return 首次 Redis 观察后的逐 id 结论；UNKNOWN 已由注册表接管，失效快照保留 PEL 且不发起 I/O
      */
     Map<String, AckDisposition> commit(CommitSource source,
                                        List<CommitRecord> records,
@@ -125,6 +125,11 @@ final class StreamCommitCoordinator implements AutoCloseable {
             StreamRuntimeStatus.DrainToken drain = status.enter(StreamRuntimeStatus.Resource.COMMIT);
             try {
                 attempt = new CommitAttempt(id, source, records, capacity, drain, initialDelayMillis);
+                // 发布前只认业务执行时的快照；失效成功证据交回 PEL，不得借当前 holder 建立新确认责任。
+                if (!attempt.allowsIo() || !attempt.authority.allowsExecution()) {
+                    finishRetained(attempt);
+                    return attempt.snapshot();
+                }
                 // 发布与 close 封口共享线性化门禁，关闭扫描不会漏掉已经通过 admission 的责任。
                 if (attempts.putIfAbsent(id, attempt) != null) {
                     throw new IllegalStateException("commit attempt id already published");
@@ -166,7 +171,8 @@ final class StreamCommitCoordinator implements AutoCloseable {
             }
         }
         try (StreamRuntimeStatus.DrainToken ignored = status.enter(StreamRuntimeStatus.Resource.ACK_IO)) {
-            if (!attempt.source().authority().isActive()) {
+            // 已发布 attempt 也可能跨越来源重获；每轮 I/O 必须仍属于原完整权威。
+            if (!attempt.allowsIo() || !attempt.authority.allowsExecution()) {
                 finishRetained(attempt);
                 return;
             }
@@ -186,9 +192,10 @@ final class StreamCommitCoordinator implements AutoCloseable {
             }
         } finally {
             attempt.endIo();
+            // ACK_IO 令牌已关闭后再争取终态权；提前返回和超时期间的交回 PEL 也必须由原 I/O 栈收口。
+            if (attempt.hasUnresolved()) schedule(attempt);
+            else finish(attempt);
         }
-        if (attempt.hasUnresolved()) schedule(attempt);
-        else finish(attempt);
     }
 
     /**
@@ -201,11 +208,21 @@ final class StreamCommitCoordinator implements AutoCloseable {
     private void reconcilePending(CommitAttempt attempt, List<String> unresolved) {
         List<String> retry = new ArrayList<>();
         for (String id : unresolved) {
+            // 每个 PEL 往返都有独立代次边界，前一个 id 的有效证据不能授权后一个查询。
+            if (!attempt.allowsIo() || !attempt.authority.allowsExecution()) {
+                finishRetained(attempt);
+                return;
+            }
             PendingDisposition pending;
             try {
                 pending = attempt.source().pending(id);
             } catch (Throwable failure) {
                 pending = PendingDisposition.UNKNOWN;
+            }
+            // 迟到的缺席或 OWNED 结果不能被后继代次解释为旧业务的确认事实。
+            if (!attempt.allowsIo() || !attempt.authority.allowsExecution()) {
+                finishRetained(attempt);
+                return;
             }
             switch (pending) {
                 case ABSENT -> {
@@ -226,7 +243,7 @@ final class StreamCommitCoordinator implements AutoCloseable {
                 }
             }
         }
-        if (!retry.isEmpty() && attempt.source().authority().isActive()) {
+        if (!retry.isEmpty()) {
             applyRemote(attempt, ackByPolicy(attempt, retry));
         }
     }
@@ -246,9 +263,25 @@ final class StreamCommitCoordinator implements AutoCloseable {
             else retained.add(id);
         }
         LinkedHashMap<String, AckDisposition> result = new LinkedHashMap<>();
-        if (!retained.isEmpty()) result.putAll(attempt.source().ack(retained, false));
-        if (!deleted.isEmpty()) result.putAll(attempt.source().ack(deleted, true));
+        if (!retained.isEmpty()) result.putAll(ackCurrent(attempt, retained, false));
+        if (!deleted.isEmpty()) result.putAll(ackCurrent(attempt, deleted, true));
         return Map.copyOf(result);
+    }
+
+    /**
+     * 业务作用：在每种删除策略的 ACK 前复验原权威，并把冻结 holder 传到 Redis 边界。
+     * @param attempt 原业务代次的确认责任
+     * @param ids 本次策略对应的精确坐标
+     * @param autoDelete 本次确认是否删除正文
+     * @return 远端逐 id 观察；代次失效时交回 PEL 并返回空映射
+     */
+    private Map<String, AckDisposition> ackCurrent(CommitAttempt attempt, List<String> ids, boolean autoDelete) {
+        // 两种策略可能相隔一次 Redis 往返，不能让第二次 ACK 复用第一次的准入结论。
+        if (!attempt.allowsIo() || !attempt.authority.allowsExecution()) {
+            finishRetained(attempt);
+            return Map.of();
+        }
+        return attempt.source().ack(attempt.authority, ids, autoDelete);
     }
 
     /**
@@ -266,7 +299,7 @@ final class StreamCommitCoordinator implements AutoCloseable {
     }
 
     /**
-     * 业务作用：将一个 id 的远端结论 exactly-once 发布到 gate 与 Proxy ledger 依赖。
+     * 业务作用：将一个 id 的远端结论 exactly-once 发布到 gate 依赖。
      *
      * @param attempt     当前 attempt
      * @param id          record id
@@ -274,6 +307,11 @@ final class StreamCommitCoordinator implements AutoCloseable {
      *                    返回: 无返回值；旧或重复结果保持 no-op。
      */
     private void applyOne(CommitAttempt attempt, String id, AckDisposition disposition) {
+        // Redis I/O 已开始后仍可能失权；迟到结果只结束原责任，不改变后继代次的 gate 或权威。
+        if (!attempt.allowsIo() || !attempt.authority.allowsExecution()) {
+            finishRetained(attempt);
+            return;
+        }
         recordAck(attempt, "fencing", disposition.name().toLowerCase(java.util.Locale.ROOT));
         if (disposition == AckDisposition.UNKNOWN) {
             if (attempt.markUnknown(id)) {
@@ -286,7 +324,7 @@ final class StreamCommitCoordinator implements AutoCloseable {
             return;
         }
         if (disposition == AckDisposition.LOST_AUTHORITY) {
-            attempt.source().authority().loseAuthority();
+            attempt.authority.loseAuthority();
             finishRetained(attempt);
             return;
         }
@@ -295,10 +333,8 @@ final class StreamCommitCoordinator implements AutoCloseable {
         if (disposition == AckDisposition.CONFIRMED) {
             if (record.autoDelete()) recordAck(attempt, "delete", "confirmed");
             for (OrderedKeyCoordinator.GateToken gate : record.gates()) orderedKeys.ackConfirmed(gate, id);
-            record.confirmed().run();
         } else {
             for (OrderedKeyCoordinator.GateToken gate : record.gates()) orderedKeys.recordMoved(gate, id);
-            record.moved().run();
         }
     }
 
@@ -323,8 +359,8 @@ final class StreamCommitCoordinator implements AutoCloseable {
      *                返回: 无返回值。
      */
     private void schedule(CommitAttempt attempt) {
-        if (!accepting.get()) {
-            // 关闭扫描已经接管全部已发布 attempt，未决坐标交回 PEL，不能在封口后重建时间轮责任。
+        if (!accepting.get() || !attempt.allowsIo() || !attempt.authority.allowsExecution()) {
+            // 封口或原代次失效后交回 PEL，不能为旧成功证据继续保留定时确认责任。
             finishRetained(attempt);
             return;
         }
@@ -357,36 +393,40 @@ final class StreamCommitCoordinator implements AutoCloseable {
     }
 
     /**
-     * 业务作用：将失权或停机未决 id 明确交回 Redis PEL，不再调 listener 也不猜测 ACK。
+     * 业务作用：将失权或停机未决 id 明确交回 Redis PEL，封闭后续确认，执行中的 I/O 保留责任到返回。
      *
      * @param attempt 需要结束本地所有权的 attempt
      *                返回: 无返回值。
      */
     private void finishRetained(CommitAttempt attempt) {
         attempt.retainUnresolved();
-        orderedKeys.invalidateAuthority(attempt.source().authority());
+        // 只撤销本 attempt 持有的旧令牌；同一来源重获后建立的新门禁必须保持完整。
+        for (CommitRecord record : attempt.records.values()) {
+            for (OrderedKeyCoordinator.GateToken gate : record.gates()) orderedKeys.invalidate(gate);
+        }
         finish(attempt);
     }
 
     /**
-     * 业务作用：只在 attempt 已无未决 id 时删除注册并释放容量与排干令牌。
+     * 业务作用：在确认 I/O 退出且逐 id 结论收口后独占清理，全部容量与排干令牌归还后才注销来源责任。
      *
      * @param attempt 已收口的 attempt
-     *                返回: 无返回值；重复收口保持幂等。
+     * 返回: 无返回值；执行中或重复收口保持幂等，清理未完成或抛出异常时保留注册。
      */
     private void finish(CommitAttempt attempt) {
         if (attempt.hasUnresolved() || !attempt.finish()) return;
         TimingWheel.cancel(timingTaskName(attempt));
-        attempts.remove(attempt.id(), attempt);
+        // 注册表是 holder 正常排干的证据；容量释放可能等待锁，不能在长期资源终态之前删除该证据。
         attempt.capacity().close();
         attempt.drain().close();
+        attempts.remove(attempt.id(), attempt);
     }
 
     /**
      * 业务作用：判断一个 Redis 来源是否仍持有已发布的确认责任，来源 owner 只能在该集合收敛后正常释放。
      *
      * @param authority 来源共享权威对象
-     * @return 没有任何 CommitAttempt 绑定该来源时返回 true
+     * @return 本来源确认 I/O、容量及 DrainToken 均收口且没有剩余注册时返回 true
      */
     boolean isDrained(StreamSourceAuthority authority) {
         Objects.requireNonNull(authority, "authority");
@@ -403,7 +443,7 @@ final class StreamCommitCoordinator implements AutoCloseable {
      */
     boolean ownsConfirmation(CommitSource source, PartitionRecordRef ref) {
         return attempts.values().stream().anyMatch(attempt -> attempt.source() == source
-                && attempt.sourceGeneration == ref.sourceGeneration() && attempt.markUnknown(ref.id()));
+                && attempt.authority.generation() == ref.sourceGeneration() && attempt.markUnknown(ref.id()));
     }
 
     /**
@@ -413,11 +453,16 @@ final class StreamCommitCoordinator implements AutoCloseable {
         return attempts.size();
     }
 
+    /** 业务作用：读取尚无远端确定结论的记录数。参数说明: 无。返回: 未决确认数量。 */
+    long unknownRecords() {
+        return attempts.values().stream().mapToLong(attempt -> attempt.unresolvedIds().size()).sum();
+    }
+
     /**
-     * 业务作用：停止接受新 attempt，在预算内收敛已发布确认，最后把未决 id 交回 PEL。
+     * 业务作用：停止接受新 attempt，在预算内收敛已发布确认，预算结束后交回未决 id 并保留执行中责任。
      *
      * @param timeoutMillis 排干预算
-     *                      返回: 无返回值。
+     * 返回: 无返回值；执行中 ACK/PEL 不被中断，其注册及资源由原 I/O 栈退出后清理。
      */
     void closeAndDrain(long timeoutMillis) {
         admissionBarrier.writeLock().lock();
@@ -460,7 +505,7 @@ final class StreamCommitCoordinator implements AutoCloseable {
     }
 
     /**
-     * 业务作用：由物理 Claim 或 BOTH consumer 提供精确 fencing ACK 与 PEL owner 复验。
+     * 业务作用：由物理 Claim 提供精确 fencing ACK 与 PEL owner 复验。
      */
     interface CommitSource {
         /**
@@ -469,9 +514,13 @@ final class StreamCommitCoordinator implements AutoCloseable {
         StreamSourceAuthority authority();
 
         /**
-         * 业务作用：对精确 id 集执行原子 fencing ACK。参数说明: id 及删除策略。返回: 逐 id 远端观察。
+         * 业务作用：仅以调用方冻结的原权威执行精确 fencing ACK。
+         * @param authority 业务执行或恢复时冻结的来源、代次与 holder
+         * @param ids 精确 record id 集合
+         * @param autoDelete 本次实际确认后是否删除正文
+         * @return 逐 id 远端观察；快照失效时禁止发送 ACK
          */
-        Map<String, AckDisposition> ack(List<String> ids, boolean autoDelete);
+        Map<String, AckDisposition> ack(StreamSourceAuthority.Snapshot authority, List<String> ids, boolean autoDelete);
 
         /**
          * 业务作用：精确查询一个 id 是否缺席、仍属当前来源或已迁移。参数说明: record id。返回: PEL 所有权结论。
@@ -480,36 +529,36 @@ final class StreamCommitCoordinator implements AutoCloseable {
     }
 
     /**
-     * 业务作用：保存一个 record id 与其 exact gate/ledger 依赖，防止批次广播确认到无关 key。
+     * 业务作用：保存一个 record id 与其 exact gate 依赖，防止批次广播确认到无关 key。
      *
      * @param id         Redis record id
      * @param gates      只依赖该 id 的 gate token
-     * @param confirmed  该 id 明确确认后的账本动作
-     * @param moved      该 id 明确迁移后的账本动作
      * @param autoDelete 本 id 实际 XACK 成功后是否删除正文
+     * @param authority 业务 Task 冻结的完整来源权威
      */
     record CommitRecord(String id,
                         List<OrderedKeyCoordinator.GateToken> gates,
-                        Runnable confirmed,
-                        Runnable moved,
-                        boolean autoDelete) {
+                        boolean autoDelete,
+                        StreamSourceAuthority.Snapshot authority) {
         /**
          * 业务作用：复制一条精确确认依赖。
          *
          * @param id         record id
          * @param gates      exact gate token
-         * @param confirmed  确认回调
-         * @param moved      迁移回调
          * @param autoDelete 删除正文策略
+         * @param authority 原 Task 的身份与代次
          *                   返回: 不可变 gate 列表的依赖。
          */
         CommitRecord {
             Objects.requireNonNull(id, "id");
+            Objects.requireNonNull(authority, "authority");
             gates = gates == null ? List.of() : List.copyOf(gates);
-            confirmed = confirmed == null ? () -> {
-            } : confirmed;
-            moved = moved == null ? () -> {
-            } : moved;
+            // gate 与成功证据必须来自同一代次，否则不能安全释放顺序屏障。
+            for (OrderedKeyCoordinator.GateToken gate : gates) {
+                if (gate.authority() != authority.current() || gate.generation() != authority.generation()) {
+                    throw new IllegalArgumentException("commit gate authority differs from record authority");
+                }
+            }
         }
     }
 
@@ -520,7 +569,7 @@ final class StreamCommitCoordinator implements AutoCloseable {
 
         private final long id;
         private final CommitSource source;
-        private final long sourceGeneration;
+        private final StreamSourceAuthority.Snapshot authority;
         private final LinkedHashMap<String, CommitRecord> records;
         private final LinkedHashMap<String, AckDisposition> results = new LinkedHashMap<>();
         private final PartitionDispatchCapacity.CommitLease capacity;
@@ -528,6 +577,7 @@ final class StreamCommitCoordinator implements AutoCloseable {
         private final AtomicBoolean io = new AtomicBoolean();
         private final AtomicBoolean scheduled = new AtomicBoolean();
         private final AtomicBoolean finished = new AtomicBoolean();
+        private boolean retained;
         private long delayMillis;
 
         /**
@@ -549,7 +599,12 @@ final class StreamCommitCoordinator implements AutoCloseable {
                               long delayMillis) {
             this.id = id;
             this.source = source;
-            this.sourceGeneration = source.authority().snapshot().generation();
+            this.authority = records.getFirst().authority();
+            // 批次只承接同一执行快照，不能在确认登记时为旧结果换发当前权威。
+            if (authority.current() != source.authority()
+                    || records.stream().anyMatch(record -> !authority.equals(record.authority()))) {
+                throw new IllegalArgumentException("commit records must share their source authority snapshot");
+            }
             this.records = new LinkedHashMap<>();
             for (CommitRecord record : records) {
                 if (this.records.putIfAbsent(record.id(), record) != null) {
@@ -598,16 +653,26 @@ final class StreamCommitCoordinator implements AutoCloseable {
         }
 
         /**
-         * 业务作用：尝试独占一次 Redis I/O。参数说明: 无。返回: 本调用取得执行权时为 true。
+         * 业务作用：与终态权争用同一边界，独占一次尚未交回 PEL 的确认 I/O。参数说明: 无。返回: 本调用取得执行权时为 true。
          */
-        boolean beginIo() {
-            return !finished.get() && io.compareAndSet(false, true);
+        synchronized boolean beginIo() {
+            // 执行权与终态权共用 monitor，不能在清理已取得权利后再发布一次新的 I/O。
+            return allowsIo() && io.compareAndSet(false, true);
+        }
+
+        /**
+         * 业务作用：在退避或逐次 Redis 调用前复验确认责任仍可推进，超时交回 PEL 后不再开始下一项请求。
+         * 参数说明: 无。
+         * @return 尚未交回 PEL 且尚未取得终态清理权时为 true
+         */
+        synchronized boolean allowsIo() {
+            return !retained && !finished.get();
         }
 
         /**
          * 业务作用：释放 Redis I/O 执行权。参数说明: 无。返回: 无返回值。
          */
-        void endIo() {
+        synchronized void endIo() {
             io.set(false);
         }
 
@@ -651,9 +716,12 @@ final class StreamCommitCoordinator implements AutoCloseable {
         }
 
         /**
-         * 业务作用：在失权或排干超时时把 UNKNOWN 标记为已交回 PEL。参数说明: 无。返回: 无返回值。
+         * 业务作用：在失权或排干超时时关闭后续确认动作，把 UNKNOWN 交回 PEL，保留已开始 I/O 的排干责任。
+         * 参数说明: 无。返回: 无返回值；已有明确结论不变。
          */
         synchronized void retainUnresolved() {
+            // 交回远端责任只关闭后续动作；当前 I/O 仍须由执行栈退出后释放原容量和令牌。
+            retained = true;
             for (Map.Entry<String, AckDisposition> entry : results.entrySet()) {
                 if (entry.getValue() == AckDisposition.UNKNOWN) entry.setValue(AckDisposition.MOVED);
             }
@@ -670,7 +738,7 @@ final class StreamCommitCoordinator implements AutoCloseable {
          * 业务作用：为 attempt 登记唯一定时复验。参数说明: 无。返回: 本调用取得登记权时为 true。
          */
         boolean schedule() {
-            return !finished.get() && scheduled.compareAndSet(false, true);
+            return allowsIo() && scheduled.compareAndSet(false, true);
         }
 
         /**
@@ -690,10 +758,12 @@ final class StreamCommitCoordinator implements AutoCloseable {
         }
 
         /**
-         * 业务作用：发布 attempt 终态。参数说明: 无。返回: 本调用完成迁移时为 true。
+         * 业务作用：在无执行中 I/O 和未决 id 时独占终态清理，阻止并发复验重新取得执行权。
+         * 参数说明: 无。返回: 本调用取得唯一清理权时为 true，不代表容量已经归还或注册已经注销。
          */
-        boolean finish() {
-            return finished.compareAndSet(false, true);
+        synchronized boolean finish() {
+            // 交回 PEL 只结束远端责任，尚未返回的 I/O 仍禁止取得本地清理权。
+            return !io.get() && !hasUnresolved() && finished.compareAndSet(false, true);
         }
     }
 }

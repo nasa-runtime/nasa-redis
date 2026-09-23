@@ -340,6 +340,24 @@
       "type": "java.lang.Boolean",
       "description": "Job JSON 的 Jackson Default Typing 安全门禁，只能保持 false。",
       "defaultValue": false
+    },
+    {
+      "name": "nasa.redis.properties.*.stream.partition.executor.scope",
+      "type": "io.github.nasaruntime.redis.cache.redis.partition.RedisPartitionProperties$ExecutorScope",
+      "defaultValue": "SOURCE",
+      "description": "物理分区本地执行域：source 共享、group 按完整逻辑组、stream 按全部物理分区；不改变 Redis 消费组。"
+    },
+    {
+      "name": "nasa.redis.properties.*.stream.partition.executor.max-runners",
+      "type": "java.lang.Integer",
+      "defaultValue": 256,
+      "description": "完整执行域数量上限，允许 1 到 4096；未订阅配置组也参与 group/stream 计算。"
+    },
+    {
+      "name": "nasa.redis.properties.*.stream.partition.executor.max-total-partitions",
+      "type": "java.lang.Integer",
+      "defaultValue": 4096,
+      "description": "全部 Runner 的本地槽数总上限；槽数由 nasa.partition.partitions 按二次幂归一化。"
     }
   ],
   "hints": [

@@ -6,11 +6,11 @@
 
     <groupId>io.github.nasa-runtime</groupId>
     <artifactId>nasa-redis</artifactId>
-    <version>2.0.1</version>
+    <version>2.0.2</version>
     <packaging>jar</packaging>
 
     <name>nasa-redis</name>
-    <description>Redis 基础设施：无中心任务调度与 Fanout、Stream 分区独占认领与按键本地顺序消费、PEL 恢复与确认 fencing、nonce 幂等计数、命令代理、分布式锁和 RediSearch</description>
+    <description>Redis 基础设施：无中心任务调度与 Fanout、Stream 分区独占认领与按键本地顺序消费、source/group/stream 执行域与固定容量份额、PEL 恢复与确认 fencing、nonce 幂等计数、命令代理、分布式锁和 RediSearch</description>
     <url>https://github.com/nasa-runtime/nasa-redis</url>
     <inceptionYear>2026</inceptionYear>
 

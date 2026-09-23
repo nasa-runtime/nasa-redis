@@ -9,7 +9,7 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * 业务作用：在 XREADGROUP 前按来源公平预留 raw record 容量，并把预留精确交接给活动批次或 retained 状态。
- * 它只约束读取所有权，不与 Task、确认或恢复配额混用。
+ * raw 所有权与后继组合预留分别计量，并在同一来源生命周期内转交。
  */
 final class PartitionRecordCapacity {
 
@@ -17,13 +17,14 @@ final class PartitionRecordCapacity {
     private final int total;
     private final Runnable debtObserved;
     private int available;
+    private final java.util.function.IntFunction<PartitionReadReservation> readReservations;
     private boolean admissionOpen = true;
     private final LinkedHashMap<Object, Waiter> waiters = new LinkedHashMap<>();
 
     /**
      * 业务作用：创建固定总量的来源公平读取容量池。
      *
-     * @param total 所有 RedisPartition Claim 与 BOTH 来源共享的最大 raw record 数
+     * @param total 同一执行域全部物理 Claim 共享的最大 raw record 数
      *              返回: 初始全部容量可用的协调器。
      */
     PartitionRecordCapacity(int total) {
@@ -33,11 +34,24 @@ final class PartitionRecordCapacity {
     /**
      * 业务作用：创建固定总量的来源公平读取容量池，并在 Redis 返回数违反 COUNT 合同时发布保护信号。
      *
-     * @param total        所有 RedisPartition Claim 与 BOTH 来源共享的最大 raw record 数
+     * @param total        同一执行域全部物理 Claim 共享的最大 raw record 数
      * @param debtObserved 实际返回超过预留时关闭新读取 readiness 的动作
      *                     返回: 初始全部容量可用的协调器。
      */
     PartitionRecordCapacity(int total, Runnable debtObserved) {
+        this(total, debtObserved, null);
+    }
+
+    /**
+     * 业务作用：把域级完整预留纳入同一读取公平队列，后继不足时不能先消费 Redis。
+     * @param total raw record 上限
+     * @param debtObserved COUNT 失约保护动作
+     * @param readReservations 完整后继容量申请；source 模式为 null
+     * 返回: 固定域容量池。
+     */
+    PartitionRecordCapacity(int total, Runnable debtObserved,
+                            java.util.function.IntFunction<PartitionReadReservation> readReservations) {
+        this.readReservations = readReservations;
         if (total < 1) throw new IllegalArgumentException("record capacity must be greater than zero");
         this.total = total;
         this.available = total;
@@ -69,12 +83,16 @@ final class PartitionRecordCapacity {
             if (waiter != null) {
                 Map.Entry<Object, Waiter> first = waiters.entrySet().iterator().next();
                 if (first.getKey() != sourceId || available < waiter.count()) return null;
-                waiters.remove(sourceId);
-                available -= waiter.count();
-                return new Permit(this, waiter.count());
+                count = waiter.count();
             }
+            PartitionReadReservation downstream = readReservations == null ? null : readReservations.apply(count);
+            if (readReservations != null && downstream == null) {
+                waiters.putIfAbsent(sourceId, new Waiter(count, wake));
+                return null;
+            }
+            waiters.remove(sourceId);
             available -= count;
-            return new Permit(this, count);
+            return new Permit(this, count, downstream);
         } finally {
             lock.unlock();
         }
@@ -211,16 +229,19 @@ final class PartitionRecordCapacity {
         private final PartitionRecordCapacity owner;
         private final AtomicBoolean released = new AtomicBoolean();
         private int held;
+        final PartitionReadReservation downstream;
 
         /**
          * 业务作用：绑定一次已经从协调器扣减的读取容量。
          *
          * @param owner 所属协调器
          * @param held  初始预留数量
+         * @param downstream 同域执行和恢复预留；source 模式可为空
          *              返回: 由唯一批次所有者负责缩减和释放的 Permit。
          */
-        private Permit(PartitionRecordCapacity owner, int held) {
+        private Permit(PartitionRecordCapacity owner, int held, PartitionReadReservation downstream) {
             this.owner = owner;
+            this.downstream = downstream;
             this.held = held;
         }
 
@@ -241,7 +262,8 @@ final class PartitionRecordCapacity {
                 owner.addDebt(actual - held);
                 held = actual;
             }
-            if (held == 0) released.set(true);
+            if (downstream != null) downstream.resize(actual);
+            if (held == 0) { released.set(true); if (downstream != null) downstream.close(); }
         }
 
         /**
@@ -252,6 +274,7 @@ final class PartitionRecordCapacity {
          */
         synchronized void release() {
             if (!released.compareAndSet(false, true)) return;
+            if (downstream != null) downstream.close();
             int count = held;
             held = 0;
             if (count > 0) owner.release(count);
@@ -276,10 +299,12 @@ final class PartitionRecordCapacity {
 final class PartitionSourceRecordState {
 
     private final PartitionRecordCapacity capacity;
-    private final Object sourceId;
+    private final StreamPartitionRuntime.PartitionSource sourceId;
     private final Runnable wake;
     private PartitionRecordCapacity.Permit pending;
     private PartitionRecordCapacity.Permit activeBatch;
+    private StreamSourceAuthority.Snapshot pendingAuthority;
+    private StreamSourceAuthority.Snapshot activeAuthority;
     private boolean closed;
 
     /**
@@ -290,29 +315,38 @@ final class PartitionSourceRecordState {
      * @param wake     容量变化时的 runner 唤醒动作
      *                 返回: 初始不持有任何容量的来源状态。
      */
-    PartitionSourceRecordState(PartitionRecordCapacity capacity, Object sourceId, Runnable wake) {
+    PartitionSourceRecordState(PartitionRecordCapacity capacity, StreamPartitionRuntime.PartitionSource sourceId, Runnable wake) {
         this.capacity = capacity;
         this.sourceId = sourceId;
         this.wake = wake;
     }
 
     /**
-     * 业务作用：为即将发生的读取取得一次最大批量预留。
+     * 业务作用：在 Redis 读取前冻结权威并取得最大批量预留，使正文与容量始终属于同一代次。
      *
      * @param batchSize 当前来源有效 batch-size
-     * @return 已有或本次取得预留时返回 true；来源关闭、仍有活动批次或容量暂不可满足时返回 false
+     * @return 原快照有效且已有或本次取得预留时返回 true；来源关闭、权威失效、仍有活动批次或容量暂不可满足时返回 false
      */
     synchronized boolean tryAcquire(int batchSize) {
         if (closed) return false;
         // 周期恢复可与尚未完成的原始批次重叠；保留原 Permit，等待该批真实结束后再读取。
         if (activeBatch != null) return false;
-        if (pending != null) return true;
+        if (pending != null) return pendingAuthority.allowsExecution();
+        // Redis 读取之前冻结权威，迟到正文只能继承该快照，不能在收到结果后换成新 holder。
+        StreamSourceAuthority.Snapshot authority = sourceId.authority().snapshot();
+        if (!authority.allowsExecution()) return false;
         pending = capacity.tryReserve(sourceId, batchSize, wake);
+        if (pending != null && !authority.allowsExecution()) {
+            pending.release();
+            pending = null;
+            return false;
+        }
+        pendingAuthority = pending == null ? null : authority;
         return pending != null;
     }
 
     /**
-     * 业务作用：把读取结果数量交接给活动批次；零结果直接清空本轮所有权。
+     * 业务作用：把读取数量与原快照一起交接给活动批次，失权不换发身份；零结果直接清空本轮所有权。
      *
      * @param recordCount 本来源本轮真实返回数
      *                    返回: 无返回值；来源关闭后忽略迟到结果，缺少读取前预留时拒绝建立虚假批次所有权。
@@ -321,9 +355,14 @@ final class PartitionSourceRecordState {
         if (closed) return;
         PartitionRecordCapacity.Permit permit = pending;
         pending = null;
+        StreamSourceAuthority.Snapshot authority = pendingAuthority;
+        pendingAuthority = null;
         if (permit == null) throw new IllegalStateException("poll result has no reserved record permit");
         permit.resizeToActual(recordCount);
-        if (recordCount > 0) activeBatch = permit;
+        if (recordCount > 0) {
+            activeBatch = permit;
+            activeAuthority = authority;
+        }
     }
 
     /**
@@ -335,6 +374,7 @@ final class PartitionSourceRecordState {
     synchronized void afterBatchComplete() {
         PartitionRecordCapacity.Permit permit = activeBatch;
         activeBatch = null;
+        activeAuthority = null;
         if (permit != null) permit.release();
     }
 
@@ -345,6 +385,8 @@ final class PartitionSourceRecordState {
      * 返回: 无返回值；没有容量时保持幂等。
      */
     synchronized void afterPollFailure() {
+        pendingAuthority = null;
+        activeAuthority = null;
         PartitionRecordCapacity.Permit p = pending;
         pending = null;
         if (p != null) p.release();
@@ -364,8 +406,21 @@ final class PartitionSourceRecordState {
         PartitionRecordCapacity.Permit permit = activeBatch;
         if (permit == null) return null;
         activeBatch = null;
+        activeAuthority = null;
         return permit;
     }
+
+    /**
+     * 业务作用：把读取前冻结的权威交给正文处理或 PEL 恢复，禁止按当前来源重新解释已读数据。
+     * 参数说明: 无。
+     * @return 活动批次或待读取的原快照；没有读取所有权时返回 null
+     */
+    synchronized StreamSourceAuthority.Snapshot readAuthority() {
+        return activeBatch == null ? pendingAuthority : activeAuthority;
+    }
+
+    /** 业务作用：提供当前批次原预留供执行接续，不转移 raw 所有权。参数说明: 无。返回: 可为空的预留。 */
+    synchronized PartitionReadReservation readReservation() { return activeBatch == null ? null : activeBatch.downstream; }
 
     /**
      * 业务作用：来源退出时撤销公平等待并归还尚未交接的容量。
@@ -375,6 +430,8 @@ final class PartitionSourceRecordState {
      */
     synchronized void close() {
         closed = true;
+        pendingAuthority = null;
+        activeAuthority = null;
         capacity.removeWaiter(sourceId);
         PartitionRecordCapacity.Permit p = pending;
         pending = null;
